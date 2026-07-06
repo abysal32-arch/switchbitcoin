@@ -1,0 +1,37 @@
+[package]
+name = "newkey"
+version = "0.0.1"
+edition = "2021"
+description = "New Key Protocol — settlement-core reference scaffold (v3.16). NOT production. Fill against real libsecp256k1-zkp."
+license = "MIT OR Apache-2.0"
+publish = false
+
+# ---------------------------------------------------------------------------
+# PINNED CRYPTO (v3.16 Requirement 1 — no hand-rolling).
+# MuSig2 + adaptor signatures + nonce generation MUST come from libsecp256k1-zkp.
+# `musig2` (conduition) defaults to libsecp256k1 bindings for curve math and
+# exposes adaptor-signature APIs. `secp256k1` gives BIP340 / point validation.
+# Do NOT add a pure-Rust curve backend for anything touching real funds.
+# ---------------------------------------------------------------------------
+[dependencies]
+# Versions verified against crates.io 2026-07-06. musig2 0.4 pins secp256k1 0.31,
+# so secp256k1 0.31 is THE canonical curve-math type set for the validation gate.
+# NOTE: bitcoin 0.32.101 (current latest) internally uses secp256k1 0.29 — keys/
+# sigs crossing into `bitcoin` tx types go via byte serialization, never by
+# re-interpreting one crate's types as the other's.
+secp256k1 = { version = "0.31", features = ["rand", "global-context"] }
+# Backend made EXPLICIT (Req 1): libsecp256k1 bindings, never the pure-Rust k256.
+musig2 = { version = "0.4", default-features = false, features = ["secp256k1", "rand"] }
+bitcoin = { version = "0.32" }                     # Taproot/BIP341, PSBT, tx types
+rand = "0.9"                                       # matches secp256k1 0.31 / musig2 0.4 rand dep
+thiserror = "2"
+zeroize = { version = "1", features = ["derive"] } # scrub secret nonces from memory (INV-1)
+
+[dev-dependencies]
+proptest = "1"
+
+# Fuzzing lives in ./fuzz (cargo-fuzz). Wire parser MUST be fuzzed from commit one
+# (v3.16 Requirement 4). See fuzz/fuzz_targets/wire_parse.rs.
+
+[profile.release]
+overflow-checks = true    # keep integer overflow checks on even in release for money code
