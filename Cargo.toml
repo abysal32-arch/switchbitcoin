@@ -22,6 +22,10 @@ publish = false
 secp256k1 = { version = "0.31", features = ["rand", "global-context"] }
 # Backend made EXPLICIT (Req 1): libsecp256k1 bindings, never the pure-Rust k256.
 musig2 = { version = "0.4", default-features = false, features = ["secp256k1", "rand"] }
+# secp is musig2's own scalar/point type family (Scalar, Point, MaybeScalar, G).
+# It does NO curve math itself — with the secp256k1 feature it delegates to
+# libsecp256k1 (verified in the 2026-07-06 pin audit), so Req 1 holds.
+secp = { version = "0.7", default-features = false, features = ["secp256k1", "rand"] }
 bitcoin = { version = "0.32" }                     # Taproot/BIP341, PSBT, tx types
 rand = "0.9"                                       # matches secp256k1 0.31 / musig2 0.4 rand dep
 thiserror = "2"
@@ -29,6 +33,7 @@ zeroize = { version = "1", features = ["derive"] } # scrub secret nonces from me
 
 [dev-dependencies]
 proptest = "1"
+tempfile = "3"
 
 # Fuzzing lives in ./fuzz (cargo-fuzz). Wire parser MUST be fuzzed from commit one
 # (v3.16 Requirement 4). See fuzz/fuzz_targets/wire_parse.rs.

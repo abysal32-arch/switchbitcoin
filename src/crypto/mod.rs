@@ -9,4 +9,6 @@
 pub mod validate;
 pub mod adaptor;
 
-pub use validate::{ValidatedPoint, ValidatedScalar, ValidatedPubNonce, ValidatedPartial};
+pub use validate::{
+    ValidatedFinalSig, ValidatedPartial, ValidatedPoint, ValidatedPubNonce, ValidatedScalar,
+};

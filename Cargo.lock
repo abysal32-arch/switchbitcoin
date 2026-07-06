@@ -302,7 +302,9 @@ dependencies = [
  "musig2",
  "proptest",
  "rand",
+ "secp",
  "secp256k1 0.31.1",
+ "tempfile",
  "thiserror",
  "zeroize",
 ]
