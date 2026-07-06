@@ -4,6 +4,10 @@ version = "0.0.0"
 edition = "2021"
 publish = false
 
+# Standalone package by convention (cargo-fuzz): the empty table keeps any
+# future parent [workspace] from trying to absorb this crate.
+[workspace]
+
 [package.metadata]
 cargo-fuzz = true
 
