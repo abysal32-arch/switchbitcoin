@@ -27,6 +27,7 @@
 //!        under crash/restart (pre-armed refund + Δ_buffer).
 //! ========================================================================
 
+pub mod chain;
 pub mod crypto;
 pub mod wire;
 pub mod signing;

@@ -137,19 +137,80 @@ pub fn should_refund(status: CompletionStatus, refund_matured: bool) -> Result<(
     }
 }
 
-/// Run the refund subroutine. Idempotent and crash-safe: re-checking status on
-/// every entry means a crash mid-refund simply re-evaluates on restart.
-/// CHAIN-LAYER FILL POINT (needs the dual-source chain view + Tor broadcast).
-pub fn run(_refund: &PreArmedRefund /*, chain view, watchtower */) -> Result<()> {
-    // IMPLEMENT:
-    //   loop-ish (event driven):
-    //     let status = dual_source_completion_status();   // self-verifying
-    //     should_refund(status, matured)?;                // may say "take the swap"
-    //     broadcast pre-armed refund over dedicated Tor circuit;
-    //     if it stalls -> escalate via anchor+reserve backstop (silent for refunds);
-    //   if completion appears after we broadcast: CSV ordering decides; never
-    //   double-spend against ourselves; reconcile to whichever confirms.
-    Err(Error::Unimplemented("refund::run: completion-supersedes, Tor broadcast, deterministic reconciliation"))
+/// Map the chain's view of our escrow output to a completion status. Because
+/// `run` is called BEFORE we broadcast our own refund, any spend of the escrow
+/// is necessarily the counterparty's completion.
+fn completion_status_of(
+    chain: &impl crate::chain::ChainView,
+    escrow_outpoint: bitcoin::OutPoint,
+) -> CompletionStatus {
+    match chain.spend_status(escrow_outpoint) {
+        crate::chain::SpendStatus::Confirmed(_) => CompletionStatus::Confirmed,
+        crate::chain::SpendStatus::InMempool => CompletionStatus::InMempool,
+        crate::chain::SpendStatus::Unspent => CompletionStatus::Absent,
+    }
+}
+
+/// Run the refund subroutine against a chain view. Idempotent and crash-safe:
+/// re-checking status on every entry means a crash mid-refund simply
+/// re-evaluates on restart.
+///
+/// Completion-supersedes: if the counterparty's completion is winning
+/// (confirmed or in mempool), this returns `Err(Abort("...take the swap..."))`
+/// — do NOT fight it (extraction, not refund, is the response). Otherwise, once
+/// the CSV has matured, broadcast the pre-armed refund. The chain view enforces
+/// the relative timelock and the no-double-spend rule, so a completion that
+/// confirms first wins deterministically.
+pub fn run(
+    refund: &PreArmedRefund,
+    chain: &impl crate::chain::ChainView,
+    escrow_outpoint: bitcoin::OutPoint,
+) -> Result<()> {
+    let matured = chain.tip_height() >= refund.csv_maturity_height();
+    let status = completion_status_of(chain, escrow_outpoint);
+    // May return Err(Abort) meaning "completion winning; take the swap".
+    should_refund(status, matured)?;
+    // Appropriate to refund: broadcast it. The chain view rejects it if the CSV
+    // is somehow not yet matured or the output was spent out from under us
+    // (either => a completion is winning, so surfacing the error is correct).
+    chain.broadcast(refund.tx_bytes())?;
+    Ok(())
+}
+
+/// A watchtower holding a pre-armed refund on the owner's behalf. It can fire
+/// the refund even if the owner's device is dead (gate G2 crash-safety), and it
+/// respects completion-supersedes so it never fights a winning completion.
+pub struct Watchtower {
+    refund: PreArmedRefund,
+    escrow_outpoint: bitcoin::OutPoint,
+}
+
+impl Watchtower {
+    /// Arm the watchtower with a refund whose fingerprint the owner acknowledged
+    /// (the same `WatchtowerReceipt` that satisfies gate G2).
+    pub fn arm(
+        refund: PreArmedRefund,
+        escrow_outpoint: bitcoin::OutPoint,
+        receipt: &WatchtowerReceipt,
+    ) -> Result<Self> {
+        if !receipt.matches(&refund) {
+            return Err(Error::Deadline("watchtower receipt does not cover this refund"));
+        }
+        Ok(Watchtower { refund, escrow_outpoint })
+    }
+
+    /// Poll the chain and fire the refund if (and only if) it is both matured
+    /// and not superseded by a winning completion. Returns Ok(true) if the
+    /// refund was broadcast this poll, Ok(false) if there is nothing to do yet,
+    /// Err(Abort) if a completion is winning (owner should take the swap).
+    pub fn poll(&self, chain: &impl crate::chain::ChainView) -> Result<bool> {
+        match run(&self.refund, chain, self.escrow_outpoint) {
+            Ok(()) => Ok(true),
+            // "not yet matured" is a normal not-yet-actionable state, not an error.
+            Err(Error::Deadline(_)) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 #[cfg(test)]

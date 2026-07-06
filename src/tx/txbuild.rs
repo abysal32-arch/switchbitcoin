@@ -17,6 +17,7 @@ use bitcoin::transaction::Version;
 use bitcoin::{absolute, Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
 
 /// A spend transaction plus the 32-byte sighash the signer must sign.
+#[derive(Clone)]
 pub struct SpendTx {
     pub tx: Transaction,
     pub sighash: [u8; 32],
@@ -118,6 +119,15 @@ pub fn sign_schnorr_single(seckey_bytes: [u8; 32], sighash: [u8; 32]) -> Result<
     let mut out = [0u8; 64];
     out.copy_from_slice(sig.as_ref());
     Ok(out)
+}
+
+/// Attach the taproot KEY-PATH witness (a single 64-byte signature) to a
+/// completion and serialize the fully-signed transaction, ready to broadcast.
+pub fn finalize_key_spend(mut spend: SpendTx, sig64: [u8; 64]) -> Vec<u8> {
+    let mut w = Witness::new();
+    w.push(sig64);
+    spend.tx.input[0].witness = w;
+    bitcoin::consensus::encode::serialize(&spend.tx)
 }
 
 /// Attach the script-path refund witness `[sig, leaf_script, control_block]` and

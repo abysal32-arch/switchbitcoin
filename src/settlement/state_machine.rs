@@ -237,13 +237,46 @@ impl Funding {
         Funding { params, peer }
     }
 
-    /// Wait for both escrows to confirm via the self-verifying dual-source view,
-    /// enforce the co-funding window, derive the role. CHAIN-LAYER FILL POINT.
-    pub fn await_funded(self) -> Result<Funded> {
+    /// Confirm both escrows against the chain view, enforce the co-funding
+    /// window, compute S, and derive the role. Both funding outpoints are
+    /// supplied by the (stubbed) discovery/tx layer: `our_funding` is the escrow
+    /// WE funded, `their_funding` is the counterparty's.
+    ///
+    /// Role derivation is deterministic and ANTISYMMETRIC in the two funding
+    /// txids, so the two parties derive OPPOSITE roles from the same public
+    /// data (v3.13 "role from txids + S"). Here: the party whose funded escrow
+    /// has the lexicographically smaller txid is the SecretHolder.
+    pub fn await_funded(
+        self,
+        chain: &impl crate::chain::ChainView,
+        our_funding: bitcoin::OutPoint,
+        their_funding: bitcoin::OutPoint,
+    ) -> Result<Funded> {
         self.params.validate()?; // ordering invariant (review item #5)
-        // IMPLEMENT (chain layer): dual-source confirmation (>=1 self-verifying
-        // source); enforce cofunding_window; compute S; derive Role from txids + S.
-        Err(Error::Unimplemented("Funding::await_funded: dual-source confirm + cofunding window + role derivation"))
+        let our_h = chain
+            .funding_height(our_funding)
+            .ok_or(Error::Deadline("our escrow not yet confirmed"))?;
+        let their_h = chain
+            .funding_height(their_funding)
+            .ok_or(Error::Deadline("counterparty escrow not yet confirmed"))?;
+
+        // Co-funding window: the two confirmations must be close (else abandon).
+        let skew = our_h.abs_diff(their_h);
+        if skew > self.params.cofunding_window {
+            return Err(Error::Deadline("co-funding window exceeded; abandon and refund"));
+        }
+        // S is the LATER of the two confirmations (the conservative baseline).
+        let s_height = our_h.max(their_h);
+
+        // Antisymmetric role derivation from the funding txids.
+        let ours = our_funding.txid.to_string();
+        let theirs = their_funding.txid.to_string();
+        if ours == theirs {
+            return Err(Error::Validation("both escrows share a funding txid"));
+        }
+        let role = if ours < theirs { Role::SecretHolder } else { Role::SecretLearner };
+
+        Ok(Funded { params: self.params, peer: self.peer, role, s_height })
     }
 
     /// Hand-fed variant for the stubbed-discovery build (Requirement 5): the
@@ -259,6 +292,10 @@ impl Funding {
 impl Funded {
     pub fn role(&self) -> Role {
         self.role
+    }
+
+    pub fn s_height(&self) -> u32 {
+        self.s_height
     }
 
     /// Run the interlocked adaptor exchange (Phase 5 messages 1–5), ending with
