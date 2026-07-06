@@ -42,9 +42,12 @@ pub trait ChainView {
 
 struct Inner {
     height: u32,
-    funded: HashMap<OutPoint, u32>,
-    /// escrow outpoint -> (spending txid, confirmed height | None = mempool)
-    spends: HashMap<OutPoint, (Txid, Option<u32>)>,
+    /// funding outpoint -> (confirmation height, output amount in sats)
+    funded: HashMap<OutPoint, (u32, u64)>,
+    /// escrow outpoint -> (spending txid, confirmed height | None = mempool, fee)
+    spends: HashMap<OutPoint, (Txid, Option<u32>, u64)>,
+    /// Minimum fee (sats) a tx must pay to be relayed — the congestion knob.
+    congestion_min_fee: u64,
 }
 
 /// A shareable in-process chain (Send + Sync via Arc<Mutex<_>>).
@@ -57,12 +60,26 @@ impl SimChain {
             height: genesis_height,
             funded: HashMap::new(),
             spends: HashMap::new(),
+            congestion_min_fee: 0,
         })))
     }
 
-    /// Record a confirmed funding output at the given height.
+    /// Record a confirmed funding output at the given height, with an
+    /// unconstrained amount (fee checks always pass for spends of it).
     pub fn fund(&self, outpoint: OutPoint, height: u32) {
-        self.0.lock().unwrap().funded.insert(outpoint, height);
+        self.0.lock().unwrap().funded.insert(outpoint, (height, u64::MAX));
+    }
+
+    /// Record a confirmed funding output with a specific amount, so spends of it
+    /// have a meaningful fee (input amount − output total) for congestion tests.
+    pub fn fund_with_amount(&self, outpoint: OutPoint, height: u32, amount_sats: u64) {
+        self.0.lock().unwrap().funded.insert(outpoint, (height, amount_sats));
+    }
+
+    /// Set the minimum relay fee (congestion level). A tx paying less will not
+    /// be accepted until it is fee-bumped or the congestion clears.
+    pub fn set_congestion(&self, min_fee_sats: u64) {
+        self.0.lock().unwrap().congestion_min_fee = min_fee_sats;
     }
 
     /// Mine one block: every mempool spend confirms at the new tip height.
@@ -70,7 +87,7 @@ impl SimChain {
         let mut g = self.0.lock().unwrap();
         g.height += 1;
         let h = g.height;
-        for (_op, (_txid, conf)) in g.spends.iter_mut() {
+        for (_op, (_txid, conf, _fee)) in g.spends.iter_mut() {
             if conf.is_none() {
                 *conf = Some(h);
             }
@@ -86,7 +103,7 @@ impl SimChain {
     /// low-fee tx dropping out of the mempool. Confirmed spends are untouched.
     pub fn evict(&self, outpoint: OutPoint) {
         let mut g = self.0.lock().unwrap();
-        if let Some((_txid, None)) = g.spends.get(&outpoint) {
+        if let Some((_txid, None, _fee)) = g.spends.get(&outpoint) {
             g.spends.remove(&outpoint);
         }
     }
@@ -98,14 +115,14 @@ impl ChainView for SimChain {
     }
 
     fn funding_height(&self, outpoint: OutPoint) -> Option<u32> {
-        self.0.lock().unwrap().funded.get(&outpoint).copied()
+        self.0.lock().unwrap().funded.get(&outpoint).map(|(h, _)| *h)
     }
 
     fn spend_status(&self, escrow_outpoint: OutPoint) -> SpendStatus {
         match self.0.lock().unwrap().spends.get(&escrow_outpoint) {
             None => SpendStatus::Unspent,
-            Some((_, None)) => SpendStatus::InMempool,
-            Some((_, Some(h))) => SpendStatus::Confirmed(*h),
+            Some((_, None, _)) => SpendStatus::InMempool,
+            Some((_, Some(h), _)) => SpendStatus::Confirmed(*h),
         }
     }
 
@@ -116,13 +133,16 @@ impl ChainView for SimChain {
         let mut g = self.0.lock().unwrap();
         let tip = g.height;
 
-        // Validate every input before mutating (all-or-nothing acceptance).
+        // Compute the fee (sum of input amounts − sum of outputs). Saturating so
+        // an unconstrained (u64::MAX) funding input never overflows.
+        let mut total_in: u64 = 0;
         for input in &tx.input {
             let op = input.previous_output;
-            let funding_height = *g
+            let (funding_height, amount) = *g
                 .funded
                 .get(&op)
                 .ok_or(Error::Validation("broadcast: input spends an unfunded output"))?;
+            total_in = total_in.saturating_add(amount);
 
             // Relative-timelock (CSV) maturity.
             if let Some(lock) = input.sequence.to_relative_lock_time() {
@@ -138,22 +158,38 @@ impl ChainView for SimChain {
                     }
                 }
             }
+        }
+        let total_out: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
+        let fee = total_in.saturating_sub(total_out);
 
-            // No double spend of a confirmed output; first-seen wins the mempool.
+        // Congestion: a tx paying below the minimum relay fee will not be
+        // accepted (it stalls until fee-bumped or congestion clears).
+        if fee < g.congestion_min_fee {
+            return Err(Error::Deadline("broadcast: fee below the current relay threshold"));
+        }
+
+        // Conflict / double-spend handling, with fee-based replacement (RBF).
+        for input in &tx.input {
+            let op = input.previous_output;
+            // Replace-by-fee: a strictly higher-fee replacement of an unconfirmed
+            // spend evicts the incumbent; equal-or-lower is refused.
             match g.spends.get(&op) {
-                Some((existing, _)) if *existing == txid => {} // idempotent re-broadcast
-                Some((_, Some(_))) => {
+                Some((existing, _, _)) if *existing == txid => {} // idempotent
+                Some((_, Some(_), _)) => {
                     return Err(Error::Abort("broadcast: output already spent (confirmed)"))
                 }
-                Some((_, None)) => {
-                    return Err(Error::Abort("broadcast: output already in mempool (conflict)"))
+                Some((_, None, old_fee)) if fee <= *old_fee => {
+                    return Err(Error::Abort(
+                        "broadcast: output already in mempool (fee too low to replace)",
+                    ))
                 }
+                Some((_, None, _)) => {} // higher fee: replace on insert below
                 None => {}
             }
         }
 
         for input in &tx.input {
-            g.spends.insert(input.previous_output, (txid, None));
+            g.spends.insert(input.previous_output, (txid, None, fee));
         }
         Ok(txid)
     }
@@ -212,5 +248,45 @@ mod tests {
         let chain = SimChain::new(100);
         let tx = spend_tx(op(9), Sequence::ENABLE_RBF_NO_LOCKTIME);
         assert!(chain.broadcast(&tx).is_err());
+    }
+
+    /// Build a spend of `prev` paying `out` sats (fee = funded_amount − out).
+    fn spend_tx_out(prev: OutPoint, out: u64) -> Vec<u8> {
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: prev,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut { value: Amount::from_sat(out), script_pubkey: ScriptBuf::new() }],
+        };
+        bitcoin::consensus::encode::serialize(&tx)
+    }
+
+    #[test]
+    fn congestion_rejects_low_fee_and_accepts_bumped() {
+        let chain = SimChain::new(100);
+        chain.fund_with_amount(op(0), 100, 10_000);
+        chain.set_congestion(500); // require >= 500 sat fee
+        // Output 9_600 -> fee 400 < 500: rejected.
+        assert!(matches!(chain.broadcast(&spend_tx_out(op(0), 9_600)), Err(Error::Deadline(_))));
+        // Output 9_400 -> fee 600 >= 500: accepted.
+        assert!(chain.broadcast(&spend_tx_out(op(0), 9_400)).is_ok());
+    }
+
+    #[test]
+    fn higher_fee_replaces_mempool_incumbent_lower_does_not() {
+        let chain = SimChain::new(100);
+        chain.fund_with_amount(op(0), 100, 10_000);
+        // Incumbent: fee 300.
+        assert!(chain.broadcast(&spend_tx_out(op(0), 9_700)).is_ok());
+        // Lower fee (200): refused.
+        assert!(chain.broadcast(&spend_tx_out(op(0), 9_800)).is_err());
+        // Higher fee (500): replaces the incumbent.
+        assert!(chain.broadcast(&spend_tx_out(op(0), 9_500)).is_ok());
+        assert!(matches!(chain.spend_status(op(0)), SpendStatus::InMempool));
     }
 }

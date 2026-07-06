@@ -8,10 +8,11 @@
 //! Run:  cargo test            (runs implemented rows; skips ignored)
 //!       cargo test -- --ignored   (runs the rest; they fail until implemented)
 //!
-//! STATUS: rows 1-7 are implemented. Rows 2/5/6 exercise the crypto core; rows
-//! 1/3/4/7 drive a full taproot swap against the in-process `SimChain` (real
-//! CSV maturity + no-double-spend physics). Row 8 (fee-congestion backstop)
-//! stays ignored: it needs a fee model the sim deliberately omits.
+//! STATUS: all 8 rows are implemented. Rows 2/5/6 exercise the crypto core;
+//! rows 1/3/4/7/8 drive a full taproot swap against the in-process `SimChain`
+//! (real CSV maturity, no-double-spend, and fee/congestion physics). Note the
+//! sim does not run script or verify signatures — real signature validity is
+//! proven in `tests/taproot_swap.rs` (bitcoin-side schnorr verify).
 
 use bitcoin::{OutPoint, Txid};
 use musig2::KeyAggContext;
@@ -137,6 +138,8 @@ fn run_onchain_exchange() -> Swap {
     let msg_comp_sl = comp_sl_spend.sighash;
     let root_sh = escrow_comp_sh.merkle_root();
     let root_sl = escrow_comp_sl.merkle_root();
+    let outkey_sh = escrow_comp_sh.output_key_xonly();
+    let outkey_sl = escrow_comp_sl.output_key_xonly();
 
     let swap_id = [0x99u8; 32];
     let lease_sh = tempfile::tempdir().unwrap();
@@ -163,6 +166,8 @@ fn run_onchain_exchange() -> Swap {
             possession_store: None,
             taproot_root_comp_sh: Some(root_sh),
             taproot_root_comp_sl: Some(root_sl),
+            taproot_output_comp_sh: Some(outkey_sh),
+            taproot_output_comp_sl: Some(outkey_sl),
         })?;
         let sig = possessing.broadcast_completion(s_height + 10, &receipt)?;
         let final_tx = finalize_key_spend(comp_sh_for_sh, sig.0);
@@ -186,6 +191,8 @@ fn run_onchain_exchange() -> Swap {
             possession_store: Some(store.path().to_path_buf()),
             taproot_root_comp_sh: Some(root_sh),
             taproot_root_comp_sl: Some(root_sl),
+            taproot_output_comp_sh: Some(outkey_sh),
+            taproot_output_comp_sl: Some(outkey_sl),
         })
         .expect("SL exchange");
 
@@ -581,9 +588,65 @@ fn partial_funding_funded_side_reclaims() {
 
 // ---- 8. Congestion beyond delta_fee ---------------------------------------
 #[test]
-#[ignore = "needs a fee model: the SimChain deliberately omits fees, so a spike > delta_fee, opt-in completion bump, and silent refund backstop cannot be exercised here"]
 fn congestion_backstop_behaves() {
-    unimplemented!("congestion backstop needs a fee-aware chain model");
+    let params = Params::testnet_provisional();
+    let sh = keypair();
+    let sl = keypair();
+    let internal = aggregate_internal(sh.pk, sl.pk);
+    let s = 700_000u32;
+    let escrow_amount = params.tier_d_sats + params.delta_fee_sats; // funds D + fee margin
+    let delta_late = u32::try_from(params.delta_late()).unwrap();
+
+    let chain = SimChain::new(s);
+    // A fee spike BEYOND the baked delta_fee margin.
+    chain.set_congestion(params.delta_fee_sats + 1);
+
+    // (A) COMPLETION under congestion: the standard completion pays exactly the
+    //     baked margin (fee == delta_fee), so it STALLS; an OPT-IN bump (the
+    //     user accepts a smaller output to add fee) clears it.
+    let escrow_a = Escrow::new(&internal, &sh.pk, delta_late).unwrap();
+    let op_a = OutPoint::new(txid_from(1), 0);
+    chain.fund_with_amount(op_a, s, escrow_amount);
+    let dest_a = escrow_a.funding_script_pubkey().clone();
+
+    let standard = finalize_key_spend(
+        build_completion(&escrow_a, op_a, escrow_amount, dest_a.clone(), params.tier_d_sats).unwrap(),
+        [0u8; 64],
+    );
+    assert!(
+        matches!(chain.broadcast(&standard), Err(Error::Deadline(_))),
+        "a completion paying only the baked margin should stall under congestion"
+    );
+    let bumped = finalize_key_spend(
+        build_completion(&escrow_a, op_a, escrow_amount, dest_a, params.tier_d_sats - 5).unwrap(),
+        [0u8; 64],
+    );
+    chain.broadcast(&bumped).expect("opt-in fee bump clears congestion");
+    chain.mine();
+    assert!(matches!(chain.spend_status(op_a), SpendStatus::Confirmed(_)));
+
+    // (B) REFUND under the SAME congestion uses a SILENT backstop: it is
+    //     pre-armed with a reserve fee that already clears the threshold, so it
+    //     needs no interactive bump — the watchtower can fire it unattended.
+    let escrow_b = Escrow::new(&internal, &sh.pk, delta_late).unwrap();
+    let op_b = OutPoint::new(txid_from(2), 0);
+    chain.fund_with_amount(op_b, s, escrow_amount);
+    let reserve_output = params.tier_d_sats - 10; // fee = delta_fee + 10 (reserve)
+    let refund = PreArmedRefund::arm(
+        &escrow_b,
+        op_b,
+        escrow_amount,
+        &sh.sk,
+        escrow_b.funding_script_pubkey().clone(),
+        reserve_output,
+        s,
+    )
+    .unwrap();
+    chain.advance(delta_late); // CSV matured
+    newkey::settlement::refund::run(&refund, &chain, op_b)
+        .expect("pre-armed refund clears congestion silently via its reserve fee");
+    chain.mine();
+    assert!(matches!(chain.spend_status(op_b), SpendStatus::Confirmed(_)));
 }
 
 // ---- Co-funding-skew race window (regression for the critical review find) -
@@ -628,6 +691,49 @@ fn cofunding_skew_anchors_claim_to_swept_escrow_not_s() {
     assert!(
         reveal as u64 + buggy_max + params.claim_confirm_allowance as u64 > true_deadline,
         "skew scenario does not actually exercise the race window"
+    );
+}
+
+// ---- Taproot funded-key == signed-key guard (unspendable-funds footgun) ----
+// A mis-specified merkle root would make both parties sign under a key that is
+// not the funded output key — completions that verify against each other but
+// are unspendable on-chain. The exchange proves signing-key == funded-output-key
+// before producing any partial, so a wrong output key aborts immediately.
+#[test]
+fn exchange_rejects_wrong_taproot_output_key() {
+    let sh = keypair();
+    let sl = keypair();
+    let params = Params::testnet_provisional();
+    let internal = aggregate_internal(sh.pk, sl.pk);
+    let escrow_sh = Escrow::new(&internal, &sl.pk, params.delta_early).unwrap();
+    let escrow_sl =
+        Escrow::new(&internal, &sh.pk, u32::try_from(params.delta_late()).unwrap()).unwrap();
+    let mut wrong = escrow_sh.output_key_xonly();
+    wrong[0] ^= 0x01; // corrupt the expected Comp->SH output key
+
+    let lease = tempfile::tempdir().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    // tweak_ctx runs before any lease/message, so SL aborts without a peer.
+    let funded = Funding::new(params, PeerSession::new([1u8; 32], Box::new(duplex().0)))
+        .funded_manual(Role::SecretLearner, 100)
+        .unwrap();
+    let out = funded.run_adaptor_exchange(ExchangeInputs {
+        our_seckey: sl.sk,
+        their_pubkey: ValidatedPoint::from_bytes(&sh.pk.serialize()).unwrap(),
+        msg_comp_sh: [1u8; 32],
+        msg_comp_sl: [2u8; 32],
+        pre_armed_refund: PreArmedRefund::from_signed_tx(vec![1; 32], 200).unwrap(),
+        adaptor_secret: None,
+        lease_dir: Some(lease.path().to_path_buf()),
+        possession_store: Some(store.path().to_path_buf()),
+        taproot_root_comp_sh: Some(escrow_sh.merkle_root()),
+        taproot_root_comp_sl: Some(escrow_sl.merkle_root()),
+        taproot_output_comp_sh: Some(wrong), // WRONG — must be caught
+        taproot_output_comp_sl: Some(escrow_sl.output_key_xonly()),
+    });
+    assert!(
+        matches!(out, Err(Error::Verification(_))),
+        "a signing key that does not match the funded output key was not caught"
     );
 }
 

@@ -169,17 +169,46 @@ pub struct ExchangeInputs {
     pub taproot_root_comp_sh: Option<[u8; 32]>,
     /// Tapscript merkle root of the escrow Comp->SL spends (SH-funded escrow).
     pub taproot_root_comp_sl: Option<[u8; 32]>,
+    /// Expected 32-byte x-only OUTPUT key of the escrow Comp->SH spends. When
+    /// `Some` (alongside the matching root), the exchange PROVES the taproot-
+    /// tweaked signing key equals the funded output key before producing any
+    /// partial — a mis-specified root then aborts instead of yielding a
+    /// silently-unspendable completion. `None` skips the check (untweaked path).
+    pub taproot_output_comp_sh: Option<[u8; 32]>,
+    /// Expected x-only output key of the escrow Comp->SL spends.
+    pub taproot_output_comp_sl: Option<[u8; 32]>,
 }
 
 /// Apply a taproot tweak to a base context if a merkle root is supplied, else
 /// clone unchanged. The two completions spend DIFFERENT escrows (different CSV,
 /// hence different merkle roots), so each leg gets its own tweaked context.
-fn tweak_ctx(base: &KeyAggContext, root: Option<[u8; 32]>) -> Result<KeyAggContext> {
+///
+/// When `expected_output` is supplied, the tweaked aggregate x-only key MUST
+/// equal it — this is the funded-key == signed-key guard (`escrow::
+/// taproot_tweaked_keyagg`), wired into the production exchange so a wrong
+/// merkle root cannot produce completions that verify against each other yet
+/// are unspendable against the on-chain UTXO.
+fn tweak_ctx(
+    base: &KeyAggContext,
+    root: Option<[u8; 32]>,
+    expected_output: Option<[u8; 32]>,
+) -> Result<KeyAggContext> {
     match root {
-        Some(r) => base
-            .clone()
-            .with_taproot_tweak(&r)
-            .map_err(|_| Error::Validation("taproot tweak (exchange)")),
+        Some(r) => {
+            let tweaked = base
+                .clone()
+                .with_taproot_tweak(&r)
+                .map_err(|_| Error::Validation("taproot tweak (exchange)"))?;
+            if let Some(exp) = expected_output {
+                let got = tweaked.aggregated_pubkey::<Point>().serialize_xonly();
+                if got != exp {
+                    return Err(Error::Verification(
+                        "taproot tweak: signing key does not match the funded output key",
+                    ));
+                }
+            }
+            Ok(tweaked)
+        }
         None => Ok(base.clone()),
     }
 }
@@ -348,8 +377,8 @@ impl Funded {
         // Each completion spends a different escrow, so each leg signs under its
         // own taproot-tweaked context (the tweak MUST be baked in before nonce
         // generation — BIP327 binds the nonce to the tweaked aggregate key).
-        let ctx_sh = tweak_ctx(&base_ctx, inputs.taproot_root_comp_sh)?;
-        let ctx_sl = tweak_ctx(&base_ctx, inputs.taproot_root_comp_sl)?;
+        let ctx_sh = tweak_ctx(&base_ctx, inputs.taproot_root_comp_sh, inputs.taproot_output_comp_sh)?;
+        let ctx_sl = tweak_ctx(&base_ctx, inputs.taproot_root_comp_sl, inputs.taproot_output_comp_sl)?;
 
         // INV-3: one signer per swap. Both sessions share the ONE lease.
         let lease = match &inputs.lease_dir {
@@ -858,6 +887,8 @@ mod tests {
                 possession_store: None, // SH crash is refund-safe; no record needed
                 taproot_root_comp_sh: None,
                 taproot_root_comp_sl: None,
+                taproot_output_comp_sh: None,
+                taproot_output_comp_sl: None,
             })?;
             let t_point_bytes = possessing.t_point().to_bytes();
             let sig = possessing.broadcast_completion(broadcast_height, &receipt)?;
@@ -881,6 +912,8 @@ mod tests {
                 possession_store: Some(store_dir.to_path_buf()),
                 taproot_root_comp_sh: None,
                 taproot_root_comp_sl: None,
+                taproot_output_comp_sh: None,
+                taproot_output_comp_sl: None,
             })
             .expect("SL exchange");
 
@@ -999,6 +1032,8 @@ mod tests {
                 possession_store: None,
                 taproot_root_comp_sh: None,
                 taproot_root_comp_sl: None,
+                taproot_output_comp_sh: None,
+                taproot_output_comp_sl: None,
             })?;
             Ok(())
         });
@@ -1020,6 +1055,8 @@ mod tests {
             possession_store: Some(store.path().to_path_buf()),
             taproot_root_comp_sh: None,
             taproot_root_comp_sl: None,
+            taproot_output_comp_sh: None,
+            taproot_output_comp_sl: None,
         });
 
         // SL MUST abort...
@@ -1177,6 +1214,8 @@ mod tests {
                 possession_store: None,
                 taproot_root_comp_sh: None,
                 taproot_root_comp_sl: None,
+                taproot_output_comp_sh: None,
+                taproot_output_comp_sl: None,
             })?;
 
             // deadline = S + 144 - 24 = S + 120.
@@ -1214,6 +1253,8 @@ mod tests {
                 possession_store: Some(store.path().to_path_buf()),
                 taproot_root_comp_sh: None,
                 taproot_root_comp_sl: None,
+                taproot_output_comp_sh: None,
+                taproot_output_comp_sl: None,
             })
             .expect("SL exchange");
 

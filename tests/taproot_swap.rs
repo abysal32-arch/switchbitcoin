@@ -120,6 +120,8 @@ fn taproot_swap_both_legs_are_spendable_on_the_bitcoin_side() {
             possession_store: None,
             taproot_root_comp_sh: Some(root_sh),
             taproot_root_comp_sl: Some(root_sl),
+            taproot_output_comp_sh: Some(outkey_sh),
+            taproot_output_comp_sl: Some(outkey_sl),
         })?;
         let sig = possessing.broadcast_completion(s_height + 10, &receipt)?;
         Ok(sig.0)
@@ -142,6 +144,8 @@ fn taproot_swap_both_legs_are_spendable_on_the_bitcoin_side() {
             possession_store: Some(store.path().to_path_buf()),
             taproot_root_comp_sh: Some(root_sh),
             taproot_root_comp_sl: Some(root_sl),
+            taproot_output_comp_sh: Some(outkey_sh),
+            taproot_output_comp_sl: Some(outkey_sl),
         })
         .expect("SL exchange");
 
