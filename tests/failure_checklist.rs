@@ -133,6 +133,10 @@ fn claim_delay_never_breaches_safe_window() {
                 p.margin = margin;
                 p.delta_buffer = delta_buffer;
                 p.claim_confirm_allowance = allowance;
+                // This property isolates the claim-delay bound; neutralize the
+                // unrelated cofunding-skew guard (delta_buffer > cofunding_window)
+                // so the generated space is exactly the claim-delay validated space.
+                p.cofunding_window = 0;
                 // The generated space must be exactly the validated space.
                 prop_assert!(p.validate().is_ok(), "generator produced invalid params");
 

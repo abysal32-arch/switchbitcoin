@@ -83,6 +83,20 @@ impl Params {
         if self.delta_fee_sats == 0 {
             return Err(Error::Deadline("delta_fee must be > 0"));
         }
+        // On-chain CSV field is BIP68 16-bit relative-height. Both refund
+        // maturities must fit, or `Sequence::from_height` would truncate and a
+        // refund could mature FAR earlier than intended (collapsing the
+        // ordering). delta_late() = delta_early + margin is the larger.
+        if self.delta_late() > u16::MAX as u64 {
+            return Err(Error::Deadline("delta_late exceeds the 16-bit BIP68 CSV field"));
+        }
+        // Defense-in-depth against co-funding skew: S is the LATER of the two
+        // funding confirmations, so the earlier-funded escrow's CSV is measured
+        // from up to `cofunding_window` blocks before S. The SH broadcast buffer
+        // must absorb that skew, else the reveal deadline can slip.
+        if self.delta_buffer as u64 <= self.cofunding_window as u64 {
+            return Err(Error::Deadline("delta_buffer must exceed cofunding_window (absorb funding skew)"));
+        }
         Ok(())
     }
 

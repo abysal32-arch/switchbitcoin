@@ -34,6 +34,12 @@ zeroize = { version = "1", features = ["derive"] } # scrub secret nonces from me
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
+# For the taproot integration test: build escrows + verify completed sigs on the
+# bitcoin (secp256k1 0.29) side. Same version the tx layer uses.
+bitcoin = "0.32"
+musig2 = { version = "0.4", default-features = false, features = ["secp256k1", "rand"] }
+secp = { version = "0.7", default-features = false, features = ["secp256k1", "rand"] }
+rand = "0.9"
 
 # Fuzzing lives in ./fuzz (cargo-fuzz). Wire parser MUST be fuzzed from commit one
 # (v3.16 Requirement 4). See fuzz/fuzz_targets/wire_parse.rs.

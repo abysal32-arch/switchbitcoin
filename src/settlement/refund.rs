@@ -26,9 +26,35 @@ pub struct PreArmedRefund {
 
 impl PreArmedRefund {
     /// Build and sign the refund NOW, before broadcasting any completion (G2).
-    /// TX-LAYER FILL POINT: needs escrow outpoint, own key, CSV height, params.
-    pub fn arm(/* escrow, own key, csv height, params */) -> Result<Self> {
-        Err(Error::Unimplemented("PreArmedRefund::arm: sign script-path refund up front (tx layer)"))
+    ///
+    /// Script-path spend of the escrow's CSV leaf: build the refund tx (input
+    /// nSequence = the leaf's relative CSV), sign the BIP341 script-path sighash
+    /// with the funder's own key, attach the `[sig, leaf, control_block]`
+    /// witness, and store the fully-signed bytes. The stored tx is broadcastable
+    /// by the watchtower the moment `S + csv_blocks` is reached — this is what
+    /// makes gate G2 crash-safe.
+    pub fn arm(
+        escrow: &crate::tx::escrow::Escrow,
+        funding_outpoint: bitcoin::OutPoint,
+        escrow_amount_sats: u64,
+        funder_seckey: &secp::Scalar,
+        dest_spk: bitcoin::ScriptBuf,
+        out_amount_sats: u64,
+        s_height: u32,
+    ) -> Result<Self> {
+        let spend = crate::tx::txbuild::build_refund(
+            escrow,
+            funding_outpoint,
+            escrow_amount_sats,
+            dest_spk,
+            out_amount_sats,
+        )?;
+        let sig = crate::tx::txbuild::sign_schnorr_single(funder_seckey.serialize(), spend.sighash)?;
+        let signed = crate::tx::txbuild::finalize_refund(spend, escrow, sig)?;
+        let csv_maturity_height = s_height
+            .checked_add(escrow.csv_blocks() as u32)
+            .ok_or(Error::Deadline("refund CSV maturity overflows the height field"))?;
+        PreArmedRefund::from_signed_tx(signed, csv_maturity_height)
     }
 
     /// Wrap an already fully-signed refund transaction produced by the tx layer.
@@ -145,6 +171,34 @@ mod tests {
             should_refund(CompletionStatus::InMempool, true),
             Err(Error::Abort(_))
         ));
+    }
+
+    #[test]
+    fn arm_produces_a_signed_script_path_refund() {
+        let mut rng = rand::rng();
+        let sk = secp::Scalar::random(&mut rng);
+        let other = secp::Scalar::random(&mut rng);
+        let mut keys = [sk * secp::G, other * secp::G];
+        keys.sort_by_key(|p| p.serialize());
+        let ctx = musig2::KeyAggContext::new(keys).unwrap();
+        let internal: secp::Point = ctx.aggregated_pubkey_untweaked();
+        let funder = sk * secp::G;
+        let escrow = crate::tx::escrow::Escrow::new(&internal, &funder, 144).unwrap();
+        let outpoint =
+            bitcoin::OutPoint::new(bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::all_zeros()), 0);
+        let dest = escrow.funding_script_pubkey().clone();
+
+        let refund =
+            PreArmedRefund::arm(&escrow, outpoint, 1_005_000, &sk, dest, 1_000_000, 800_000).unwrap();
+        assert_eq!(refund.csv_maturity_height(), 800_000 + 144);
+
+        // The stored bytes are a real, version-2 tx with the CSV relative lock
+        // and a complete 3-element script-path witness.
+        let tx: bitcoin::Transaction =
+            bitcoin::consensus::encode::deserialize(refund.tx_bytes()).unwrap();
+        assert_eq!(tx.version, bitcoin::transaction::Version::TWO);
+        assert!(tx.input[0].sequence.is_relative_lock_time());
+        assert_eq!(tx.input[0].witness.len(), 3);
     }
 
     #[test]

@@ -93,12 +93,18 @@ impl AdaptorSecret {
 pub struct CompletePreSig {
     /// (R', s_hat) — the adaptor-shifted nonce and aggregate pre-sig scalar.
     sig: AdaptorSignature,
-    /// Aggregate-key context this pre-sig verifies under.
+    /// Aggregate-key context this pre-sig verifies under. For a taproot key-path
+    /// leg this is the TWEAKED context, so `aggregated_pubkey()` is the funded
+    /// OUTPUT key — verify/complete happen under exactly the key on-chain.
     key_agg_ctx: KeyAggContext,
     /// The exact 32-byte message (sighash) it signs.
     message: [u8; 32],
     /// The adaptor point it is bound to.
     t_point: Point,
+    /// The BIP341 tapscript merkle root, if this leg is a taproot key-path spend
+    /// (the tweak input). MUST be re-applied on restore or a rebuilt context
+    /// would verify against the INTERNAL key, not the funded output key.
+    taproot_merkle_root: Option<[u8; 32]>,
 }
 
 impl core::fmt::Debug for CompletePreSig {
@@ -115,13 +121,16 @@ impl core::fmt::Debug for CompletePreSig {
 impl CompletePreSig {
     /// Crate-internal: called ONLY by `signing::assemble_complete_presig`, which
     /// has already aggregated both partials and verified the result.
+    /// `taproot_merkle_root` is `Some` when `key_agg_ctx` carries a taproot
+    /// tweak (key-path leg), so restore can reproduce the tweaked context.
     pub(crate) fn new(
         sig: AdaptorSignature,
         key_agg_ctx: KeyAggContext,
         message: [u8; 32],
         t_point: Point,
+        taproot_merkle_root: Option<[u8; 32]>,
     ) -> Self {
-        CompletePreSig { sig, key_agg_ctx, message, t_point }
+        CompletePreSig { sig, key_agg_ctx, message, t_point, taproot_merkle_root }
     }
 
     pub fn message(&self) -> &[u8; 32] {
@@ -168,35 +177,48 @@ impl CompletePreSig {
     /// the only path, so the material extraction needs has to survive restart).
     ///
     /// SAFE TO PERSIST: contains the adaptor pre-signature, the two aggregate
-    /// pubkeys, the message, and T — no secret nonces (INV-1/2 untouched), no
-    /// secret keys. A stolen record only lets the holder complete the FIXED
-    /// sighash it binds. Layout is fixed 197 bytes:
-    /// `[1 version=1][65 adaptor sig][33 key0][33 key1][32 msg][33 T]`.
+    /// pubkeys, the message, T, and (for a taproot key-path leg) the tapscript
+    /// merkle root — no secret nonces (INV-1/2 untouched), no secret keys. A
+    /// stolen record only lets the holder complete the FIXED sighash it binds.
+    /// Layout is fixed 230 bytes:
+    /// `[1 version=2][65 adaptor sig][33 key0][33 key1][32 msg][33 T]
+    ///  [1 tweak_flag][32 merkle_root]`.
     /// key0/key1 are in the exact KeyAggContext order — BIP327 key aggregation
-    /// is order-dependent. The version byte is reserved for future tweaked
-    /// contexts.
+    /// is order-dependent. tweak_flag=1 => merkle_root is meaningful and the
+    /// context is taproot-tweaked; =0 => raw aggregate, merkle_root is zero.
     pub fn to_bytes(&self) -> Vec<u8> {
         let keys: Vec<Point> = self.key_agg_ctx.pubkeys().to_vec();
-        let mut v = Vec::with_capacity(197);
-        v.push(1u8);
+        let mut v = Vec::with_capacity(230);
+        v.push(2u8);
         v.extend_from_slice(&self.sig.serialize());
         for k in &keys {
             v.extend_from_slice(&k.serialize());
         }
         v.extend_from_slice(&self.message);
         v.extend_from_slice(&self.t_point.serialize());
+        match self.taproot_merkle_root {
+            Some(root) => {
+                v.push(1u8);
+                v.extend_from_slice(&root);
+            }
+            None => {
+                v.push(0u8);
+                v.extend_from_slice(&[0u8; 32]);
+            }
+        }
         v
     }
 
     /// Rebuild from a possession record. Everything is re-validated: points
-    /// re-parsed through the curve checks, the context re-aggregated, and the
-    /// pre-signature RE-VERIFIED against (R + T, P, m) before the value exists
-    /// — a corrupt or tampered record yields Err, never a bogus pre-sig.
+    /// re-parsed through the curve checks, the context re-aggregated AND
+    /// re-tweaked with the recorded merkle root, and the pre-signature
+    /// RE-VERIFIED against (R + T, P, m) before the value exists — a corrupt or
+    /// tampered record yields Err, never a bogus pre-sig.
     pub fn from_bytes(b: &[u8]) -> Result<Self> {
-        if b.len() != 197 {
+        if b.len() != 230 {
             return Err(Error::Validation("possession record: wrong length"));
         }
-        if b[0] != 1 {
+        if b[0] != 2 {
             return Err(Error::Validation("possession record: unknown version"));
         }
         let sig_bytes: [u8; 65] = b[1..66]
@@ -215,10 +237,24 @@ impl CompletePreSig {
         let t: [u8; 33] =
             b[164..197].try_into().map_err(|_| Error::Validation("possession record: T"))?;
         let t_point = ValidatedPoint::from_bytes(&t)?.point(); // <-- gate
+        let tweak_flag = b[197];
+        let root: [u8; 32] =
+            b[198..230].try_into().map_err(|_| Error::Validation("possession record: root"))?;
+        let taproot_merkle_root = match tweak_flag {
+            0 => None,
+            1 => Some(root),
+            _ => return Err(Error::Validation("possession record: bad tweak flag")),
+        };
 
-        let key_agg_ctx = KeyAggContext::new([key0.point(), key1.point()])
+        let base = KeyAggContext::new([key0.point(), key1.point()])
             .map_err(|_| Error::Validation("possession record: key aggregation failed"))?;
-        let presig = CompletePreSig { sig, key_agg_ctx, message, t_point };
+        let key_agg_ctx = match taproot_merkle_root {
+            Some(r) => base
+                .with_taproot_tweak(&r)
+                .map_err(|_| Error::Validation("possession record: taproot tweak"))?,
+            None => base,
+        };
+        let presig = CompletePreSig { sig, key_agg_ctx, message, t_point, taproot_merkle_root };
         // Re-verify: a record that does not verify never becomes a value.
         presig.verify_adaptor(&AdaptorPoint(ValidatedPoint::from_valid(t_point)))?;
         Ok(presig)

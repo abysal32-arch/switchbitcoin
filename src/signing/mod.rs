@@ -277,6 +277,11 @@ pub fn verify_partial(
 /// aggregate is verified against (R + T, P, m) before the value exists at all —
 /// `musig2::adaptor::aggregate_partial_signatures` verifies internally, and this
 /// is the ONLY constructor of `CompletePreSig`.
+///
+/// `key_agg_ctx` must be the SAME context the partials were signed under — for a
+/// taproot key-path leg that is the TWEAKED context, and `taproot_merkle_root`
+/// must be `Some(root)` so the pre-sig can be restored (re-tweaked) after a
+/// crash; for a non-taproot leg pass `None`.
 pub fn assemble_complete_presig(
     key_agg_ctx: &KeyAggContext,
     agg_nonce: &AggNonce,
@@ -284,6 +289,7 @@ pub fn assemble_complete_presig(
     ours: &ValidatedPartial,
     theirs: &ValidatedPartial,
     message: [u8; 32],
+    taproot_merkle_root: Option<[u8; 32]>,
 ) -> Result<CompletePreSig> {
     let sig = musig2::adaptor::aggregate_partial_signatures(
         key_agg_ctx,
@@ -293,7 +299,7 @@ pub fn assemble_complete_presig(
         message,
     )
     .map_err(|_| Error::Verification("aggregate pre-signature failed verification"))?;
-    Ok(CompletePreSig::new(sig, key_agg_ctx.clone(), message, t.point()))
+    Ok(CompletePreSig::new(sig, key_agg_ctx.clone(), message, t.point(), taproot_merkle_root))
 }
 
 #[cfg(test)]

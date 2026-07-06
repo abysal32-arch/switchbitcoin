@@ -153,6 +153,27 @@ pub struct ExchangeInputs {
     /// extraction (which needs this material) is the only path, including
     /// across a crash/restart. Ignored for SH (its crash is refund-safe).
     pub possession_store: Option<std::path::PathBuf>,
+    /// Tapscript merkle root of the escrow Comp->SH spends (SL-funded escrow),
+    /// if this is a real taproot swap. `Some` => the Comp->SH session signs
+    /// under the taproot-tweaked key so the signature is valid for the funded
+    /// OUTPUT key. `None` => untweaked (crypto-core unit-test path). Both
+    /// parties MUST agree on the same roots (they fund the same escrows).
+    pub taproot_root_comp_sh: Option<[u8; 32]>,
+    /// Tapscript merkle root of the escrow Comp->SL spends (SH-funded escrow).
+    pub taproot_root_comp_sl: Option<[u8; 32]>,
+}
+
+/// Apply a taproot tweak to a base context if a merkle root is supplied, else
+/// clone unchanged. The two completions spend DIFFERENT escrows (different CSV,
+/// hence different merkle roots), so each leg gets its own tweaked context.
+fn tweak_ctx(base: &KeyAggContext, root: Option<[u8; 32]>) -> Result<KeyAggContext> {
+    match root {
+        Some(r) => base
+            .clone()
+            .with_taproot_tweak(&r)
+            .map_err(|_| Error::Validation("taproot tweak (exchange)")),
+        None => Ok(base.clone()),
+    }
 }
 
 /// Canonical 2-of-2 key aggregation: BIP327 key aggregation is order-DEPENDENT,
@@ -256,7 +277,12 @@ impl Funded {
     /// refund exists BEFORE the exchange begins (G2 setup): it is an input.
     pub fn run_adaptor_exchange(mut self, inputs: ExchangeInputs) -> Result<Possessing> {
         let our_pubkey = inputs.our_seckey * secp::G;
-        let key_agg_ctx = canonical_key_agg(our_pubkey, inputs.their_pubkey.point())?;
+        let base_ctx = canonical_key_agg(our_pubkey, inputs.their_pubkey.point())?;
+        // Each completion spends a different escrow, so each leg signs under its
+        // own taproot-tweaked context (the tweak MUST be baked in before nonce
+        // generation — BIP327 binds the nonce to the tweaked aggregate key).
+        let ctx_sh = tweak_ctx(&base_ctx, inputs.taproot_root_comp_sh)?;
+        let ctx_sl = tweak_ctx(&base_ctx, inputs.taproot_root_comp_sl)?;
 
         // INV-3: one signer per swap. Both sessions share the ONE lease.
         let lease = match &inputs.lease_dir {
@@ -264,12 +290,13 @@ impl Funded {
             None => SingleSignerLease::acquire(self.peer.swap_session_id)?,
         };
 
-        // Fresh sessions (INV-4), one per completion message.
+        // Fresh sessions (INV-4), one per completion message, each under its
+        // own (possibly taproot-tweaked) context.
         let mut sess_sh = SigningSession::begin(
-            Rc::clone(&lease), key_agg_ctx.clone(), inputs.our_seckey, inputs.msg_comp_sh,
+            Rc::clone(&lease), ctx_sh.clone(), inputs.our_seckey, inputs.msg_comp_sh,
         )?;
         let mut sess_sl = SigningSession::begin(
-            Rc::clone(&lease), key_agg_ctx.clone(), inputs.our_seckey, inputs.msg_comp_sl,
+            Rc::clone(&lease), ctx_sl.clone(), inputs.our_seckey, inputs.msg_comp_sl,
         )?;
 
         // (1) Interlock: commit BOTH, then reveal/exchange nonces.
@@ -303,14 +330,14 @@ impl Funded {
                 // (5) Receive SL's enabling partial; verify BEFORE aggregation.
                 let enabling = expect_sl_enabling(self.peer.recv_msg()?)?;
                 verify_partial(
-                    &key_agg_ctx, &enabling, &agg_nonce_sh, &t_point,
+                    &ctx_sh, &enabling, &agg_nonce_sh, &t_point,
                     &inputs.their_pubkey, &their_nonce_sh, &inputs.msg_comp_sh,
                 )?;
 
                 // (4/G1 for SH) Assemble + verify the complete pre-signature.
                 let presig_comp_sh = assemble_complete_presig(
-                    &key_agg_ctx, &agg_nonce_sh, &t_point, &p_sh, &enabling,
-                    inputs.msg_comp_sh,
+                    &ctx_sh, &agg_nonce_sh, &t_point, &p_sh, &enabling,
+                    inputs.msg_comp_sh, inputs.taproot_root_comp_sh,
                 )?;
                 presig_comp_sh.verify_adaptor(&t_point)?;
 
@@ -328,14 +355,15 @@ impl Funded {
                 // (2) Receive T (validated by the wire gate).
                 let t_point = expect_adaptor_point(self.peer.recv_msg()?)?;
 
-                // (3) Receive SH's partials on BOTH completions; verify each.
+                // (3) Receive SH's partials on BOTH completions; verify each
+                // under that leg's tweaked context.
                 let (sh_p_sh, sh_p_sl) = expect_sh_partials(self.peer.recv_msg()?)?;
                 verify_partial(
-                    &key_agg_ctx, &sh_p_sh, &agg_nonce_sh, &t_point,
+                    &ctx_sh, &sh_p_sh, &agg_nonce_sh, &t_point,
                     &inputs.their_pubkey, &their_nonce_sh, &inputs.msg_comp_sh,
                 )?;
                 verify_partial(
-                    &key_agg_ctx, &sh_p_sl, &agg_nonce_sl, &t_point,
+                    &ctx_sl, &sh_p_sl, &agg_nonce_sl, &t_point,
                     &inputs.their_pubkey, &their_nonce_sl, &inputs.msg_comp_sl,
                 )?;
 
@@ -346,16 +374,16 @@ impl Funded {
                 // (4) G1: assemble + verify the COMPLETE pre-sig for Comp->SH —
                 // the tx we must extract from — BEFORE releasing anything.
                 let presig_comp_sh = assemble_complete_presig(
-                    &key_agg_ctx, &agg_nonce_sh, &t_point, &sl_p_sh, &sh_p_sh,
-                    inputs.msg_comp_sh,
+                    &ctx_sh, &agg_nonce_sh, &t_point, &sl_p_sh, &sh_p_sh,
+                    inputs.msg_comp_sh, inputs.taproot_root_comp_sh,
                 )?;
                 presig_comp_sh.verify_adaptor(&t_point)?;
 
                 // Our own leg's complete pre-sig (v3.11 lesson: hold it, don't
                 // assume it).
                 let presig_comp_sl = assemble_complete_presig(
-                    &key_agg_ctx, &agg_nonce_sl, &t_point, &sl_p_sl, &sh_p_sl,
-                    inputs.msg_comp_sl,
+                    &ctx_sl, &agg_nonce_sl, &t_point, &sl_p_sl, &sh_p_sl,
+                    inputs.msg_comp_sl, inputs.taproot_root_comp_sl,
                 )?;
                 presig_comp_sl.verify_adaptor(&t_point)?;
 
@@ -423,7 +451,7 @@ fn hex32(id: &[u8; 32]) -> String {
 /// Atomically write SL's possession record (tmp + rename). Layout, all LE:
 /// `[1 version=1][4 s_height][params: tier(8) fee(8) early(4) margin(4)
 /// buffer(4) allowance(4) cofund(4) onboard_lo(4) onboard_hi(4)][33 T]
-/// [197 presig_comp_sh][197 presig_comp_sl][4 csv_maturity][4 refund_len]
+/// [230 presig_comp_sh][230 presig_comp_sl][4 csv_maturity][4 refund_len]
 /// [refund_len refund bytes]`.
 #[allow(clippy::too_many_arguments)]
 fn write_possession_record(
@@ -552,9 +580,9 @@ impl Possessing {
         params.validate()?; // the record cannot smuggle in bad timelocks
         let t_bytes: [u8; 33] = take_arr(&b, &mut at)?;
         let t_point = AdaptorPoint::new(ValidatedPoint::from_bytes(&t_bytes)?); // <-- gate
-        let presig_sh_bytes: [u8; 197] = take_arr(&b, &mut at)?;
+        let presig_sh_bytes: [u8; 230] = take_arr(&b, &mut at)?;
         let presig_comp_sh = CompletePreSig::from_bytes(&presig_sh_bytes)?; // re-verifies
-        let presig_sl_bytes: [u8; 197] = take_arr(&b, &mut at)?;
+        let presig_sl_bytes: [u8; 230] = take_arr(&b, &mut at)?;
         let presig_comp_sl = CompletePreSig::from_bytes(&presig_sl_bytes)?; // re-verifies
         // Both pre-signatures must be bound to the record's T.
         presig_comp_sh.verify_adaptor(&t_point)?;
@@ -749,6 +777,8 @@ mod tests {
                 adaptor_secret: Some(t_secret),
                 lease_dir: Some(lease_dir_sh.path().to_path_buf()),
                 possession_store: None, // SH crash is refund-safe; no record needed
+                taproot_root_comp_sh: None,
+                taproot_root_comp_sl: None,
             })?;
             let t_point_bytes = possessing.t_point().to_bytes();
             let sig = possessing.broadcast_completion(broadcast_height, &receipt)?;
@@ -770,6 +800,8 @@ mod tests {
                 adaptor_secret: None,
                 lease_dir: Some(lease_dir_sl.path().to_path_buf()),
                 possession_store: Some(store_dir.to_path_buf()),
+                taproot_root_comp_sh: None,
+                taproot_root_comp_sl: None,
             })
             .expect("SL exchange");
 
@@ -886,6 +918,8 @@ mod tests {
                 adaptor_secret: Some(t_secret),
                 lease_dir: Some(lease_dir_sh.path().to_path_buf()),
                 possession_store: None,
+                taproot_root_comp_sh: None,
+                taproot_root_comp_sl: None,
             })?;
             Ok(())
         });
@@ -905,6 +939,8 @@ mod tests {
             adaptor_secret: None,
             lease_dir: Some(lease_dir_sl.path().to_path_buf()),
             possession_store: Some(store.path().to_path_buf()),
+            taproot_root_comp_sh: None,
+            taproot_root_comp_sl: None,
         });
 
         // SL MUST abort...
@@ -1058,6 +1094,8 @@ mod tests {
                 adaptor_secret: Some(t_secret),
                 lease_dir: Some(lease_dir_sh.path().to_path_buf()),
                 possession_store: None,
+                taproot_root_comp_sh: None,
+                taproot_root_comp_sl: None,
             })?;
 
             // deadline = S + 144 - 24 = S + 120.
@@ -1093,6 +1131,8 @@ mod tests {
                 adaptor_secret: None,
                 lease_dir: Some(lease_dir_sl.path().to_path_buf()),
                 possession_store: Some(store.path().to_path_buf()),
+                taproot_root_comp_sh: None,
+                taproot_root_comp_sl: None,
             })
             .expect("SL exchange");
 
