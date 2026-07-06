@@ -199,16 +199,33 @@ impl Watchtower {
         Ok(Watchtower { refund, escrow_outpoint })
     }
 
-    /// Poll the chain and fire the refund if (and only if) it is both matured
-    /// and not superseded by a winning completion. Returns Ok(true) if the
-    /// refund was broadcast this poll, Ok(false) if there is nothing to do yet,
-    /// Err(Abort) if a completion is winning (owner should take the swap).
+    /// Poll the chain and fire the refund if (and only if) the escrow is still
+    /// unspent AND the CSV has matured. Returns Ok(true) if the refund was
+    /// broadcast this poll, Ok(false) if there is nothing to do YET.
+    ///
+    /// Crucially, an in-mempool completion is treated as TRANSIENT ("keep
+    /// watching"), NOT as a permanent stand-down: a low-fee completion parked in
+    /// the mempool can be evicted and never confirm, and a watchtower that stood
+    /// down forever on it would strand a dead owner's refund. Only a CONFIRMED
+    /// completion is terminal (the swap went through; nothing to refund). The
+    /// chain's single-spend rule guarantees we never race a confirmed
+    /// completion: once it confirms, the escrow is Confirmed here and broadcast
+    /// would be rejected anyway.
     pub fn poll(&self, chain: &impl crate::chain::ChainView) -> Result<bool> {
-        match run(&self.refund, chain, self.escrow_outpoint) {
-            Ok(()) => Ok(true),
-            // "not yet matured" is a normal not-yet-actionable state, not an error.
-            Err(Error::Deadline(_)) => Ok(false),
-            Err(e) => Err(e),
+        use crate::chain::SpendStatus;
+        match chain.spend_status(self.escrow_outpoint) {
+            // Completion won: terminal, nothing to do (owner takes the swap).
+            SpendStatus::Confirmed(_) => Ok(false),
+            // Completion pending but not final: keep watching (may evict).
+            SpendStatus::InMempool => Ok(false),
+            SpendStatus::Unspent => {
+                if chain.tip_height() >= self.refund.csv_maturity_height() {
+                    chain.broadcast(self.refund.tx_bytes())?;
+                    Ok(true)
+                } else {
+                    Ok(false) // CSV not matured yet
+                }
+            }
         }
     }
 }

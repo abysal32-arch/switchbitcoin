@@ -325,6 +325,41 @@ fn sh_offline_after_broadcast_watchtower_covers() {
     // would stand down instead of racing it (covered in row 4).
 }
 
+// ---- 3b. Watchtower must not stand down forever on an EVICTABLE mempool
+// completion (dead-owner robustness; regression for a review find) ----------
+#[test]
+fn watchtower_waits_through_mempool_completion_then_fires_on_eviction() {
+    let swap = run_onchain_exchange();
+    let refund = PreArmedRefund::arm(
+        &swap.escrow_comp_sl,
+        swap.op_comp_sl,
+        swap.escrow_amount,
+        &swap.sh.sk,
+        swap.escrow_comp_sl.funding_script_pubkey().clone(),
+        swap.d,
+        swap.s_height,
+    )
+    .unwrap();
+    let receipt = confirm_watchtower_handoff(&refund, refund.fingerprint()).unwrap();
+    let wt = Watchtower::arm(refund, swap.op_comp_sl, &receipt).unwrap();
+
+    // A completion of E_sh sits in the mempool (the sim does not verify sigs, so
+    // a placeholder-witnessed key-path spend is enough to occupy the outpoint).
+    let pending = finalize_key_spend(swap.comp_sl_spend.clone(), [0u8; 64]);
+    swap.chain.broadcast(&pending).expect("completion to mempool");
+    swap.chain.advance(u32::try_from(swap.params.delta_late()).unwrap()); // CSV matured
+
+    // Even though the refund's CSV has matured, the watchtower must WAIT (not
+    // fire and not stand down) while a completion is pending in the mempool.
+    assert!(!wt.poll(&swap.chain).expect("poll waits"), "fired against a pending completion");
+
+    // The completion is evicted (never confirms). Now the watchtower fires.
+    swap.chain.evict(swap.op_comp_sl);
+    assert!(wt.poll(&swap.chain).expect("poll fires"), "did not fire after eviction");
+    swap.chain.mine();
+    assert!(matches!(swap.chain.spend_status(swap.op_comp_sl), SpendStatus::Confirmed(_)));
+}
+
 // ---- 4. Refund/completion race (completion-supersedes) ---------------------
 #[test]
 fn refund_completion_race_resolves_deterministically() {
@@ -534,8 +569,14 @@ fn partial_funding_funded_side_reclaims() {
     newkey::settlement::refund::run(&refund, &chain, op).expect("refund broadcasts");
     chain.mine();
     assert!(matches!(chain.spend_status(op), SpendStatus::Confirmed(_)));
-    // Nothing broadcastable against it: the output is now spent by SL's refund.
-    assert!(chain.broadcast(refund.tx_bytes()).is_ok()); // idempotent re-broadcast of same txid
+    // Nothing broadcastable against it: a DIFFERENT tx (e.g. a would-be
+    // completion) spending the now-confirmed refund output is rejected.
+    let competing = finalize_key_spend(
+        build_completion(&escrow, op, escrow_amount, escrow.funding_script_pubkey().clone(), params.tier_d_sats)
+            .unwrap(),
+        [0u8; 64],
+    );
+    assert!(chain.broadcast(&competing).is_err(), "a competing spend of the reclaimed escrow was accepted");
 }
 
 // ---- 8. Congestion beyond delta_fee ---------------------------------------
@@ -543,6 +584,51 @@ fn partial_funding_funded_side_reclaims() {
 #[ignore = "needs a fee model: the SimChain deliberately omits fees, so a spike > delta_fee, opt-in completion bump, and silent refund backstop cannot be exercised here"]
 fn congestion_backstop_behaves() {
     unimplemented!("congestion backstop needs a fee-aware chain model");
+}
+
+// ---- Co-funding-skew race window (regression for the critical review find) -
+// SL's claim deadline MUST anchor to the SH-funded escrow's OWN confirmation
+// height, not the later co-funding baseline S. Under skew (E_sh confirms before
+// E_sl), anchoring to S would authorize a Comp->SL confirmation PAST the height
+// at which SH's refund of E_sh matures — a reachable extract-and-race window
+// where SH takes both legs. This test funds E_sh strictly earlier than E_sl.
+#[test]
+fn cofunding_skew_anchors_claim_to_swept_escrow_not_s() {
+    let params = Params::testnet_provisional();
+    let f_sh = 600_000u32; // SH-funded escrow (SL sweeps it) confirms FIRST
+    let f_sl = f_sh + params.cofunding_window; // SL-funded escrow later; max skew
+    let chain = SimChain::new(f_sl);
+    let op_sh_funded = OutPoint::new(txid_from(1), 0); // E_sh — SL sweeps via Comp->SL
+    let op_sl_funded = OutPoint::new(txid_from(2), 0); // E_sl — SH sweeps via Comp->SH
+    chain.fund(op_sh_funded, f_sh);
+    chain.fund(op_sl_funded, f_sl);
+
+    // SL's view: our_funding = E_sl, their_funding = E_sh.
+    let funded = Funding::new(params.clone(), PeerSession::new([1u8; 32], Box::new(duplex().0)))
+        .await_funded(&chain, op_sl_funded, op_sh_funded)
+        .expect("SL funded");
+    assert_eq!(funded.role(), Role::SecretLearner);
+    assert_eq!(funded.s_height(), f_sl, "S is the later confirmation");
+    assert_eq!(funded.sweep_escrow_height(), f_sh, "anchor is E_sh's own height");
+
+    // The true on-chain maturity of SH's refund of E_sh (relative to E_sh):
+    let true_deadline = f_sh as u64 + params.delta_late();
+    let reveal = funded.s_height(); // Comp->SH confirms around when E_sl is funded
+
+    // CORRECT anchor (the swept escrow) keeps SL's worst-case claim within the
+    // true deadline.
+    let ok_max = params.max_claim_delay(funded.sweep_escrow_height(), reveal);
+    assert!(
+        reveal as u64 + ok_max + params.claim_confirm_allowance as u64 <= true_deadline,
+        "correctly-anchored claim must confirm before SH's E_sh refund matures"
+    );
+    // The OLD buggy anchor (S) would have over-granted PAST the true deadline —
+    // this proves the skew scenario genuinely exposes the bug (regression guard).
+    let buggy_max = params.max_claim_delay(funded.s_height(), reveal);
+    assert!(
+        reveal as u64 + buggy_max + params.claim_confirm_allowance as u64 > true_deadline,
+        "skew scenario does not actually exercise the race window"
+    );
 }
 
 // ---- await_funded role derivation (chain-view coverage) -------------------

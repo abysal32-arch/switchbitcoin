@@ -91,6 +91,11 @@ pub struct Funded {
     peer: PeerSession,
     role: Role,
     s_height: u32,
+    /// Confirmation height of the escrow WE sweep (the counterparty-funded
+    /// escrow). SL's claim deadline is anchored HERE, not to S: bitcoin's
+    /// relative CSV on the SH-funded escrow matures from that escrow's own
+    /// funding height, so anchoring to S would over-grant under co-funding skew.
+    sweep_escrow_height: u32,
 }
 
 /// Role-specific settlement material produced by the exchange. Encodes the
@@ -112,6 +117,9 @@ pub struct Possessing {
     params: Params,
     role: Role,
     s_height: u32,
+    /// Confirmation height of the escrow we sweep — SL's claim deadline anchor
+    /// (see `Funded::sweep_escrow_height`).
+    sweep_escrow_height: u32,
     presig_comp_sh: CompletePreSig, // verified (G1)
     t_point: AdaptorPoint,
     pre_armed_refund: PreArmedRefund, // exists BEFORE any broadcast (G2)
@@ -276,7 +284,15 @@ impl Funding {
         }
         let role = if ours < theirs { Role::SecretHolder } else { Role::SecretLearner };
 
-        Ok(Funded { params: self.params, peer: self.peer, role, s_height })
+        // We sweep the COUNTERPARTY's escrow (SH sweeps E_sl via Comp->SH; SL
+        // sweeps E_sh via Comp->SL), so the sweep anchor is their funding height.
+        Ok(Funded {
+            params: self.params,
+            peer: self.peer,
+            role,
+            s_height,
+            sweep_escrow_height: their_h,
+        })
     }
 
     /// Hand-fed variant for the stubbed-discovery build (Requirement 5): the
@@ -285,7 +301,16 @@ impl Funding {
     /// exists. Params are validated here exactly as in `await_funded`.
     pub fn funded_manual(self, role: Role, s_height: u32) -> Result<Funded> {
         self.params.validate()?;
-        Ok(Funded { params: self.params, peer: self.peer, role, s_height })
+        // Manual mode assumes zero co-funding skew (both escrows at S), so the
+        // sweep anchor is S. Skewed funding must go through `await_funded`,
+        // which records the real per-escrow confirmation heights.
+        Ok(Funded {
+            params: self.params,
+            peer: self.peer,
+            role,
+            s_height,
+            sweep_escrow_height: s_height,
+        })
     }
 }
 
@@ -296,6 +321,11 @@ impl Funded {
 
     pub fn s_height(&self) -> u32 {
         self.s_height
+    }
+
+    /// Confirmation height of the escrow this party sweeps (SL's claim anchor).
+    pub fn sweep_escrow_height(&self) -> u32 {
+        self.sweep_escrow_height
     }
 
     /// Run the interlocked adaptor exchange (Phase 5 messages 1–5), ending with
@@ -382,6 +412,7 @@ impl Funded {
                     params: self.params,
                     role: self.role,
                     s_height: self.s_height,
+                    sweep_escrow_height: self.sweep_escrow_height,
                     presig_comp_sh,
                     t_point,
                     pre_armed_refund: inputs.pre_armed_refund,
@@ -436,6 +467,7 @@ impl Funded {
                     store,
                     &self.peer.swap_session_id,
                     self.s_height,
+                    self.sweep_escrow_height,
                     &self.params,
                     &t_point,
                     &presig_comp_sh,
@@ -462,6 +494,7 @@ impl Funded {
                     params: self.params,
                     role: self.role,
                     s_height: self.s_height,
+                    sweep_escrow_height: self.sweep_escrow_height,
                     presig_comp_sh,
                     t_point,
                     pre_armed_refund: inputs.pre_armed_refund,
@@ -486,15 +519,16 @@ fn hex32(id: &[u8; 32]) -> String {
 }
 
 /// Atomically write SL's possession record (tmp + rename). Layout, all LE:
-/// `[1 version=1][4 s_height][params: tier(8) fee(8) early(4) margin(4)
-/// buffer(4) allowance(4) cofund(4) onboard_lo(4) onboard_hi(4)][33 T]
-/// [230 presig_comp_sh][230 presig_comp_sl][4 csv_maturity][4 refund_len]
-/// [refund_len refund bytes]`.
+/// `[1 version=2][4 s_height][4 sweep_escrow_height][params: tier(8) fee(8)
+/// early(4) margin(4) buffer(4) allowance(4) cofund(4) onboard_lo(4)
+/// onboard_hi(4)][33 T][230 presig_comp_sh][230 presig_comp_sl]
+/// [4 csv_maturity][4 refund_len][refund_len refund bytes]`.
 #[allow(clippy::too_many_arguments)]
 fn write_possession_record(
     dir: &std::path::Path,
     swap_session_id: &[u8; 32],
     s_height: u32,
+    sweep_escrow_height: u32,
     params: &Params,
     t_point: &AdaptorPoint,
     presig_comp_sh: &CompletePreSig,
@@ -503,8 +537,9 @@ fn write_possession_record(
 ) -> Result<std::path::PathBuf> {
     std::fs::create_dir_all(dir).map_err(|_| Error::Abort("possession store unavailable"))?;
     let mut v = Vec::with_capacity(512 + refund.tx_bytes().len());
-    v.push(1u8);
+    v.push(2u8);
     v.extend_from_slice(&s_height.to_le_bytes());
+    v.extend_from_slice(&sweep_escrow_height.to_le_bytes());
     v.extend_from_slice(&params.tier_d_sats.to_le_bytes());
     v.extend_from_slice(&params.delta_fee_sats.to_le_bytes());
     v.extend_from_slice(&params.delta_early.to_le_bytes());
@@ -600,10 +635,11 @@ impl Possessing {
             .map_err(|_| Error::Abort("possession record unreadable"))?;
         let mut at = 0usize;
         let version: [u8; 1] = take_arr(&b, &mut at)?;
-        if version[0] != 1 {
+        if version[0] != 2 {
             return Err(Error::Validation("possession record: unknown version"));
         }
         let s_height = take_le_u32(&b, &mut at)?;
+        let sweep_escrow_height = take_le_u32(&b, &mut at)?;
         let params = Params {
             tier_d_sats: take_le_u64(&b, &mut at)?,
             delta_fee_sats: take_le_u64(&b, &mut at)?,
@@ -638,6 +674,7 @@ impl Possessing {
             params,
             role: Role::SecretLearner,
             s_height,
+            sweep_escrow_height,
             presig_comp_sh,
             t_point,
             pre_armed_refund,
@@ -697,9 +734,11 @@ impl Possessing {
 
     /// SL ONLY: on seeing Comp->SH's final signature in the mempool, extract t
     /// (via the verified CompletePreSig — G1), complete our own leg, and plan a
-    /// randomized claim delay bounded so we still confirm before S + delta_late
-    /// (review item #5). The bound is enforced by construction: the sampled
-    /// delay cannot exceed `params.max_claim_delay`.
+    /// randomized claim delay bounded so we still confirm before the SH-funded
+    /// escrow's LATE refund matures (review item #5). The bound is enforced by
+    /// construction: the sampled delay cannot exceed `params.max_claim_delay`,
+    /// which is anchored to the escrow WE sweep — NOT to the co-funding
+    /// baseline S — so co-funding skew cannot widen the race window.
     pub fn claim_after_reveal(
         &self,
         final_sig_comp_sh: &ValidatedFinalSig,
@@ -714,8 +753,11 @@ impl Possessing {
         // Extraction (review item #2): t = s_final - s_hat, checked t*G == T.
         let t = self.presig_comp_sh.extract_secret(final_sig_comp_sh)?;
 
-        // Bounded randomized decorrelation delay: sample space is [0, max_delay].
-        let max_delay = self.params.max_claim_delay(self.s_height, current_height);
+        // Bounded randomized decorrelation delay, anchored to the SWEPT escrow's
+        // confirmation height (fixes the co-funding-skew race window).
+        let max_delay = self
+            .params
+            .max_claim_delay(self.sweep_escrow_height, current_height);
         let delay_blocks = sample_claim_delay(max_delay);
 
         let sig = presig_comp_sl.complete_with(&t)?;
@@ -1044,7 +1086,9 @@ mod tests {
         );
         let mut bytes = std::fs::read(&out.possession_record).unwrap();
         // Flip a byte inside the first pre-signature (past the header+params+T).
-        let idx = 1 + 4 + 40 + 33 + 10; // into presig_comp_sh
+        // Header = version(1) + s_height(4) + sweep(4) + params(44) + T(33) = 86;
+        // land 10 bytes into presig_comp_sh so from_bytes re-verify fails.
+        let idx = 1 + 4 + 4 + 44 + 33 + 10;
         bytes[idx] ^= 0x01;
         let bad = store.path().join("bad.possession");
         std::fs::write(&bad, &bytes).unwrap();

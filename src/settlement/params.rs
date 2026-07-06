@@ -102,10 +102,17 @@ impl Params {
 
     /// Upper bound for the randomized SL claim delay (in blocks), such that
     /// broadcast at `reveal_height + delay` still confirms (within the
-    /// allowance) strictly before S + delta_late. Total; never panics.
+    /// allowance) strictly before the SH-funded escrow's LATE refund matures.
+    ///
+    /// `anchor_height` MUST be the confirmation height of the escrow SL sweeps
+    /// (the SH-funded escrow), NOT the co-funding baseline S. Bitcoin's relative
+    /// timelock matures at `anchor_height + delta_late` measured from THAT
+    /// escrow's own funding, so anchoring to S (= max of the two funding heights)
+    /// would over-grant by up to `cofunding_window` blocks and open a reachable
+    /// extract-and-race window under co-funding skew. Total; never panics.
     /// Returns 0 when the window is already tight or past — claim IMMEDIATELY.
-    pub fn max_claim_delay(&self, s_height: u32, reveal_height: u32) -> u64 {
-        let deadline = s_height as u64 + self.delta_late();
+    pub fn max_claim_delay(&self, anchor_height: u32, reveal_height: u32) -> u64 {
+        let deadline = anchor_height as u64 + self.delta_late();
         let budget_end = deadline.saturating_sub(self.claim_confirm_allowance as u64);
         budget_end.saturating_sub(reveal_height as u64)
     }

@@ -81,6 +81,15 @@ impl SimChain {
     pub fn advance(&self, blocks: u32) {
         self.0.lock().unwrap().height += blocks;
     }
+
+    /// Evict an UNCONFIRMED (mempool) spend of `outpoint`, if any — models a
+    /// low-fee tx dropping out of the mempool. Confirmed spends are untouched.
+    pub fn evict(&self, outpoint: OutPoint) {
+        let mut g = self.0.lock().unwrap();
+        if let Some((_txid, None)) = g.spends.get(&outpoint) {
+            g.spends.remove(&outpoint);
+        }
+    }
 }
 
 impl ChainView for SimChain {
