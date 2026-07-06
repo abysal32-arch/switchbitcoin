@@ -23,7 +23,9 @@
 use crate::crypto::{ValidatedFinalSig, ValidatedPoint};
 use crate::{Error, Result};
 use musig2::{AdaptorSignature, KeyAggContext, LiftedSignature};
+use rand::TryRngCore;
 use secp::{MaybeScalar, Point, Scalar};
+use zeroize::Zeroizing;
 
 /// The adaptor point T = t*G. SH publishes this; t itself is NEVER sent.
 ///
@@ -54,12 +56,23 @@ impl AdaptorPoint {
 pub struct AdaptorSecret(Scalar);
 
 impl AdaptorSecret {
-    /// SH-side: draw a fresh t from OS-seeded randomness and derive T = t*G.
+    /// SH-side: draw a fresh t from OS randomness and derive T = t*G.
+    /// FALLIBLE by design: RNG failure maps to `Error::Abort` (the crate-wide
+    /// rule that every failure path is an Err, never a panic — `rand::rng()`
+    /// would panic on first-use entropy failure).
     pub fn generate() -> Result<(AdaptorSecret, AdaptorPoint)> {
-        let mut rng = rand::rng();
-        let t = Scalar::random(&mut rng);
-        let point = AdaptorPoint(ValidatedPoint::from_valid(t * secp::G));
-        Ok((AdaptorSecret(t), point))
+        // Rejection-sample a nonzero scalar (P(reject) ~ 2^-128 per draw).
+        for _ in 0..8 {
+            let mut buf = Zeroizing::new([0u8; 32]);
+            rand::rngs::OsRng
+                .try_fill_bytes(buf.as_mut())
+                .map_err(|_| Error::Abort("OS randomness unavailable; cannot mint adaptor secret"))?;
+            if let Ok(t) = Scalar::from_slice(&*buf) {
+                let point = AdaptorPoint(ValidatedPoint::from_valid(t * secp::G));
+                return Ok((AdaptorSecret(t), point));
+            }
+        }
+        Err(Error::Abort("OS randomness returned out-of-range scalars repeatedly"))
     }
 
     /// The point this secret opens: T = t*G.
@@ -147,6 +160,68 @@ impl CompletePreSig {
             return Err(Error::Abort("extracted secret does not open the published T; aborting"));
         }
         Ok(AdaptorSecret(t))
+    }
+
+    /// Serialize for the G1 possession record (crash-safety: SL MUST persist
+    /// its complete pre-signatures BEFORE releasing the enabling partial —
+    /// after release, ABORT_REFUND is no longer a safe sink and extraction is
+    /// the only path, so the material extraction needs has to survive restart).
+    ///
+    /// SAFE TO PERSIST: contains the adaptor pre-signature, the two aggregate
+    /// pubkeys, the message, and T — no secret nonces (INV-1/2 untouched), no
+    /// secret keys. A stolen record only lets the holder complete the FIXED
+    /// sighash it binds. Layout is fixed 197 bytes:
+    /// `[1 version=1][65 adaptor sig][33 key0][33 key1][32 msg][33 T]`.
+    /// key0/key1 are in the exact KeyAggContext order — BIP327 key aggregation
+    /// is order-dependent. The version byte is reserved for future tweaked
+    /// contexts.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let keys: Vec<Point> = self.key_agg_ctx.pubkeys().to_vec();
+        let mut v = Vec::with_capacity(197);
+        v.push(1u8);
+        v.extend_from_slice(&self.sig.serialize());
+        for k in &keys {
+            v.extend_from_slice(&k.serialize());
+        }
+        v.extend_from_slice(&self.message);
+        v.extend_from_slice(&self.t_point.serialize());
+        v
+    }
+
+    /// Rebuild from a possession record. Everything is re-validated: points
+    /// re-parsed through the curve checks, the context re-aggregated, and the
+    /// pre-signature RE-VERIFIED against (R + T, P, m) before the value exists
+    /// — a corrupt or tampered record yields Err, never a bogus pre-sig.
+    pub fn from_bytes(b: &[u8]) -> Result<Self> {
+        if b.len() != 197 {
+            return Err(Error::Validation("possession record: wrong length"));
+        }
+        if b[0] != 1 {
+            return Err(Error::Validation("possession record: unknown version"));
+        }
+        let sig_bytes: [u8; 65] = b[1..66]
+            .try_into()
+            .map_err(|_| Error::Validation("possession record: sig slice"))?;
+        let sig = AdaptorSignature::from_bytes(&sig_bytes)
+            .map_err(|_| Error::Validation("possession record: malformed adaptor signature"))?;
+        let k0: [u8; 33] =
+            b[66..99].try_into().map_err(|_| Error::Validation("possession record: key0"))?;
+        let k1: [u8; 33] =
+            b[99..132].try_into().map_err(|_| Error::Validation("possession record: key1"))?;
+        let key0 = ValidatedPoint::from_bytes(&k0)?; // <-- gate
+        let key1 = ValidatedPoint::from_bytes(&k1)?; // <-- gate
+        let message: [u8; 32] =
+            b[132..164].try_into().map_err(|_| Error::Validation("possession record: msg"))?;
+        let t: [u8; 33] =
+            b[164..197].try_into().map_err(|_| Error::Validation("possession record: T"))?;
+        let t_point = ValidatedPoint::from_bytes(&t)?.point(); // <-- gate
+
+        let key_agg_ctx = KeyAggContext::new([key0.point(), key1.point()])
+            .map_err(|_| Error::Validation("possession record: key aggregation failed"))?;
+        let presig = CompletePreSig { sig, key_agg_ctx, message, t_point };
+        // Re-verify: a record that does not verify never becomes a value.
+        presig.verify_adaptor(&AdaptorPoint(ValidatedPoint::from_valid(t_point)))?;
+        Ok(presig)
     }
 
     /// Repair to the final signature using the known secret (SH completing, or SL

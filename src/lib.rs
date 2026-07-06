@@ -11,10 +11,10 @@
 //!
 //!   * Requirement 1 — crypto is pinned in Cargo.toml; no hand-rolling.
 //!   * Requirement 2 — every deserialized point/scalar is validated on receipt
-//!                     (see `wire` + `crypto::validate`). Invalid => Abort.
+//!     (see `wire` + `crypto::validate`). Invalid => Abort.
 //!   * Requirement 3 — nonce-lifecycle invariants INV-1..4 are encoded as a
-//!                     non-resumable, non-clonable `SecretNonce` and a signing
-//!                     state machine that CANNOT survive a restart.
+//!     non-resumable, non-clonable `SecretNonce` and a signing state machine
+//!     that CANNOT survive a restart.
 //!   * Requirement 4 — the wire parser is the fuzz target (see ./fuzz).
 //!   * Requirement 6 — parameters are named constants in `settlement::params`.
 //!   * Requirement 7 — the failure checklist is stubbed as named tests.

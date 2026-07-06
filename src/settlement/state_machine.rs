@@ -33,7 +33,6 @@ use crate::signing::{
 use crate::wire::{parse_message, serialize_message, Message};
 use crate::{Error, Result};
 use musig2::KeyAggContext;
-use rand::Rng;
 use secp::{Point, Scalar};
 use std::rc::Rc;
 
@@ -101,8 +100,8 @@ enum RoleState {
     /// SH holds t itself (it minted it) and completes Comp->SH with it.
     SecretHolder { t: AdaptorSecret },
     /// SL holds the complete pre-signature for its own leg, completable once
-    /// t is extracted from SH's broadcast.
-    SecretLearner { presig_comp_sl: CompletePreSig },
+    /// t is extracted from SH's broadcast. Boxed: much larger than the SH arm.
+    SecretLearner { presig_comp_sl: Box<CompletePreSig> },
 }
 
 /// Phase 5 complete: we hold what we need to EXTRACT or COMPLETE — i.e. the
@@ -119,12 +118,17 @@ pub struct Possessing {
     role_state: RoleState,
 }
 
-/// Witness that G1 holds. Non-constructible except inside
-/// `Funded::run_adaptor_exchange`, after the Comp->SH complete pre-signature
-/// verified. Presenting it to `release_enabling_partial` is the ONLY way the
-/// enabling partial goes on the wire. (Field is module-private: not even other
-/// crate modules can mint one.)
-pub struct PossessionWitness(());
+/// Witness that G1 holds FOR ONE SPECIFIC SWAP. Non-constructible except
+/// inside `Funded::run_adaptor_exchange`, after the Comp->SH complete
+/// pre-signature verified; minted exactly ONCE per exchange and consumed by
+/// `release_enabling_partial` — it never escapes this module. The witness is
+/// BOUND to the swap and the extraction message: a witness earned in one swap
+/// cannot release anything in another (fields are module-private).
+pub struct PossessionWitness {
+    swap_session_id: [u8; 32],
+    #[allow(dead_code)] // binding recorded for audit; release checks swap id
+    msg_comp_sh: [u8; 32],
+}
 
 /// Everything the exchange needs from the caller. Secrets stay in fields the
 /// caller constructs; the exchange derives pubkeys and contexts itself.
@@ -143,6 +147,12 @@ pub struct ExchangeInputs {
     pub adaptor_secret: Option<AdaptorSecret>,
     /// Lease directory override (tests / alternate stores). None = default.
     pub lease_dir: Option<std::path::PathBuf>,
+    /// Durable directory for the G1 possession record. REQUIRED for SL: the
+    /// complete pre-signatures MUST be persisted before the enabling partial
+    /// is released — after release, refund is no longer a safe sink and
+    /// extraction (which needs this material) is the only path, including
+    /// across a crash/restart. Ignored for SH (its crash is refund-safe).
+    pub possession_store: Option<std::path::PathBuf>,
 }
 
 /// Canonical 2-of-2 key aggregation: BIP327 key aggregation is order-DEPENDENT,
@@ -187,13 +197,17 @@ fn expect_sl_enabling(m: Message) -> Result<crate::crypto::ValidatedPartial> {
 }
 
 /// The ONLY function that puts SL's enabling partial on the wire, and it
-/// demands the possession witness (G1). The witness is consumed: one release.
-pub fn release_enabling_partial(
+/// demands the possession witness (G1). The witness is consumed (one release)
+/// and must be bound to THIS peer's swap — a stale witness from another swap
+/// is rejected, so G1 cannot be replayed across swaps.
+fn release_enabling_partial(
     witness: PossessionWitness,
     peer: &mut PeerSession,
     enabling_partial: crate::crypto::ValidatedPartial,
 ) -> Result<()> {
-    let PossessionWitness(()) = witness; // consumed
+    if witness.swap_session_id != peer.swap_session_id {
+        return Err(Error::Ordering("possession witness is bound to a different swap"));
+    }
     peer.send_msg(&Message::SlEnablingPartial(enabling_partial))
 }
 
@@ -227,21 +241,20 @@ impl Funded {
     }
 
     /// Run the interlocked adaptor exchange (Phase 5 messages 1–5), ending with
-    /// a VERIFIED complete pre-signature for Comp->SH. Producing `Possessing` +
-    /// `PossessionWitness` is the ONLY way past the gate.
+    /// a VERIFIED complete pre-signature for Comp->SH. Producing `Possessing`
+    /// is the ONLY way past the gate; the `PossessionWitness` that authorizes
+    /// the SL enabling release is minted once in here and consumed in here.
     ///
     /// Ordering is mandatory and enforced lexically below:
-    ///   1. both own sessions committed, THEN nonces revealed/exchanged
-    ///   2. T received (validated) / sent
-    ///   3. SH partials on BOTH completions; PartialSigVerify each
-    ///   4. assemble + verify the CompletePreSig for Comp->SH   <-- G1
-    ///   5. (SL) release the enabling partial ONLY via the witness
+    /// 1. both own sessions committed, THEN nonces revealed/exchanged
+    /// 2. T received (validated) / sent
+    /// 3. SH partials on BOTH completions; PartialSigVerify each
+    /// 4. assemble + verify the CompletePreSig for Comp->SH  (G1)
+    /// 5. (SL) release the enabling partial ONLY via the witness
+    ///
     /// Any verification failure => Err (=> Abort => refund). The pre-armed
     /// refund exists BEFORE the exchange begins (G2 setup): it is an input.
-    pub fn run_adaptor_exchange(
-        mut self,
-        inputs: ExchangeInputs,
-    ) -> Result<(Possessing, PossessionWitness)> {
+    pub fn run_adaptor_exchange(mut self, inputs: ExchangeInputs) -> Result<Possessing> {
         let our_pubkey = inputs.our_seckey * secp::G;
         let key_agg_ctx = canonical_key_agg(our_pubkey, inputs.their_pubkey.point())?;
 
@@ -301,19 +314,15 @@ impl Funded {
                 )?;
                 presig_comp_sh.verify_adaptor(&t_point)?;
 
-                let witness = PossessionWitness(());
-                Ok((
-                    Possessing {
-                        params: self.params,
-                        role: self.role,
-                        s_height: self.s_height,
-                        presig_comp_sh,
-                        t_point,
-                        pre_armed_refund: inputs.pre_armed_refund,
-                        role_state: RoleState::SecretHolder { t: t_secret },
-                    },
-                    witness,
-                ))
+                Ok(Possessing {
+                    params: self.params,
+                    role: self.role,
+                    s_height: self.s_height,
+                    presig_comp_sh,
+                    t_point,
+                    pre_armed_refund: inputs.pre_armed_refund,
+                    role_state: RoleState::SecretHolder { t: t_secret },
+                })
             }
             Role::SecretLearner => {
                 // (2) Receive T (validated by the wire gate).
@@ -350,29 +359,134 @@ impl Funded {
                 )?;
                 presig_comp_sl.verify_adaptor(&t_point)?;
 
-                // G1 satisfied — mint the witness, and ONLY NOW release the
-                // enabling partial, through the witness-demanding gate.
-                let witness = PossessionWitness(());
-                release_enabling_partial(witness, &mut self.peer, sl_p_sh)?;
+                // G1 satisfied. PERSIST-THEN-RELEASE: once the enabling partial
+                // is on the wire, refund is no longer a safe sink — extraction
+                // is the only path, and it needs these pre-signatures. So the
+                // possession record MUST hit durable storage before release,
+                // making the InMempool->extraction route survive crash/restart.
+                let store = inputs.possession_store.as_deref().ok_or(Error::Ordering(
+                    "SL requires a possession_store: presigs must be durable before release",
+                ))?;
+                let record_path = write_possession_record(
+                    store,
+                    &self.peer.swap_session_id,
+                    self.s_height,
+                    &self.params,
+                    &t_point,
+                    &presig_comp_sh,
+                    &presig_comp_sl,
+                    &inputs.pre_armed_refund,
+                )?;
 
-                // A fresh witness for the caller (the release consumed one; the
-                // caller's copy proves the same fact, minted at the same point).
-                let witness = PossessionWitness(());
-                Ok((
-                    Possessing {
-                        params: self.params,
-                        role: self.role,
-                        s_height: self.s_height,
-                        presig_comp_sh,
-                        t_point,
-                        pre_armed_refund: inputs.pre_armed_refund,
-                        role_state: RoleState::SecretLearner { presig_comp_sl },
+                // Mint the ONE witness (bound to this swap) and release through
+                // the witness-demanding gate. Release is the point of no return:
+                // if send errors, the bytes may still have been delivered, so we
+                // do NOT unwind to refund — the persisted record lets this node
+                // (or its restart) keep watching for SH's broadcast and extract.
+                let witness = PossessionWitness {
+                    swap_session_id: self.peer.swap_session_id,
+                    msg_comp_sh: inputs.msg_comp_sh,
+                };
+                if release_enabling_partial(witness, &mut self.peer, sl_p_sh).is_err() {
+                    // Delivered-or-not is unknowable (TCP/Tor). Proceed as
+                    // released; the record at `record_path` covers restart.
+                    let _ = &record_path;
+                }
+
+                Ok(Possessing {
+                    params: self.params,
+                    role: self.role,
+                    s_height: self.s_height,
+                    presig_comp_sh,
+                    t_point,
+                    pre_armed_refund: inputs.pre_armed_refund,
+                    role_state: RoleState::SecretLearner {
+                        presig_comp_sl: Box::new(presig_comp_sl),
                     },
-                    witness,
-                ))
+                })
             }
         }
     }
+}
+
+// ----- G1 possession record (crash-safety for the post-release window) ------
+
+fn hex32(id: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(64);
+    for b in id {
+        use core::fmt::Write;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// Atomically write SL's possession record (tmp + rename). Layout, all LE:
+/// `[1 version=1][4 s_height][params: tier(8) fee(8) early(4) margin(4)
+/// buffer(4) allowance(4) cofund(4) onboard_lo(4) onboard_hi(4)][33 T]
+/// [197 presig_comp_sh][197 presig_comp_sl][4 csv_maturity][4 refund_len]
+/// [refund_len refund bytes]`.
+#[allow(clippy::too_many_arguments)]
+fn write_possession_record(
+    dir: &std::path::Path,
+    swap_session_id: &[u8; 32],
+    s_height: u32,
+    params: &Params,
+    t_point: &AdaptorPoint,
+    presig_comp_sh: &CompletePreSig,
+    presig_comp_sl: &CompletePreSig,
+    refund: &PreArmedRefund,
+) -> Result<std::path::PathBuf> {
+    std::fs::create_dir_all(dir).map_err(|_| Error::Abort("possession store unavailable"))?;
+    let mut v = Vec::with_capacity(512 + refund.tx_bytes().len());
+    v.push(1u8);
+    v.extend_from_slice(&s_height.to_le_bytes());
+    v.extend_from_slice(&params.tier_d_sats.to_le_bytes());
+    v.extend_from_slice(&params.delta_fee_sats.to_le_bytes());
+    v.extend_from_slice(&params.delta_early.to_le_bytes());
+    v.extend_from_slice(&params.margin.to_le_bytes());
+    v.extend_from_slice(&params.delta_buffer.to_le_bytes());
+    v.extend_from_slice(&params.claim_confirm_allowance.to_le_bytes());
+    v.extend_from_slice(&params.cofunding_window.to_le_bytes());
+    v.extend_from_slice(&params.onboarding_delay_hours.0.to_le_bytes());
+    v.extend_from_slice(&params.onboarding_delay_hours.1.to_le_bytes());
+    v.extend_from_slice(&t_point.to_bytes());
+    v.extend_from_slice(&presig_comp_sh.to_bytes());
+    v.extend_from_slice(&presig_comp_sl.to_bytes());
+    v.extend_from_slice(&refund.csv_maturity_height().to_le_bytes());
+    let refund_bytes = refund.tx_bytes();
+    v.extend_from_slice(&(refund_bytes.len() as u32).to_le_bytes());
+    v.extend_from_slice(refund_bytes);
+
+    let path = dir.join(format!("{}.possession", hex32(swap_session_id)));
+    let tmp = dir.join(format!("{}.possession.tmp", hex32(swap_session_id)));
+    std::fs::write(&tmp, &v).map_err(|_| Error::Abort("possession record write failed"))?;
+    std::fs::rename(&tmp, &path)
+        .map_err(|_| Error::Abort("possession record rename failed"))?;
+    Ok(path)
+}
+
+fn take_le_u32(b: &[u8], at: &mut usize) -> Result<u32> {
+    let s = b
+        .get(*at..*at + 4)
+        .ok_or(Error::Validation("possession record truncated"))?;
+    *at += 4;
+    Ok(u32::from_le_bytes(s.try_into().map_err(|_| Error::Validation("u32 slice"))?))
+}
+
+fn take_le_u64(b: &[u8], at: &mut usize) -> Result<u64> {
+    let s = b
+        .get(*at..*at + 8)
+        .ok_or(Error::Validation("possession record truncated"))?;
+    *at += 8;
+    Ok(u64::from_le_bytes(s.try_into().map_err(|_| Error::Validation("u64 slice"))?))
+}
+
+fn take_arr<const N: usize>(b: &[u8], at: &mut usize) -> Result<[u8; N]> {
+    let s = b
+        .get(*at..*at + N)
+        .ok_or(Error::Validation("possession record truncated"))?;
+    *at += N;
+    s.try_into().map_err(|_| Error::Validation("array slice"))
 }
 
 /// The completed final signature for a leg, ready for the (chain-layer) Tor
@@ -387,9 +501,85 @@ pub struct ClaimPlan {
     pub comp_sl_final: CompletionSig,
 }
 
+/// Bounded randomized claim delay. Fallible OS randomness; on RNG failure the
+/// delay is 0, which is always inside the legal window (claim immediately —
+/// privacy decorrelation degrades, settlement safety does not). Modulo bias is
+/// immaterial for a privacy jitter. Kept as a plain function so the bound is
+/// unit-testable at the boundaries (review item #5).
+fn sample_claim_delay(max_delay: u64) -> u32 {
+    use rand::TryRngCore;
+    if max_delay == 0 {
+        return 0;
+    }
+    let mut b = [0u8; 8];
+    if rand::rngs::OsRng.try_fill_bytes(&mut b).is_err() {
+        return 0;
+    }
+    let cap = max_delay.min(u32::MAX as u64);
+    (u64::from_le_bytes(b) % (cap + 1)) as u32
+}
+
 impl Possessing {
     pub fn role(&self) -> Role {
         self.role
+    }
+
+    /// Rebuild SL's `Possessing` from the persisted G1 possession record —
+    /// the crash/restart path for the post-release window. Everything is
+    /// re-validated on the way in: params re-checked against the ordering
+    /// invariant, both pre-signatures re-verified against (R + T, P, m), and
+    /// both must be bound to the T stored in the record. A tampered or corrupt
+    /// record is an Err, never a bogus possession.
+    pub fn restore_secret_learner(record_path: &std::path::Path) -> Result<Possessing> {
+        let b = std::fs::read(record_path)
+            .map_err(|_| Error::Abort("possession record unreadable"))?;
+        let mut at = 0usize;
+        let version: [u8; 1] = take_arr(&b, &mut at)?;
+        if version[0] != 1 {
+            return Err(Error::Validation("possession record: unknown version"));
+        }
+        let s_height = take_le_u32(&b, &mut at)?;
+        let params = Params {
+            tier_d_sats: take_le_u64(&b, &mut at)?,
+            delta_fee_sats: take_le_u64(&b, &mut at)?,
+            delta_early: take_le_u32(&b, &mut at)?,
+            margin: take_le_u32(&b, &mut at)?,
+            delta_buffer: take_le_u32(&b, &mut at)?,
+            claim_confirm_allowance: take_le_u32(&b, &mut at)?,
+            cofunding_window: take_le_u32(&b, &mut at)?,
+            onboarding_delay_hours: (take_le_u32(&b, &mut at)?, take_le_u32(&b, &mut at)?),
+        };
+        params.validate()?; // the record cannot smuggle in bad timelocks
+        let t_bytes: [u8; 33] = take_arr(&b, &mut at)?;
+        let t_point = AdaptorPoint::new(ValidatedPoint::from_bytes(&t_bytes)?); // <-- gate
+        let presig_sh_bytes: [u8; 197] = take_arr(&b, &mut at)?;
+        let presig_comp_sh = CompletePreSig::from_bytes(&presig_sh_bytes)?; // re-verifies
+        let presig_sl_bytes: [u8; 197] = take_arr(&b, &mut at)?;
+        let presig_comp_sl = CompletePreSig::from_bytes(&presig_sl_bytes)?; // re-verifies
+        // Both pre-signatures must be bound to the record's T.
+        presig_comp_sh.verify_adaptor(&t_point)?;
+        presig_comp_sl.verify_adaptor(&t_point)?;
+        let csv = take_le_u32(&b, &mut at)?;
+        let refund_len = take_le_u32(&b, &mut at)? as usize;
+        let refund_bytes = b
+            .get(at..at + refund_len)
+            .ok_or(Error::Validation("possession record truncated (refund)"))?;
+        if b.len() != at + refund_len {
+            return Err(Error::Validation("possession record: trailing bytes"));
+        }
+        let pre_armed_refund = PreArmedRefund::from_signed_tx(refund_bytes.to_vec(), csv)?;
+
+        Ok(Possessing {
+            params,
+            role: Role::SecretLearner,
+            s_height,
+            presig_comp_sh,
+            t_point,
+            pre_armed_refund,
+            role_state: RoleState::SecretLearner {
+                presig_comp_sl: Box::new(presig_comp_sl),
+            },
+        })
     }
 
     pub fn s_height(&self) -> u32 {
@@ -459,19 +649,9 @@ impl Possessing {
         // Extraction (review item #2): t = s_final - s_hat, checked t*G == T.
         let t = self.presig_comp_sh.extract_secret(final_sig_comp_sh)?;
 
-        // Bounded randomized decorrelation delay.
+        // Bounded randomized decorrelation delay: sample space is [0, max_delay].
         let max_delay = self.params.max_claim_delay(self.s_height, current_height);
-        // Never delay past the window; the sample space is [0, max_delay].
-        let delay_blocks = if max_delay == 0 {
-            0
-        } else {
-            rand::rng().random_range(0..=max_delay.min(u32::MAX as u64)) as u32
-        };
-        debug_assert!(
-            current_height as u64 + delay_blocks as u64 + self.params.claim_confirm_allowance as u64
-                <= self.s_height as u64 + self.params.delta_late()
-                || max_delay == 0
-        );
+        let delay_blocks = sample_claim_delay(max_delay);
 
         let sig = presig_comp_sl.complete_with(&t)?;
         Ok(ClaimPlan { delay_blocks, comp_sl_final: CompletionSig(sig) })
@@ -516,55 +696,71 @@ mod tests {
         PartySetup { seckey, pubkey: seckey * secp::G }
     }
 
-    /// Full two-party in-process exchange + settlement crypto:
-    ///   exchange -> SH broadcast authorization -> SL extraction -> SL claim.
-    /// Proves G1/G2 wiring and the adaptor math end-to-end without a chain.
-    #[test]
-    fn two_party_exchange_extract_and_claim() {
-        let sh_keys = keypair();
-        let sl_keys = keypair();
-        let (io_sh, io_sl) = duplex();
-        let swap_id = [0xabu8; 32];
-        let msg_comp_sh = [0x51u8; 32]; // tx layer will supply real sighashes
-        let msg_comp_sl = [0x52u8; 32];
-        let params = Params::testnet_provisional();
-        let s_height = 100_000;
+    /// Independently recompute the 2-of-2 aggregate key (canonical ordering)
+    /// and BIP340-verify a completed leg signature against `message`. This does
+    /// NOT rely on any production-internal check — it catches a regression in
+    /// complete_with that the "len() == 64" tautology would miss.
+    fn independently_verify_leg(a: Point, b: Point, message: &[u8; 32], sig: &[u8; 64]) {
+        let ctx = canonical_key_agg(a, b).expect("agg");
+        let agg: Point = ctx.aggregated_pubkey();
+        let lifted = musig2::LiftedSignature::from_bytes(sig).expect("well-formed sig");
+        musig2::verify_single(agg, lifted, message).expect("leg must verify under aggregate key");
+    }
 
+    /// Result bundle from a full happy-path exchange, retaining the artifacts
+    /// the assertions and negative tests need.
+    struct ExchangeOutcome {
+        sl_possessing: Possessing,
+        sh_completion: CompletionSig,
+        sh_t_point: [u8; 33],
+        possession_record: std::path::PathBuf,
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_happy_exchange(
+        swap_id: [u8; 32],
+        msg_comp_sh: [u8; 32],
+        msg_comp_sl: [u8; 32],
+        s_height: u32,
+        broadcast_height: u32,
+        sh_keys: &PartySetup,
+        sl_keys: &PartySetup,
+        store_dir: &std::path::Path,
+    ) -> ExchangeOutcome {
+        let (io_sh, io_sl) = duplex();
+        let params = Params::testnet_provisional();
         let lease_dir_sh = tempfile::tempdir().expect("tempdir");
         let lease_dir_sl = tempfile::tempdir().expect("tempdir");
-
-        // SH runs in a second thread (its sessions/leases never cross threads);
-        // SL runs here. Byte channels are the only thing crossing.
         let sh_params = params.clone();
-        let sl_pub = sl_keys.pubkey;
+        let (sh_sk, sl_pub) = (sh_keys.seckey, sl_keys.pubkey);
+
         let sh_handle = std::thread::spawn(move || -> Result<(CompletionSig, [u8; 33])> {
             let refund = PreArmedRefund::from_signed_tx(vec![0xaa; 64], s_height + 300)?;
             let receipt = confirm_watchtower_handoff(&refund, refund.fingerprint())?;
             let (t_secret, _t_point) = AdaptorSecret::generate()?;
             let peer = PeerSession::new(swap_id, Box::new(io_sh));
             let funded = Funding::new(sh_params, peer).funded_manual(Role::SecretHolder, s_height)?;
-            let (possessing, _witness) = funded.run_adaptor_exchange(ExchangeInputs {
-                our_seckey: sh_keys.seckey,
+            let possessing = funded.run_adaptor_exchange(ExchangeInputs {
+                our_seckey: sh_sk,
                 their_pubkey: ValidatedPoint::from_bytes(&sl_pub.serialize())?,
                 msg_comp_sh,
                 msg_comp_sl,
                 pre_armed_refund: refund,
                 adaptor_secret: Some(t_secret),
                 lease_dir: Some(lease_dir_sh.path().to_path_buf()),
+                possession_store: None, // SH crash is refund-safe; no record needed
             })?;
             let t_point_bytes = possessing.t_point().to_bytes();
-            // G2-gated completion; broadcast itself is chain-layer.
-            let sig = possessing.broadcast_completion(s_height + 10, &receipt)?;
+            let sig = possessing.broadcast_completion(broadcast_height, &receipt)?;
             Ok((sig, t_point_bytes))
         });
 
-        // SL side.
         let refund = PreArmedRefund::from_signed_tx(vec![0xbb; 64], s_height + 200).unwrap();
         let peer = PeerSession::new(swap_id, Box::new(io_sl));
         let funded = Funding::new(params, peer)
             .funded_manual(Role::SecretLearner, s_height)
             .expect("funded");
-        let (sl_possessing, _witness) = funded
+        let sl_possessing = funded
             .run_adaptor_exchange(ExchangeInputs {
                 our_seckey: sl_keys.seckey,
                 their_pubkey: ValidatedPoint::from_bytes(&sh_keys.pubkey.serialize()).unwrap(),
@@ -573,35 +769,262 @@ mod tests {
                 pre_armed_refund: refund,
                 adaptor_secret: None,
                 lease_dir: Some(lease_dir_sl.path().to_path_buf()),
+                possession_store: Some(store_dir.to_path_buf()),
             })
             .expect("SL exchange");
 
-        let (sh_completion, sh_t_point) = sh_handle.join().expect("SH thread").expect("SH side");
+        let (sh_completion, sh_t_point) =
+            sh_handle.join().expect("SH thread").expect("SH side");
+        let possession_record = store_dir.join(format!("{}.possession", hex32(&swap_id)));
+        ExchangeOutcome { sl_possessing, sh_completion, sh_t_point, possession_record }
+    }
+
+    /// Full two-party in-process exchange + settlement crypto:
+    ///   exchange -> SH broadcast authorization -> SL extraction -> SL claim.
+    /// Proves G1/G2 wiring and the adaptor math end-to-end without a chain,
+    /// with INDEPENDENT signature verification of both completed legs.
+    #[test]
+    fn two_party_exchange_extract_and_claim() {
+        let sh_keys = keypair();
+        let sl_keys = keypair();
+        let swap_id = [0xabu8; 32];
+        let msg_comp_sh = [0x51u8; 32];
+        let msg_comp_sl = [0x52u8; 32];
+        let s_height = 100_000;
+        let store = tempfile::tempdir().expect("store");
+
+        let out = run_happy_exchange(
+            swap_id, msg_comp_sh, msg_comp_sl, s_height, s_height + 10,
+            &sh_keys, &sl_keys, store.path(),
+        );
 
         // Both parties agreed on T.
-        assert_eq!(sl_possessing.t_point().to_bytes(), sh_t_point);
+        assert_eq!(out.sl_possessing.t_point().to_bytes(), out.sh_t_point);
 
-        // "Mempool observation": SL sees SH's final signature bytes.
-        let observed = ValidatedFinalSig::from_bytes(&sh_completion.0).expect("well-formed sig");
-        let plan = sl_possessing
+        // SH's completed Comp->SH is a valid BIP340 sig under the aggregate key
+        // (independent of any production-internal verification).
+        independently_verify_leg(sh_keys.pubkey, sl_keys.pubkey, &msg_comp_sh, &out.sh_completion.0);
+
+        // "Mempool observation": SL sees SH's final signature, extracts t, claims.
+        let observed = ValidatedFinalSig::from_bytes(&out.sh_completion.0).expect("well-formed");
+        let plan = out
+            .sl_possessing
             .claim_after_reveal(&observed, s_height + 12)
             .expect("extract + claim");
 
-        // The claim delay respects the review-item-#5 bound.
+        // Review-item-#5 bound holds for the ACTUAL sampled delay.
         let p = Params::testnet_provisional();
         assert!(
             (s_height + 12) as u64 + plan.delay_blocks as u64 + p.claim_confirm_allowance as u64
                 <= s_height as u64 + p.delta_late()
         );
 
-        // SL's completed leg is a real 64-byte BIP340 signature (verified
-        // internally by complete_with against the aggregate key for Comp->SL).
-        assert_eq!(plan.comp_sl_final.0.len(), 64);
+        // SL's completed Comp->SL independently verifies — proves extraction
+        // recovered the correct t (a wrong t could not have produced this sig).
+        independently_verify_leg(
+            sh_keys.pubkey, sl_keys.pubkey, &msg_comp_sl, &plan.comp_sl_final.0,
+        );
+    }
+
+    /// G1 NEGATIVE HALF: a corrupted SH partial must make SL abort WITHOUT ever
+    /// putting its enabling partial (tag 0x04) on the wire. This is the gate the
+    /// whole scaffold exists to protect; here it is proven, not just lexical.
+    #[test]
+    fn sl_aborts_without_releasing_on_corrupt_sh_partial() {
+        use std::sync::{Arc, Mutex};
+
+        /// Wraps SL's transport: flips a byte inside the ShPartials (tag 0x03)
+        /// comp_sh scalar as it arrives, and records the tags SL sends out.
+        struct CorruptingTransport {
+            inner: ChannelTransport,
+            sent_tags: Arc<Mutex<Vec<u8>>>,
+        }
+        impl Transport for CorruptingTransport {
+            fn send(&mut self, bytes: &[u8]) -> Result<()> {
+                if let Some(&tag) = bytes.first() {
+                    self.sent_tags.lock().unwrap().push(tag);
+                }
+                self.inner.send(bytes)
+            }
+            fn recv(&mut self) -> Result<Vec<u8>> {
+                let mut b = self.inner.recv()?;
+                // ShPartials = [0x03][32 comp_sh][32 comp_sl]; flip the last
+                // byte of comp_sh — stays a valid scalar (< n w.h.p.), so it
+                // passes the WIRE gate and must fail verify_partial instead.
+                if b.first() == Some(&0x03) && b.len() >= 33 {
+                    b[32] ^= 0x01;
+                }
+                Ok(b)
+            }
+        }
+
+        let sh_keys = keypair();
+        let sl_keys = keypair();
+        let (io_sh, io_sl) = duplex();
+        let swap_id = [0xeeu8; 32];
+        let (msg_a, msg_b) = ([0x71u8; 32], [0x72u8; 32]);
+        let params = Params::testnet_provisional();
+        let s_height = 9_000;
+        let store = tempfile::tempdir().expect("store");
+        let lease_dir_sh = tempfile::tempdir().expect("tempdir");
+        let lease_dir_sl = tempfile::tempdir().expect("tempdir");
+
+        let sh_params = params.clone();
+        let (sh_sk, sl_pub) = (sh_keys.seckey, sl_keys.pubkey);
+        // SH plays honestly; it will error when SL aborts and drops the channel.
+        let sh = std::thread::spawn(move || -> Result<()> {
+            let refund = PreArmedRefund::from_signed_tx(vec![0x11; 32], s_height + 300)?;
+            let (t_secret, _) = AdaptorSecret::generate()?;
+            let peer = PeerSession::new(swap_id, Box::new(io_sh));
+            let funded = Funding::new(sh_params, peer).funded_manual(Role::SecretHolder, s_height)?;
+            let _ = funded.run_adaptor_exchange(ExchangeInputs {
+                our_seckey: sh_sk,
+                their_pubkey: ValidatedPoint::from_bytes(&sl_pub.serialize())?,
+                msg_comp_sh: msg_a,
+                msg_comp_sl: msg_b,
+                pre_armed_refund: refund,
+                adaptor_secret: Some(t_secret),
+                lease_dir: Some(lease_dir_sh.path().to_path_buf()),
+                possession_store: None,
+            })?;
+            Ok(())
+        });
+
+        let sent_tags = Arc::new(Mutex::new(Vec::new()));
+        let transport = CorruptingTransport { inner: io_sl, sent_tags: Arc::clone(&sent_tags) };
+        let peer = PeerSession::new(swap_id, Box::new(transport));
+        let funded = Funding::new(params, peer)
+            .funded_manual(Role::SecretLearner, s_height)
+            .expect("funded");
+        let result = funded.run_adaptor_exchange(ExchangeInputs {
+            our_seckey: sl_keys.seckey,
+            their_pubkey: ValidatedPoint::from_bytes(&sh_keys.pubkey.serialize()).unwrap(),
+            msg_comp_sh: msg_a,
+            msg_comp_sl: msg_b,
+            pre_armed_refund: PreArmedRefund::from_signed_tx(vec![0x33; 32], s_height + 200).unwrap(),
+            adaptor_secret: None,
+            lease_dir: Some(lease_dir_sl.path().to_path_buf()),
+            possession_store: Some(store.path().to_path_buf()),
+        });
+
+        // SL MUST abort...
+        assert!(result.is_err(), "SL accepted a corrupted SH partial");
+        // ...and MUST NOT have released its enabling partial (tag 0x04).
+        let tags = sent_tags.lock().unwrap();
+        assert!(!tags.contains(&0x04), "SL released enabling partial despite bad SH partial (G1 breach)");
+        // ...and no possession record was written (nothing to persist pre-release).
+        assert!(
+            std::fs::read_dir(store.path()).unwrap().next().is_none(),
+            "possession record written before a verified pre-sig"
+        );
+        let _ = sh.join();
+    }
+
+    /// G1 CRASH-SAFETY: after release, SL can rebuild its full possession from
+    /// the persisted record (fresh process), then extract + claim. Proves the
+    /// post-release window is crash-safe, not fund-losing.
+    #[test]
+    fn sl_restores_possession_after_crash_and_claims() {
+        let sh_keys = keypair();
+        let sl_keys = keypair();
+        let swap_id = [0x5au8; 32];
+        let msg_comp_sh = [0x61u8; 32];
+        let msg_comp_sl = [0x62u8; 32];
+        let s_height = 200_000;
+        let store = tempfile::tempdir().expect("store");
+
+        let out = run_happy_exchange(
+            swap_id, msg_comp_sh, msg_comp_sl, s_height, s_height + 10,
+            &sh_keys, &sl_keys, store.path(),
+        );
+        // The record exists on disk (persist-then-release).
+        assert!(out.possession_record.exists(), "no possession record persisted");
+
+        // Simulate a crash: throw away the in-memory Possessing entirely.
+        let sh_completion = out.sh_completion;
+        drop(out.sl_possessing);
+
+        // Fresh process rebuilds from the record — everything re-validated.
+        let restored = Possessing::restore_secret_learner(&out.possession_record)
+            .expect("restore from possession record");
+        assert_eq!(restored.role(), Role::SecretLearner);
+
+        // Extraction + claim succeed post-restore; leg independently verifies.
+        let observed = ValidatedFinalSig::from_bytes(&sh_completion.0).expect("well-formed");
+        let plan = restored.claim_after_reveal(&observed, s_height + 15).expect("claim after restore");
+        independently_verify_leg(
+            sh_keys.pubkey, sl_keys.pubkey, &msg_comp_sl, &plan.comp_sl_final.0,
+        );
+    }
+
+    /// A tampered possession record never yields a valid Possessing.
+    #[test]
+    fn corrupt_possession_record_is_rejected() {
+        let sh_keys = keypair();
+        let sl_keys = keypair();
+        let swap_id = [0x3cu8; 32];
+        let s_height = 50_000;
+        let store = tempfile::tempdir().expect("store");
+        let out = run_happy_exchange(
+            swap_id, [7u8; 32], [8u8; 32], s_height, s_height + 10,
+            &sh_keys, &sl_keys, store.path(),
+        );
+        let mut bytes = std::fs::read(&out.possession_record).unwrap();
+        // Flip a byte inside the first pre-signature (past the header+params+T).
+        let idx = 1 + 4 + 40 + 33 + 10; // into presig_comp_sh
+        bytes[idx] ^= 0x01;
+        let bad = store.path().join("bad.possession");
+        std::fs::write(&bad, &bytes).unwrap();
+        assert!(Possessing::restore_secret_learner(&bad).is_err());
+    }
+
+    /// Extraction defensive paths (review item #2): a final signature from a
+    /// DIFFERENT swap must never yield a secret.
+    #[test]
+    fn extraction_rejects_unrelated_final_sig() {
+        let sh_keys = keypair();
+        let sl_keys = keypair();
+        let store_a = tempfile::tempdir().expect("a");
+        let store_b = tempfile::tempdir().expect("b");
+        let s = 300_000;
+        let a = run_happy_exchange([1u8; 32], [0x11; 32], [0x12; 32], s, s + 10, &sh_keys, &sl_keys, store_a.path());
+        let b = run_happy_exchange([2u8; 32], [0x21; 32], [0x22; 32], s, s + 10, &sh_keys, &sl_keys, store_b.path());
+
+        // Swap B's final signature fed to swap A's Comp->SH pre-signature.
+        let foreign = ValidatedFinalSig::from_bytes(&b.sh_completion.0).expect("well-formed");
+        assert!(
+            a.sl_possessing.presig_comp_sh().extract_secret(&foreign).is_err(),
+            "extracted a secret from an unrelated final signature"
+        );
+        // The matching one still works.
+        let own = ValidatedFinalSig::from_bytes(&a.sh_completion.0).expect("well-formed");
+        assert!(a.sl_possessing.presig_comp_sh().extract_secret(&own).is_ok());
+    }
+
+    /// complete_with and verify_adaptor reject a secret / adaptor point that
+    /// does not match the pre-signature's bound T (adaptor.rs defensive paths).
+    #[test]
+    fn completion_and_verify_reject_wrong_adaptor_material() {
+        let sh_keys = keypair();
+        let sl_keys = keypair();
+        let store = tempfile::tempdir().expect("store");
+        let s = 400_000;
+        let out = run_happy_exchange(
+            [4u8; 32], [0x31; 32], [0x32; 32], s, s + 10, &sh_keys, &sl_keys, store.path(),
+        );
+        let presig = out.sl_possessing.presig_comp_sh();
+
+        // A secret for an unrelated T cannot complete this pre-signature.
+        let (wrong_secret, wrong_point) = AdaptorSecret::generate().unwrap();
+        assert!(presig.complete_with(&wrong_secret).is_err());
+        // ...and verifying against the wrong adaptor point is refused.
+        assert!(presig.verify_adaptor(&wrong_point).is_err());
+        // The correct T still verifies.
+        assert!(presig.verify_adaptor(out.sl_possessing.t_point()).is_ok());
     }
 
     #[test]
-    fn broadcast_refuses_inside_buffer_and_without_receipt() {
-        // Drive a minimal exchange to obtain a legitimate SH Possessing.
+    fn broadcast_gate_boundary_and_receipt() {
         let sh_keys = keypair();
         let sl_keys = keypair();
         let (io_sh, io_sl) = duplex();
@@ -609,15 +1032,16 @@ mod tests {
         let (msg_a, msg_b) = ([1u8; 32], [2u8; 32]);
         let params = Params::testnet_provisional();
         let s_height = 5_000;
+        let store = tempfile::tempdir().expect("store");
         let lease_dir_sh = tempfile::tempdir().expect("tempdir");
         let lease_dir_sl = tempfile::tempdir().expect("tempdir");
 
         let sl_pub = sl_keys.pubkey;
         let sh_params = params.clone();
+        let sh_sk = sh_keys.seckey;
         let sh = std::thread::spawn(move || -> Result<()> {
             let refund = PreArmedRefund::from_signed_tx(vec![0x11; 32], s_height + 300)?;
             let good_receipt = confirm_watchtower_handoff(&refund, refund.fingerprint())?;
-            // Receipt for a DIFFERENT refund must not satisfy G2.
             let other = PreArmedRefund::from_signed_tx(vec![0x22; 32], s_height + 300)?;
             let wrong_receipt = confirm_watchtower_handoff(&other, other.fingerprint())?;
 
@@ -625,21 +1049,25 @@ mod tests {
             let peer = PeerSession::new(swap_id, Box::new(io_sh));
             let funded =
                 Funding::new(sh_params, peer).funded_manual(Role::SecretHolder, s_height)?;
-            let (possessing, _w) = funded.run_adaptor_exchange(ExchangeInputs {
-                our_seckey: sh_keys.seckey,
+            let possessing = funded.run_adaptor_exchange(ExchangeInputs {
+                our_seckey: sh_sk,
                 their_pubkey: ValidatedPoint::from_bytes(&sl_pub.serialize())?,
                 msg_comp_sh: msg_a,
                 msg_comp_sl: msg_b,
                 pre_armed_refund: refund,
                 adaptor_secret: Some(t_secret),
                 lease_dir: Some(lease_dir_sh.path().to_path_buf()),
+                possession_store: None,
             })?;
 
-            // Inside the buffer: deadline = S + 144 - 24 = S + 120.
+            // deadline = S + 144 - 24 = S + 120.
+            // Exact boundary: refused.
             assert!(matches!(
                 possessing.broadcast_completion(s_height + 120, &good_receipt),
                 Err(Error::Deadline(_))
             ));
+            // Last permitted height S + 119: allowed (pins the runway window).
+            assert!(possessing.broadcast_completion(s_height + 119, &good_receipt).is_ok());
             // Wrong watchtower receipt: refused.
             assert!(matches!(
                 possessing.broadcast_completion(s_height + 10, &wrong_receipt),
@@ -655,7 +1083,7 @@ mod tests {
         let funded = Funding::new(params, peer)
             .funded_manual(Role::SecretLearner, s_height)
             .expect("funded");
-        let (_sl_possessing, _w) = funded
+        let _sl = funded
             .run_adaptor_exchange(ExchangeInputs {
                 our_seckey: sl_keys.seckey,
                 their_pubkey: ValidatedPoint::from_bytes(&sh_keys.pubkey.serialize()).unwrap(),
@@ -664,9 +1092,32 @@ mod tests {
                 pre_armed_refund: refund,
                 adaptor_secret: None,
                 lease_dir: Some(lease_dir_sl.path().to_path_buf()),
+                possession_store: Some(store.path().to_path_buf()),
             })
             .expect("SL exchange");
 
         sh.join().expect("SH thread").expect("SH assertions");
+    }
+
+    #[test]
+    fn claim_delay_sampler_respects_boundaries() {
+        // max_delay == 0 => always 0.
+        for _ in 0..1000 {
+            assert_eq!(sample_claim_delay(0), 0);
+        }
+        // max_delay == 1 => only 0 or 1, both observed over many draws.
+        let mut seen0 = false;
+        let mut seen1 = false;
+        for _ in 0..2000 {
+            let d = sample_claim_delay(1);
+            assert!(d <= 1, "sampled delay {d} exceeds max 1");
+            seen0 |= d == 0;
+            seen1 |= d == 1;
+        }
+        assert!(seen0 && seen1, "sampler did not cover both endpoints of [0, 1]");
+        // Larger cap: never exceeds it.
+        for _ in 0..2000 {
+            assert!(sample_claim_delay(198) <= 198);
+        }
     }
 }

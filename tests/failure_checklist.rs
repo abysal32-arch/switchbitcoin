@@ -39,6 +39,12 @@ fn happy_path_full_swap() {
 }
 
 // ---- 2. Crash during signing (INV-4: no nonce reuse) ----------------------
+// This row proves the RETRY property: after a session ends and a fresh one is
+// begun for the same (key, message), the nonce differs — no reuse (INV-4).
+// The distinct REAL-CRASH property (Drop skipped => lease stays held => signing
+// is refused, INV-3) is proven separately in
+// signing::tests::real_crash_leaves_lease_held_and_refuses_signing; here we
+// model a GRACEFUL restart (Drop runs, lease released) and check nonce freshness.
 #[test]
 fn crash_during_signing_never_reuses_nonce() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -46,20 +52,20 @@ fn crash_during_signing_never_reuses_nonce() {
     let (ctx, sk) = test_key_ctx();
     let (msg_a, msg_b) = ([1u8; 32], [2u8; 32]);
 
-    // First attempt: sessions live, nonces revealed... then the process "dies".
+    // First attempt: sessions live, nonces revealed... then a graceful shutdown
+    // (scope exit runs Drop, releasing the lease). INV-2: no session state
+    // persists — the signing state lived only in volatile memory.
     let first = {
         let lease = SingleSignerLease::acquire_in(dir.path(), swap_id).expect("lease");
         let mut s1 = SigningSession::begin(lease.clone(), ctx.clone(), sk, msg_a).expect("s1");
         let mut s2 = SigningSession::begin(lease.clone(), ctx.clone(), sk, msg_b).expect("s2");
         let revealed = commit_and_reveal(&mut s1, &mut s2).expect("reveal");
         (revealed.comp_sh.to_bytes(), revealed.comp_sl.to_bytes())
-        // s1, s2, lease all drop here — the "crash". INV-2: nothing survives.
     };
 
-    // Nothing persisted: the lease file is gone and no session state exists on
-    // disk anywhere (the lease dir is this swap's only storage surface).
+    // No session/nonce state persisted anywhere (lease dir is the only surface).
     let leftovers: Vec<_> = std::fs::read_dir(dir.path()).expect("dir").collect();
-    assert!(leftovers.is_empty(), "no session/nonce state may survive a crash");
+    assert!(leftovers.is_empty(), "no session/nonce state may survive a restart");
 
     // Retry: fresh lease, fresh sessions. INV-4: every nonce differs.
     let lease = SingleSignerLease::acquire_in(dir.path(), swap_id).expect("re-acquire");
@@ -67,8 +73,8 @@ fn crash_during_signing_never_reuses_nonce() {
     let mut s2 = SigningSession::begin(lease.clone(), ctx, sk, msg_b).expect("s2 retry");
     let second = commit_and_reveal(&mut s1, &mut s2).expect("reveal retry");
 
-    assert_ne!(first.0, second.comp_sh.to_bytes(), "comp_sh nonce reused after crash+retry");
-    assert_ne!(first.1, second.comp_sl.to_bytes(), "comp_sl nonce reused after crash+retry");
+    assert_ne!(first.0, second.comp_sh.to_bytes(), "comp_sh nonce reused after restart+retry");
+    assert_ne!(first.1, second.comp_sl.to_bytes(), "comp_sl nonce reused after restart+retry");
 }
 
 // ---- 3. SH offline after broadcast (G2 crash-safety) ----------------------

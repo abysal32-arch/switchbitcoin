@@ -6,13 +6,20 @@
 //!
 //!   INV-1  secret nonce never leaves volatile memory
 //!          -> `SecretNonce` is `!Clone`, `!Serialize`, private, and never
-//!             returned by value from this module. The generation SEED is
-//!             zeroized after use. CAVEAT (cryptographer review item #4):
-//!             musig2 0.4.1's `SecNonce` itself implements no Zeroize, so the
-//!             two nonce scalars are dropped, not scrubbed — residual copies in
-//!             freed memory are possible. Documented, not hidden; the crate-side
-//!             fix belongs upstream (or via a zeroizable [u8;97] round-trip that
-//!             itself creates transient copies).
+//!             returned by value from this module.
+//!             SCRUBBING CAVEATS (cryptographer review item #4 — disclosed,
+//!             not hidden; the real fix belongs upstream in musig2):
+//!             (a) musig2 0.4.1's `SecNonce` implements no Zeroize, so the two
+//!                 nonce scalars are dropped, not scrubbed.
+//!             (b) The seed buffer WE own is `Zeroizing`, but the by-value
+//!                 copies handed into `SecNonce::generate`/`NonceSeed` are
+//!                 plain `[u8; 32]` copies that drop unscrubbed — and since
+//!                 NonceGen is deterministic in its inputs, a residual seed
+//!                 copy is equivalent to a residual nonce copy.
+//!             (c) The session's `seckey: Scalar` is held unscrubbed for the
+//!                 session lifetime (secp 0.7 scalars carry no Zeroize).
+//!             Net: INV-1's *no-persistence* half is fully enforced; its
+//!             *memory-scrubbing* half is best-effort pending upstream support.
 //!   INV-2  no session survives a process restart
 //!          -> `SigningSession` holds `SecretNonce`; it is created ONLY in-memory
 //!             at Phase 5 and has NO (de)serialization. A restart drops it, and
@@ -148,7 +155,8 @@ impl SigningSession {
         seckey: Scalar,
         message: [u8; 32],
     ) -> Result<Self> {
-        // Fresh OS randomness for the seed; scrubbed as soon as generate returns.
+        // Fresh OS randomness for the seed. Our buffer is scrubbed on drop;
+        // the by-value copy `*seed` hands to musig2 is NOT (module-doc caveat b).
         let mut seed = Zeroizing::new([0u8; 32]);
         rand::rngs::OsRng
             .try_fill_bytes(seed.as_mut())
@@ -355,6 +363,32 @@ mod tests {
         let n = s.public_nonce.clone();
         let agg = aggregate_nonces(&n, &n);
         assert!(matches!(s.sign_partial(&agg, &t_point), Err(Error::Ordering(_))));
+    }
+
+    #[test]
+    fn real_crash_leaves_lease_held_and_refuses_signing() {
+        // A real crash SKIPS Drop (unlike a scope exit). Model it with
+        // mem::forget so the lease file is NOT removed. INV-3's intended
+        // failure mode is then REFUSAL to sign, never a second signer.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let id = [0x5cu8; 32];
+        {
+            let lease = SingleSignerLease::acquire_in(dir.path(), id).expect("acquire");
+            let (ctx, sk, _) = test_ctx();
+            let s1 = SigningSession::begin(lease.clone(), ctx.clone(), sk, [1u8; 32]).unwrap();
+            let s2 = SigningSession::begin(lease.clone(), ctx, sk, [2u8; 32]).unwrap();
+            // "Crash": leak everything so no Drop runs.
+            core::mem::forget(s1);
+            core::mem::forget(s2);
+            core::mem::forget(lease);
+        }
+        // Lease file survives the crash...
+        assert!(std::fs::read_dir(dir.path()).unwrap().next().is_some(), "lease vanished on crash");
+        // ...and a restart is REFUSED (conservative: abort-to-refund, no 2nd signer).
+        assert!(matches!(
+            SingleSignerLease::acquire_in(dir.path(), id),
+            Err(Error::NonceInvariant(_))
+        ));
     }
 
     #[test]
