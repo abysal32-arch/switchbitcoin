@@ -47,6 +47,12 @@ pub trait Transport {
 
 /// Opaque handle to the authenticated peer channel. Provided by the (stubbed)
 /// discovery layer; here constructed manually (tests, hand-fed testnet drive).
+///
+/// `swap_session_id` here is the Phase-2 routing/session tag. The AUTHORITATIVE
+/// cryptographic swap_session_id used to key the single-signer lease and bind
+/// the possession witness is DERIVED inside `run_adaptor_exchange` from the two
+/// session pubkeys via `swap_session_id(...)`, so both wallets always agree
+/// regardless of this tag.
 pub struct PeerSession {
     swap_session_id: [u8; 32],
     transport: Box<dyn Transport>,
@@ -213,17 +219,45 @@ fn tweak_ctx(
     }
 }
 
-/// Canonical 2-of-2 key aggregation: BIP327 key aggregation is order-DEPENDENT,
-/// so both parties MUST derive the same ordering. Rule: sort the two compressed
-/// encodings lexicographically. (Any taproot tweak is applied by the tx layer
-/// before sessions begin — see `SigningSession::begin` docs.)
-fn canonical_key_agg(ours: Point, theirs: Point) -> Result<KeyAggContext> {
+/// THE single canonical 2-of-2 ordering rule (v3.13: one lexicographic sort of
+/// the compressed session pubkeys, used for `swap_session_id`, `role_seed`, and
+/// KeyAgg, so the two wallets can never derive divergent escrows). Returns the
+/// two keys in canonical order; rejects equal keys. Do NOT re-implement this
+/// sort elsewhere — call this helper.
+pub fn canonical_pair(ours: Point, theirs: Point) -> Result<[Point; 2]> {
     let (a, b) = (ours.serialize(), theirs.serialize());
     if a == b {
         return Err(Error::Validation("both parties presented the same pubkey"));
     }
-    let keys = if a < b { [ours, theirs] } else { [theirs, ours] };
-    KeyAggContext::new(keys).map_err(|_| Error::Validation("key aggregation failed"))
+    Ok(if a < b { [ours, theirs] } else { [theirs, ours] })
+}
+
+/// Canonical 2-of-2 key aggregation over the canonical pair. BIP327 key
+/// aggregation is order-DEPENDENT, so both parties MUST agree on `canonical_pair`.
+/// (Any taproot tweak is applied by the tx layer before sessions begin — see
+/// `SigningSession::begin`.)
+pub fn canonical_key_agg(ours: Point, theirs: Point) -> Result<KeyAggContext> {
+    KeyAggContext::new(canonical_pair(ours, theirs)?)
+        .map_err(|_| Error::Validation("key aggregation failed"))
+}
+
+/// The untweaked 2-of-2 aggregate (BIP341 internal key) under the canonical
+/// ordering — the escrow's internal key. Convenience over `canonical_key_agg`.
+pub fn canonical_internal_key(ours: Point, theirs: Point) -> Result<Point> {
+    Ok(canonical_key_agg(ours, theirs)?.aggregated_pubkey_untweaked())
+}
+
+/// `swap_session_id = SHA256(sessionpub_lower ‖ sessionpub_higher)` (v3.13),
+/// the two session pubkeys in canonical order. Both wallets derive the same id;
+/// the exchange uses it to key the single-signer lease and bind the possession
+/// witness, so a divergent id cannot silently split the swap.
+pub fn swap_session_id(ours: Point, theirs: Point) -> Result<[u8; 32]> {
+    use bitcoin::hashes::Hash as _;
+    let [lo, hi] = canonical_pair(ours, theirs)?;
+    let mut pre = Vec::with_capacity(66);
+    pre.extend_from_slice(&lo.serialize());
+    pre.extend_from_slice(&hi.serialize());
+    Ok(bitcoin::hashes::sha256::Hash::hash(&pre).to_byte_array())
 }
 
 fn expect_nonce_commitment(m: Message) -> Result<[u8; 32]> {
@@ -263,14 +297,15 @@ fn expect_sl_enabling(m: Message) -> Result<crate::crypto::ValidatedPartial> {
 
 /// The ONLY function that puts SL's enabling partial on the wire, and it
 /// demands the possession witness (G1). The witness is consumed (one release)
-/// and must be bound to THIS peer's swap — a stale witness from another swap
-/// is rejected, so G1 cannot be replayed across swaps.
+/// and must be bound to THIS swap's derived `swap_session_id` — a stale witness
+/// from another swap is rejected, so G1 cannot be replayed across swaps.
 fn release_enabling_partial(
     witness: PossessionWitness,
     peer: &mut PeerSession,
+    swap_sid: [u8; 32],
     enabling_partial: crate::crypto::ValidatedPartial,
 ) -> Result<()> {
-    if witness.swap_session_id != peer.swap_session_id {
+    if witness.swap_session_id != swap_sid {
         return Err(Error::Ordering("possession witness is bound to a different swap"));
     }
     peer.send_msg(&Message::SlEnablingPartial(enabling_partial))
@@ -422,10 +457,16 @@ impl Funded {
         let ctx_sh = tweak_ctx(&base_ctx, inputs.taproot_root_comp_sh, inputs.taproot_output_comp_sh)?;
         let ctx_sl = tweak_ctx(&base_ctx, inputs.taproot_root_comp_sl, inputs.taproot_output_comp_sl)?;
 
+        // The authoritative swap_session_id is DERIVED from the two session
+        // pubkeys (v3.13: SHA256 of the canonically-ordered keys), so both
+        // wallets agree regardless of any routing tag. It keys the lease and
+        // binds the possession witness.
+        let swap_sid = swap_session_id(our_pubkey, inputs.their_pubkey.point())?;
+
         // INV-3: one signer per swap. Both sessions share the ONE lease.
         let lease = match &inputs.lease_dir {
-            Some(dir) => SingleSignerLease::acquire_in(dir, self.peer.swap_session_id)?,
-            None => SingleSignerLease::acquire(self.peer.swap_session_id)?,
+            Some(dir) => SingleSignerLease::acquire_in(dir, swap_sid)?,
+            None => SingleSignerLease::acquire(swap_sid)?,
         };
 
         // Fresh sessions (INV-4), one per completion message, each under its
@@ -554,7 +595,7 @@ impl Funded {
                 ))?;
                 let record_path = write_possession_record(
                     store,
-                    &self.peer.swap_session_id,
+                    &swap_sid,
                     self.s_height,
                     self.sweep_escrow_height,
                     &self.params,
@@ -570,10 +611,10 @@ impl Funded {
                 // do NOT unwind to refund — the persisted record lets this node
                 // (or its restart) keep watching for SH's broadcast and extract.
                 let witness = PossessionWitness {
-                    swap_session_id: self.peer.swap_session_id,
+                    swap_session_id: swap_sid,
                     msg_comp_sh: inputs.msg_comp_sh,
                 };
-                if release_enabling_partial(witness, &mut self.peer, sl_p_sh).is_err() {
+                if release_enabling_partial(witness, &mut self.peer, swap_sid, sl_p_sh).is_err() {
                     // Delivered-or-not is unknowable (TCP/Tor). Proceed as
                     // released; the record at `record_path` covers restart.
                     let _ = &record_path;
@@ -979,7 +1020,9 @@ mod tests {
 
         let (sh_completion, sh_t_point) =
             sh_handle.join().expect("SH thread").expect("SH side");
-        let possession_record = store_dir.join(format!("{}.possession", hex32(&swap_id)));
+        // The record filename uses the DERIVED swap_session_id, not the routing tag.
+        let sid = swap_session_id(sh_keys.pubkey, sl_keys.pubkey).unwrap();
+        let possession_record = store_dir.join(format!("{}.possession", hex32(&sid)));
         ExchangeOutcome { sl_possessing, sh_completion, sh_t_point, possession_record }
     }
 
@@ -1319,6 +1362,23 @@ mod tests {
             .expect("SL exchange");
 
         sh.join().expect("SH thread").expect("SH assertions");
+    }
+
+    #[test]
+    fn swap_session_id_is_canonical_and_agreed() {
+        let a = keypair().pubkey;
+        let b = keypair().pubkey;
+        // Both parties (swapped arg order) derive the SAME id.
+        assert_eq!(swap_session_id(a, b).unwrap(), swap_session_id(b, a).unwrap());
+        // Distinct swaps get distinct ids; equal keys rejected.
+        let c = keypair().pubkey;
+        assert_ne!(swap_session_id(a, b).unwrap(), swap_session_id(a, c).unwrap());
+        assert!(swap_session_id(a, a).is_err());
+        // canonical_internal_key agrees regardless of arg order.
+        assert_eq!(
+            canonical_internal_key(a, b).unwrap().serialize(),
+            canonical_internal_key(b, a).unwrap().serialize()
+        );
     }
 
     #[test]

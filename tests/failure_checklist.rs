@@ -15,7 +15,6 @@
 //! proven in `tests/taproot_swap.rs` (bitcoin-side schnorr verify).
 
 use bitcoin::{OutPoint, Txid};
-use musig2::KeyAggContext;
 use newkey::chain::{ChainView, DualSourceChainView, SimChain, Source, SpendStatus};
 use newkey::crypto::adaptor::AdaptorSecret;
 use newkey::crypto::{ValidatedFinalSig, ValidatedPoint};
@@ -36,9 +35,9 @@ fn test_key_ctx() -> (musig2::KeyAggContext, Scalar) {
     let mut rng = rand::rng();
     let sk = Scalar::random(&mut rng);
     let other = Scalar::random(&mut rng);
-    let mut keys = [sk * secp::G, other * secp::G];
-    keys.sort_by_key(|p| p.serialize());
-    (musig2::KeyAggContext::new(keys).expect("valid keys"), sk)
+    let ctx = newkey::settlement::state_machine::canonical_key_agg(sk * secp::G, other * secp::G)
+        .expect("valid keys");
+    (ctx, sk)
 }
 
 // ===== On-chain swap harness (rows 1/3/4/7) ================================
@@ -73,9 +72,7 @@ fn keypair() -> Party {
 }
 
 fn aggregate_internal(a: Point, b: Point) -> Point {
-    let mut keys = [a, b];
-    keys.sort_by_key(|p| p.serialize());
-    KeyAggContext::new(keys).expect("keys").aggregated_pubkey_untweaked()
+    newkey::settlement::state_machine::canonical_internal_key(a, b).expect("keys")
 }
 
 fn txid_from(seed: u8) -> Txid {

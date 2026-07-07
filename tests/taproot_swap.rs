@@ -12,7 +12,6 @@
 //!   * Comp->SL spends the SH-funded escrow (refund CSV = delta_late).
 
 use bitcoin::OutPoint;
-use musig2::KeyAggContext;
 use newkey::crypto::adaptor::AdaptorSecret;
 use newkey::crypto::{ValidatedFinalSig, ValidatedPoint};
 use newkey::settlement::params::Params;
@@ -51,11 +50,9 @@ fn keypair() -> (Scalar, Point) {
 }
 
 /// The 2-of-2 aggregate internal key under the canonical (sorted) key order —
-/// must match `settlement::canonical_key_agg`.
+/// The single canonical ordering — the shared crate helper.
 fn aggregate_internal(sh_pub: Point, sl_pub: Point) -> Point {
-    let mut keys = [sh_pub, sl_pub];
-    keys.sort_by_key(|p| p.serialize());
-    KeyAggContext::new(keys).expect("keys").aggregated_pubkey_untweaked()
+    newkey::settlement::state_machine::canonical_internal_key(sh_pub, sl_pub).expect("keys")
 }
 
 #[test]

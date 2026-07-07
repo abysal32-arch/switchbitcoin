@@ -194,10 +194,11 @@ mod tests {
         let mut rng = rand::rng();
         let sk_a = secp::Scalar::random(&mut rng);
         let sk_b = secp::Scalar::random(&mut rng);
-        let mut keys = [sk_a * secp::G, sk_b * secp::G];
-        keys.sort_by_key(|p| p.serialize());
-        let ctx = musig2::KeyAggContext::new(keys).unwrap();
-        let internal: secp::Point = ctx.aggregated_pubkey_untweaked();
+        let internal: secp::Point = crate::settlement::state_machine::canonical_internal_key(
+            sk_a * secp::G,
+            sk_b * secp::G,
+        )
+        .unwrap();
         let escrow = Escrow::new(&internal, &(sk_a * secp::G), 216).unwrap();
 
         let dest = escrow.funding_script_pubkey().clone(); // any spk

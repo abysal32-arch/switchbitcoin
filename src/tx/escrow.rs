@@ -179,9 +179,7 @@ mod tests {
         let sk_a = Scalar::random(&mut rng);
         let sk_b = Scalar::random(&mut rng);
         let (pk_a, pk_b) = (sk_a * secp::G, sk_b * secp::G);
-        let mut keys = [pk_a, pk_b];
-        keys.sort_by_key(|p| p.serialize());
-        let ctx = KeyAggContext::new(keys).expect("keys");
+        let ctx = crate::settlement::state_machine::canonical_key_agg(pk_a, pk_b).expect("keys");
         (ctx, sk_a, sk_b, pk_a, pk_b)
     }
 

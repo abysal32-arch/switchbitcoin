@@ -326,10 +326,9 @@ mod tests {
         let sk_a = Scalar::random(&mut rng);
         let sk_b = Scalar::random(&mut rng);
         let (pk_a, pk_b) = (sk_a * secp::G, sk_b * secp::G);
-        // Canonical pubkey ordering (BIP327 key agg is order-DEPENDENT).
-        let mut keys = [pk_a, pk_b];
-        keys.sort_by_key(|p| p.serialize());
-        let ctx = KeyAggContext::new(keys).expect("valid key set");
+        // Single canonical ordering (shared helper; BIP327 key agg is order-dep).
+        let ctx = crate::settlement::state_machine::canonical_key_agg(pk_a, pk_b)
+            .expect("valid key set");
         (ctx, sk_a, sk_b)
     }
 

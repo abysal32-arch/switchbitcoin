@@ -256,10 +256,9 @@ mod tests {
         let mut rng = rand::rng();
         let sk = secp::Scalar::random(&mut rng);
         let other = secp::Scalar::random(&mut rng);
-        let mut keys = [sk * secp::G, other * secp::G];
-        keys.sort_by_key(|p| p.serialize());
-        let ctx = musig2::KeyAggContext::new(keys).unwrap();
-        let internal: secp::Point = ctx.aggregated_pubkey_untweaked();
+        let internal: secp::Point =
+            crate::settlement::state_machine::canonical_internal_key(sk * secp::G, other * secp::G)
+                .unwrap();
         let funder = sk * secp::G;
         let escrow = crate::tx::escrow::Escrow::new(&internal, &funder, 144).unwrap();
         let outpoint =
