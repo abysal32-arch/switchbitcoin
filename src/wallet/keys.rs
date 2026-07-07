@@ -66,6 +66,17 @@ pub trait KeySource {
     fn derive_xonly(&self, purpose: KeyPurpose, index: u32) -> Result<[u8; 32]> {
         Ok((self.derive_seckey(purpose, index)? * secp::G).serialize_xonly())
     }
+
+    /// Sign a Taproot key-path sighash for `(purpose, index)` WITHOUT
+    /// exposing the secret to the caller. The default routes through
+    /// `derive_seckey`; a REAL enclave implementation overrides this so the
+    /// key never enters app memory at all. (MuSig2 swap signing still needs
+    /// raw scalars by the nature of the musig2 API — documented custody
+    /// exception; single-sig paths must use THIS.)
+    fn sign_key_path(&self, purpose: KeyPurpose, index: u32, sighash: [u8; 32]) -> Result<[u8; 64]> {
+        let sk = self.derive_seckey(purpose, index)?;
+        crate::tx::setup::sign_key_path_tweaked(sk.serialize(), sighash)
+    }
 }
 
 /// Prototype key source: HKDF-SHA256 over the MODELED platform key with

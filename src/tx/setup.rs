@@ -30,8 +30,11 @@ pub fn pre_encumbrance_spk(funder_xonly: [u8; 32]) -> Result<ScriptBuf> {
 
 /// Sign a Taproot KEY-PATH (single-sig) spend of a no-script-tree output: the
 /// key is tweaked by the empty merkle root (BIP341), so signing uses the
-/// tweaked keypair. Deterministic (no aux randomness).
-fn sign_key_path_tweaked(seckey_bytes: [u8; 32], sighash: [u8; 32]) -> Result<[u8; 64]> {
+/// tweaked keypair (odd-Y internal keys are negated by `tap_tweak` per
+/// BIP341, so every derived key signs correctly). Deterministic (no aux
+/// randomness). pub(crate): `wallet::keys` routes single-sig signing through
+/// here so key material stays behind the `KeySource` seam.
+pub(crate) fn sign_key_path_tweaked(seckey_bytes: [u8; 32], sighash: [u8; 32]) -> Result<[u8; 64]> {
     let secp = Secp256k1::new();
     let kp = Keypair::from_seckey_slice(&secp, &seckey_bytes)
         .map_err(|_| Error::Validation("invalid pre-encumbrance secret key"))?;
@@ -112,6 +115,32 @@ pub fn build_onboarding_split(
     outputs: &[(ScriptBuf, u64)],
     fee_sats: u64,
 ) -> Result<(Vec<u8>, bitcoin::Txid)> {
+    let deposit_xonly = (*deposit_seckey * secp::G).serialize_xonly();
+    let spend = unsigned_onboarding_split(
+        deposit_outpoint,
+        deposit_amount_sats,
+        deposit_xonly,
+        outputs,
+        fee_sats,
+    )?;
+    let sig = sign_key_path_tweaked(deposit_seckey.serialize(), spend.sighash)?;
+    let signed = finalize_key_spend(spend, sig);
+    let split_tx: Transaction = bitcoin::consensus::encode::deserialize(&signed)
+        .map_err(|_| Error::Abort("split re-decode"))?;
+    Ok((signed, split_tx.compute_txid()))
+}
+
+/// The unsigned half of the onboarding split: build the transaction and its
+/// key-spend sighash without touching key material, so callers can route the
+/// signature through the enclave seam (`KeySource::sign_key_path`) and
+/// finalize with `txbuild::finalize_key_spend`.
+pub fn unsigned_onboarding_split(
+    deposit_outpoint: OutPoint,
+    deposit_amount_sats: u64,
+    deposit_xonly: [u8; 32],
+    outputs: &[(ScriptBuf, u64)],
+    fee_sats: u64,
+) -> Result<SpendTx> {
     if outputs.is_empty() {
         return Err(Error::Validation("split: no outputs"));
     }
@@ -131,7 +160,6 @@ pub fn build_onboarding_split(
         ));
     }
 
-    let deposit_xonly = (*deposit_seckey * secp::G).serialize_xonly();
     let deposit_spk = pre_encumbrance_spk(deposit_xonly)?;
 
     let tx = Transaction {
@@ -160,12 +188,7 @@ pub fn build_onboarding_split(
         .taproot_key_spend_signature_hash(0, &Prevouts::All(&[prevout]), TapSighashType::Default)
         .map_err(|_| Error::Abort("split key-spend sighash"))?
         .to_byte_array();
-    let sig = sign_key_path_tweaked(deposit_seckey.serialize(), sighash)?;
-
-    let signed = finalize_key_spend(SpendTx { tx, sighash }, sig);
-    let split_tx: Transaction = bitcoin::consensus::encode::deserialize(&signed)
-        .map_err(|_| Error::Abort("split re-decode"))?;
-    Ok((signed, split_tx.compute_txid()))
+    Ok(SpendTx { tx, sighash })
 }
 
 #[cfg(test)]

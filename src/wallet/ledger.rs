@@ -15,28 +15,46 @@
 //!   * `PreEncumbrance` — exactly D + Δ_fee; spendable ONLY whole, by a
 //!     Setup, and ONLY after its randomized delay.
 //!   * `OnboardingChange` — the one change output; never touches a swap.
-//!   * `Reserve` — CPFP backstop coins (congestion-only, opt-in for
-//!     completions, silent for refunds — rank 6).
-//!   * `Swapped` — exactly D at a fresh destination.
+//!   * `Reserve` — CPFP backstop coins (congestion-only; opt-in WITH a
+//!     typed linkage acknowledgement for completions, silent for refunds).
+//!   * `Swapped` — exactly D at a fresh destination; carries a persisted
+//!     `deposit_linked` taint flag when a deposit-provenance reserve ever
+//!     bumped its completion (the linkage is recorded, not just consented).
 //!
 //! Completions structurally take no external input (single escrow input,
 //! `tx::txbuild`), so "no external input ever touches a completion" holds at
 //! the transaction-builder level, not by ledger discipline.
 //!
-//! KEYS: the ledger persists only `(purpose, index)` — key material lives
-//! behind the `KeySource` seam (enclave model; see `wallet::keys`).
+//! DELAY ANCHORING (adversarial-review fix): the randomized delay is sampled
+//! at split time but ANCHORED AT CONFIRMATION — a split that lingers in the
+//! mempool must not consume its own decorrelation delay. Eligibility is
+//! double-anchored: wall-clock (`eligible_at_unix = confirm_time + delay`)
+//! AND chain height (`eligible_height = confirm_height + delay/600`), so an
+//! attacker who can shift the system clock still cannot collapse the delay
+//! without also mining the chain forward.
 //!
-//! PERSISTENCE: one sealed file (`ledger.bin`), AES-256-GCM under a
-//! domain-separated wallet TEK, fsync'd atomic writes, OS-file-lock single
-//! instance. FAIL-CLOSED on corruption: unlike swap records (per-swap blast
-//! radius, quarantine-able), the ledger is the wallet's ENTIRE coin memory —
-//! silently resetting it would orphan every coin. A corrupt ledger is an
-//! error the user must resolve (restore from backup), never a fresh start.
+//! SPLIT LIFECYCLE: `split_deposit` → broadcast → (`bump_split_fee` under
+//! congestion, RBF, reusing the SAME child keys and delays)* →
+//! `confirm_split`. Every attempt's children are tracked until one attempt
+//! confirms (mutually exclusive by shared input); the winning attempt's
+//! children activate, the losers are dropped, and the signed bytes are
+//! RETAINED on the spent deposit for shallow-reorg recovery.
 //!
-//! PHASE 0: the v3.13 warning is a typed gate. `Ledger::create` (onboarding)
-//! and the first `register_deposit` each demand a `Phase0Ack`, which can
-//! only be minted by echoing the exact warning copy back — proof the UI
-//! displayed THAT text, in the spirit of the WatchtowerReceipt gate.
+//! LEASES carry the lessee's identity (swap_session_id) and are reconciled
+//! at startup against the live swap set — a crash between lease and
+//! swap-record creation cannot orphan a coin.
+//!
+//! KEYS: the ledger persists only `(purpose, index)`; single-sig signing
+//! goes through `KeySource::sign_key_path` (enclave seam) — the ledger never
+//! touches a raw secret. RESTORE CAVEAT: restoring an OLD ledger backup
+//! rewinds `next_key_index`; restore tooling must call
+//! `raise_key_index_floor` after a forward scan or new addresses will reuse
+//! on-chain indices.
+//!
+//! PERSISTENCE: one sealed file (`ledger.bin`), fail-CLOSED on corruption
+//! (the coin memory never silently resets), OS-file-lock single instance,
+//! fsync'd atomic writes, transactional mutators (memory rolls back if the
+//! persist fails — no divergence for a later write to flush).
 
 use crate::settlement::params::Params;
 use crate::wallet::keys::{KeyPurpose, KeySource};
@@ -53,9 +71,13 @@ use std::path::{Path, PathBuf};
 /// the displayed text to `acknowledge_phase0`.
 pub const PHASE0_WARNING: &str = "Warning: Before you send Bitcoin to New Key, move it to a fresh address first. If it came from a KYC'd exchange or any service that knows your identity, send it to a brand-new self-custodied address you control before depositing here. New Key protects your history from the moment your Bitcoin arrives; it cannot erase provenance that already exists on-chain before you arrive. One clean transaction to a wallet you control, wait for confirmation, then deposit.";
 
+/// The congestion-bump linkage warning (v3.13: "bumping via a reserve UTXO
+/// reintroduces the link... explicit, user-visible consent"). Shown before a
+/// reserve coin may bump a COMPLETION; refund bumps are silent by spec.
+pub const LINKAGE_WARNING: &str = "Network congestion: paying extra fee from your reserve will publicly link this swap to your deposit history. This reduces the privacy of this one swap only. You can also wait for congestion to clear.";
+
 /// Proof the Phase-0 warning was displayed and confirmed. Non-Clone,
-/// non-constructible except via `acknowledge_phase0` — a caller cannot
-/// conjure one by passing `true` somewhere.
+/// non-constructible except via `acknowledge_phase0`.
 #[derive(Debug)]
 pub struct Phase0Ack {
     _private: (),
@@ -71,8 +93,30 @@ pub fn acknowledge_phase0(displayed_text: &str) -> Result<Phase0Ack> {
     Ok(Phase0Ack { _private: () })
 }
 
+/// Proof the linkage warning was displayed and confirmed (per bump).
+#[derive(Debug)]
+pub struct LinkageAck {
+    _private: (),
+}
+
+pub fn acknowledge_linkage(displayed_text: &str) -> Result<LinkageAck> {
+    if displayed_text != LINKAGE_WARNING {
+        return Err(Error::Validation(
+            "linkage acknowledgement must echo the exact warning copy",
+        ));
+    }
+    Ok(LinkageAck { _private: () })
+}
+
+/// What a reserve lease will bump. Refund bumps are silent (a refund has no
+/// privacy left); completion bumps demand the typed linkage consent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BumpTarget {
+    Refund,
+    Completion,
+}
+
 /// Wall-clock seam (the onboarding delay is specified in hours, not blocks).
-/// Tests inject a fixed clock; production uses the system clock.
 pub trait WalletClock {
     fn now_unix(&self) -> u64;
 }
@@ -88,8 +132,20 @@ impl WalletClock for SystemClock {
     }
 }
 
-/// Bitcoin dust threshold (sats) for the change-folding rule.
-const DUST_SATS: u64 = 546;
+/// P2TR dust threshold (sats): below this, change folds into the fee. 330
+/// per Bitcoin Core's P2TR dust rule (546 is the LEGACY threshold — using it
+/// would silently burn relayable 330–545-sat change).
+const DUST_SATS: u64 = 330;
+/// Standardness guard: cap pre-encumbrance outputs per split; the excess
+/// stays in change (re-splittable later). 64 P2TR outputs ≈ 2.8 kvB.
+const MAX_PRE_ENC_OUTPUTS: u64 = 64;
+/// Absurd-fee ceiling for the split (defense against a buggy/hostile caller
+/// burning the deposit as fee).
+const MAX_SPLIT_FEE_SATS: u64 = 100_000;
+/// RBF attempt cap per deposit (each attempt tracks its children).
+const MAX_SPLIT_ATTEMPTS: usize = 16;
+/// Expected seconds per block for the chain-height eligibility floor.
+const SECS_PER_BLOCK: u64 = 600;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CoinClass {
@@ -147,11 +203,12 @@ fn purpose_from_byte(b: u8) -> Result<KeyPurpose> {
 pub enum CoinState {
     /// Confirmed and spendable (subject to class rules + eligibility).
     Unspent,
-    /// Created by a broadcast-but-unconfirmed split.
+    /// Created by a broadcast-but-unconfirmed split attempt.
     PendingConfirm,
-    /// A deposit whose split tx is signed/broadcast but not yet confirmed.
+    /// A deposit whose split tx is signed (and possibly broadcast/bumped)
+    /// but not yet confirmed. Exits: `confirm_split` or `bump_split_fee`.
     SplitPending,
-    /// Reserved by a live swap (or backstop); no other consumer may take it.
+    /// Reserved by a live swap/backstop; `lessee` says which.
     Leased,
     /// Gone.
     Spent,
@@ -179,7 +236,7 @@ impl CoinState {
     }
 }
 
-/// One tracked coin. Key material is NOT here — only `(class→purpose, key_index)`.
+/// One tracked coin. Key material is NOT here — only `(key_purpose, key_index)`.
 #[derive(Clone, Debug)]
 pub struct CoinRecord {
     pub outpoint: OutPoint,
@@ -193,23 +250,52 @@ pub struct CoinRecord {
     pub key_purpose: KeyPurpose,
     pub key_index: u32,
     pub created_height: u32,
-    /// Pre-encumbrance only: unix time at which this coin may be encumbered
-    /// (the randomized 24–72h + sub-hour-jitter delay). 0 for other classes.
-    pub eligible_at_unix: u64,
-    /// Deposit only: the signed split transaction, persisted BEFORE
-    /// broadcast so a crash cannot orphan the split (rebroadcastable from
-    /// the ledger alone).
+    /// STATE-SCOPED (use `eligibility_unix()`, not this field directly):
+    /// while `PendingConfirm` this is the sampled delay DURATION (seconds);
+    /// once confirmed it is the ABSOLUTE eligibility time (confirm + delay).
+    /// 0 for classes with no delay.
+    pub delay_or_eligible_unix: u64,
+    /// Chain-height eligibility floor, set at confirmation
+    /// (confirm_height + delay/600). Second anchor against clock shift.
+    pub eligible_height: u32,
+    /// True when this coin's history is publicly linked to the deposit
+    /// cluster (a reserve coin bumped its completion). Persisted taint.
+    pub deposit_linked: bool,
+    /// For split children: the deposit that produced them.
+    pub parent: Option<OutPoint>,
+    /// For Leased coins: who holds the lease (swap_session_id or backstop id).
+    pub lessee: Option<[u8; 32]>,
+    /// Deposit only: the latest signed split attempt, RETAINED after
+    /// confirmation for shallow-reorg rebroadcast.
     pub split_tx: Option<Vec<u8>>,
+    /// Deposit only: every split-attempt txid (mutually exclusive txs; at
+    /// most one ever confirms).
+    pub split_attempts: Vec<Txid>,
 }
 
-/// The outcome of `split_deposit`, ready to broadcast.
+impl CoinRecord {
+    /// Absolute eligibility time, once known (None while the split attempt
+    /// is unconfirmed — the delay anchors at CONFIRMATION).
+    pub fn eligibility_unix(&self) -> Option<u64> {
+        match self.state {
+            CoinState::PendingConfirm => None,
+            _ => Some(self.delay_or_eligible_unix),
+        }
+    }
+}
+
+/// The outcome of `split_deposit` / `bump_split_fee`, ready to broadcast.
 pub struct SplitPlan {
     pub tx_bytes: Vec<u8>,
     pub txid: Txid,
     pub pre_encumbrance_count: u32,
     pub change_sats: u64,
-    /// Sampled per-output encumbrance-eligibility times (unix).
-    pub eligible_at_unix: Vec<u64>,
+    /// Which output index carries the change (shuffled position — a fixed
+    /// change position would fingerprint the tx shape). None if no change.
+    pub change_vout: Option<u32>,
+    /// Sampled per-child delay DURATIONS (seconds); the absolute eligibility
+    /// is fixed at confirmation time.
+    pub delay_secs: Vec<u64>,
 }
 
 /// Sealed, fail-closed, single-instance wallet coin ledger.
@@ -223,8 +309,7 @@ pub struct Ledger {
     _lock: std::fs::File,
 }
 
-/// Domain-separated wallet-ledger TEK salt (vs the per-swap records, whose
-/// salt is the swap_session_id).
+/// Domain-separated wallet-ledger TEK salt.
 fn ledger_salt() -> [u8; 32] {
     sha256::Hash::hash(b"newkey-ledger-v1").to_byte_array()
 }
@@ -256,8 +341,7 @@ impl Ledger {
     }
 
     /// Reopen an existing ledger. FAIL-CLOSED: a missing or corrupt ledger is
-    /// an error (the coin memory must never silently reset) — restore from
-    /// backup rather than starting empty.
+    /// an error (the coin memory must never silently reset).
     pub fn open(dir: &Path, enclave: &dyn EnclaveKeyProvider) -> Result<Ledger> {
         let path = dir.join("ledger.bin");
         let lock = Self::acquire_lock(dir)?;
@@ -285,10 +369,24 @@ impl Ledger {
         Ok(lock)
     }
 
+    /// Transactional mutation: apply `f`, persist, and ROLL BACK the
+    /// in-memory state if the persist fails — memory and disk never diverge
+    /// (a later unrelated persist can't flush a half-applied change).
+    fn transact<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        let snap_coins = self.coins.clone();
+        let snap_idx = self.next_key_index;
+        let snap_ack = self.first_deposit_acked;
+        let result = f(self).and_then(|t| self.persist().map(|()| t));
+        if result.is_err() {
+            self.coins = snap_coins;
+            self.next_key_index = snap_idx;
+            self.first_deposit_acked = snap_ack;
+        }
+        result
+    }
+
     // ---- key issuance --------------------------------------------------
 
-    /// Issue a fresh (never-reused) key index and return the Taproot
-    /// single-sig receive script for it.
     fn issue_key(
         &mut self,
         purpose: KeyPurpose,
@@ -304,77 +402,99 @@ impl Ledger {
         Ok((index, spk))
     }
 
-    /// A fresh deposit address (ordinary Taproot receive). Persists the
-    /// index bump immediately so a crash cannot reuse it.
+    /// A fresh deposit address. Persists the index bump immediately.
     pub fn next_deposit_address(&mut self, keys: &dyn KeySource) -> Result<(u32, ScriptBuf)> {
-        let out = self.issue_key(KeyPurpose::Deposit, keys)?;
-        self.persist()?;
-        Ok(out)
+        self.transact(|l| l.issue_key(KeyPurpose::Deposit, keys))
     }
 
-    /// A fresh per-swap destination (v3.13: fresh, never reused). Rank 4
-    /// exchanges this over the authenticated peer channel.
+    /// A fresh per-swap destination (v3.13: fresh, never reused).
     pub fn next_swap_destination(&mut self, keys: &dyn KeySource) -> Result<(u32, ScriptBuf)> {
-        let out = self.issue_key(KeyPurpose::SwapDestination, keys)?;
-        self.persist()?;
-        Ok(out)
+        self.transact(|l| l.issue_key(KeyPurpose::SwapDestination, keys))
+    }
+
+    /// RESTORE TOOLING ONLY: after restoring an older ledger backup, the key
+    /// counter has rewound; scan forward on-chain and raise the floor past
+    /// every index observed in use, or new issuance will REUSE addresses.
+    pub fn raise_key_index_floor(&mut self, floor: u32) -> Result<()> {
+        self.transact(|l| {
+            if floor > l.next_key_index {
+                l.next_key_index = floor;
+            }
+            Ok(())
+        })
     }
 
     // ---- onboarding ----------------------------------------------------
 
-    /// Register a detected incoming deposit (the chain watcher's callback).
-    /// THE FIRST deposit re-demands the Phase-0 acknowledgement (v3.13:
-    /// "shown once at onboarding and again at first deposit").
+    /// Register a detected incoming deposit. THE FIRST deposit re-demands
+    /// the Phase-0 acknowledgement. The claimed `(key_index → spk)` binding
+    /// is VERIFIED against the derivation before anything persists — a wrong
+    /// index would otherwise strand the deposit at signing time. The ack is
+    /// only consumed if registration succeeds.
+    #[allow(clippy::too_many_arguments)]
     pub fn register_deposit(
         &mut self,
         outpoint: OutPoint,
         amount_sats: u64,
         confirmed_height: u32,
         key_index: u32,
+        deposit_spk: &ScriptBuf,
+        keys: &dyn KeySource,
         first_deposit_ack: Option<Phase0Ack>,
     ) -> Result<()> {
-        if !self.first_deposit_acked {
-            if first_deposit_ack.is_none() {
-                return Err(Error::Ordering(
-                    "first deposit requires the Phase-0 acknowledgement again",
-                ));
-            }
-            self.first_deposit_acked = true;
-        }
+        // Validate EVERYTHING before consuming the ack (a failed attempt
+        // must not eat the Phase-0 gate).
         if self.find(&outpoint).is_some() {
             return Err(Error::Validation("ledger: outpoint already tracked"));
         }
         if amount_sats == 0 {
             return Err(Error::Validation("ledger: zero-value deposit"));
         }
-        self.coins.push(CoinRecord {
-            outpoint,
-            amount_sats,
-            class: CoinClass::Deposit,
-            key_purpose: KeyPurpose::Deposit,
-            state: CoinState::Unspent,
-            key_index,
-            created_height: confirmed_height,
-            eligible_at_unix: 0,
-            split_tx: None,
-        });
-        self.persist()
+        let derived = keys.derive_xonly(KeyPurpose::Deposit, key_index)?;
+        if &crate::tx::setup::pre_encumbrance_spk(derived)? != deposit_spk {
+            return Err(Error::Validation(
+                "ledger: deposit spk does not match the claimed key index",
+            ));
+        }
+        if !self.first_deposit_acked && first_deposit_ack.is_none() {
+            return Err(Error::Ordering(
+                "first deposit requires the Phase-0 acknowledgement again",
+            ));
+        }
+        self.transact(|l| {
+            l.first_deposit_acked = true;
+            l.coins.push(CoinRecord {
+                outpoint,
+                amount_sats,
+                class: CoinClass::Deposit,
+                state: CoinState::Unspent,
+                key_purpose: KeyPurpose::Deposit,
+                key_index,
+                created_height: confirmed_height,
+                delay_or_eligible_unix: 0,
+                eligible_height: 0,
+                deposit_linked: false,
+                parent: None,
+                lessee: None,
+                split_tx: None,
+                split_attempts: Vec::new(),
+            });
+            Ok(())
+        })
     }
 
     /// Phase 1 auto-split: build + sign the split of one deposit into k
-    /// pre-encumbrance outputs of EXACTLY D + Δ_fee each plus (at most) one
-    /// change output absorbing all rounding; sub-dust change folds into the
-    /// fee. Each pre-encumbrance child gets an independent CSPRNG-sampled
-    /// 24–72h (+ sub-hour jitter) eligibility delay from `params`. The plan
-    /// (children + signed tx) is PERSISTED before this returns, so a crash
-    /// between broadcast and confirmation cannot orphan the split.
+    /// (≤ 64) pre-encumbrance outputs of EXACTLY D + Δ_fee each plus at most
+    /// one change output at a SHUFFLED position; sub-dust change folds into
+    /// the fee; fee capped against absurdity. Per-child delays are sampled
+    /// now but ANCHOR AT CONFIRMATION. Everything persists atomically before
+    /// return (crash ⇒ rebroadcastable from the ledger alone).
     pub fn split_deposit(
         &mut self,
         deposit: OutPoint,
         params: &Params,
         fee_sats: u64,
         keys: &dyn KeySource,
-        clock: &dyn WalletClock,
     ) -> Result<SplitPlan> {
         let dep = self
             .find(&deposit)
@@ -384,9 +504,10 @@ impl Ledger {
         }
         let dep_amount = dep.amount_sats;
         let dep_key_index = dep.key_index;
+        let dep_key_purpose = dep.key_purpose;
         params.validate()?;
-        if fee_sats == 0 {
-            return Err(Error::Validation("ledger: split fee must be positive"));
+        if fee_sats == 0 || fee_sats > MAX_SPLIT_FEE_SATS {
+            return Err(Error::Validation("ledger: split fee out of sane range"));
         }
         let unit = params
             .tier_d_sats
@@ -395,7 +516,7 @@ impl Ledger {
         let spendable = dep_amount
             .checked_sub(fee_sats)
             .ok_or(Error::Validation("ledger: fee exceeds deposit"))?;
-        let k = spendable / unit;
+        let k = (spendable / unit).min(MAX_PRE_ENC_OUTPUTS);
         if k == 0 {
             return Err(Error::Validation(
                 "ledger: deposit too small for one pre-encumbrance unit",
@@ -404,135 +525,349 @@ impl Ledger {
         let mut change = spendable - k * unit;
         let mut effective_fee = fee_sats;
         if change > 0 && change < DUST_SATS {
-            // Sub-dust remainder folds into the fee (v3.13: change absorbs
-            // rounding; dust never rides on a swap coin).
             effective_fee += change;
             change = 0;
         }
 
-        // Fresh keys: k pre-encumbrance + optional change.
-        let mut outputs: Vec<(ScriptBuf, u64)> = Vec::with_capacity(k as usize + 1);
-        let mut child_keys: Vec<u32> = Vec::with_capacity(k as usize + 1);
-        for _ in 0..k {
-            let (idx, spk) = self.issue_key(KeyPurpose::PreEncumbrance, keys)?;
-            child_keys.push(idx);
-            outputs.push((spk, unit));
-        }
-        let mut change_key = None;
-        if change > 0 {
-            let (idx, spk) = self.issue_key(KeyPurpose::OnboardingChange, keys)?;
-            change_key = Some(idx);
-            outputs.push((spk, change));
-        }
-
-        // Sign the split with the deposit key (enclave-derived on demand).
-        let dep_seckey = keys.derive_seckey(KeyPurpose::Deposit, dep_key_index)?;
-        let (tx_bytes, txid) = crate::tx::setup::build_onboarding_split(
-            deposit,
-            dep_amount,
-            &dep_seckey,
-            &outputs,
-            effective_fee,
-        )?;
-
-        // Sample per-child eligibility delays (CSPRNG; hours in [lo, hi],
-        // plus sub-hour jitter) so pre-encumbrance coins decorrelate from
-        // the deposit AND from each other.
-        let now = clock.now_unix();
+        // Sample per-child delay DURATIONS + the shuffled change position.
         let (lo_h, hi_h) = params.onboarding_delay_hours;
-        let mut eligible_at = Vec::with_capacity(k as usize);
+        let mut delay_secs = Vec::with_capacity(k as usize);
         for _ in 0..k {
             let hours = sample_range_u64(lo_h as u64, hi_h as u64)?;
             let jitter = sample_range_u64(0, 3599)?;
-            eligible_at.push(now.saturating_add(hours * 3600).saturating_add(jitter));
+            delay_secs.push(hours * 3600 + jitter);
         }
+        let change_vout = if change > 0 {
+            Some(sample_range_u64(0, k)? as u32) // position among k+1 outputs
+        } else {
+            None
+        };
 
-        // Register children (PendingConfirm) + mark the deposit SplitPending
-        // with the signed tx, ATOMICALLY (one persist).
-        for (i, key_index) in child_keys.iter().enumerate() {
-            self.coins.push(CoinRecord {
-                outpoint: OutPoint::new(txid, i as u32),
-                amount_sats: unit,
-                class: CoinClass::PreEncumbrance,
-                key_purpose: KeyPurpose::PreEncumbrance,
-                state: CoinState::PendingConfirm,
-                key_index: *key_index,
-                created_height: 0,
-                eligible_at_unix: eligible_at[i],
-                split_tx: None,
-            });
-        }
-        if let Some(idx) = change_key {
-            self.coins.push(CoinRecord {
-                outpoint: OutPoint::new(txid, k as u32),
-                amount_sats: change,
-                class: CoinClass::OnboardingChange,
-                key_purpose: KeyPurpose::OnboardingChange,
-                state: CoinState::PendingConfirm,
-                key_index: idx,
-                created_height: 0,
-                eligible_at_unix: 0,
-                split_tx: None,
-            });
-        }
-        {
-            let dep = self.find_mut(&deposit).expect("checked above");
-            dep.state = CoinState::SplitPending;
-            dep.split_tx = Some(tx_bytes.clone());
-        }
-        self.persist()?;
+        self.transact(|l| {
+            // Fresh keys + output list with the change at its shuffled slot.
+            let n_outputs = k + change_vout.map_or(0, |_| 1);
+            let mut outputs: Vec<(ScriptBuf, u64)> = Vec::with_capacity(n_outputs as usize);
+            let mut child_meta: Vec<(u32, u32, u64)> = Vec::new(); // (vout, key_index, delay)
+            let mut change_meta: Option<(u32, u32)> = None; // (vout, key_index)
+            let mut pre_i = 0usize;
+            for vout in 0..n_outputs as u32 {
+                if Some(vout) == change_vout {
+                    let (idx, spk) = l.issue_key(KeyPurpose::OnboardingChange, keys)?;
+                    change_meta = Some((vout, idx));
+                    outputs.push((spk, change));
+                } else {
+                    let (idx, spk) = l.issue_key(KeyPurpose::PreEncumbrance, keys)?;
+                    child_meta.push((vout, idx, delay_secs[pre_i]));
+                    pre_i += 1;
+                    outputs.push((spk, unit));
+                }
+            }
 
-        Ok(SplitPlan {
-            tx_bytes,
-            txid,
-            pre_encumbrance_count: k as u32,
-            change_sats: change,
-            eligible_at_unix: eligible_at,
+            // Build unsigned, sign through the enclave seam, finalize.
+            let dep_xonly = keys.derive_xonly(dep_key_purpose, dep_key_index)?;
+            let spend = crate::tx::setup::unsigned_onboarding_split(
+                deposit,
+                dep_amount,
+                dep_xonly,
+                &outputs,
+                effective_fee,
+            )?;
+            let sig = keys.sign_key_path(dep_key_purpose, dep_key_index, spend.sighash)?;
+            let tx_bytes = crate::tx::txbuild::finalize_key_spend(spend, sig);
+            let parsed: bitcoin::Transaction =
+                bitcoin::consensus::encode::deserialize(&tx_bytes)
+                    .map_err(|_| Error::Abort("split re-decode"))?;
+            let txid = parsed.compute_txid();
+
+            for (vout, key_index, delay) in &child_meta {
+                l.coins.push(CoinRecord {
+                    outpoint: OutPoint::new(txid, *vout),
+                    amount_sats: unit,
+                    class: CoinClass::PreEncumbrance,
+                    state: CoinState::PendingConfirm,
+                    key_purpose: KeyPurpose::PreEncumbrance,
+                    key_index: *key_index,
+                    created_height: 0,
+                    delay_or_eligible_unix: *delay,
+                    eligible_height: 0,
+                    deposit_linked: false,
+                    parent: Some(deposit),
+                    lessee: None,
+                    split_tx: None,
+                    split_attempts: Vec::new(),
+                });
+            }
+            if let Some((vout, idx)) = change_meta {
+                l.coins.push(CoinRecord {
+                    outpoint: OutPoint::new(txid, vout),
+                    amount_sats: change,
+                    class: CoinClass::OnboardingChange,
+                    state: CoinState::PendingConfirm,
+                    key_purpose: KeyPurpose::OnboardingChange,
+                    key_index: idx,
+                    created_height: 0,
+                    delay_or_eligible_unix: 0,
+                    eligible_height: 0,
+                    deposit_linked: false,
+                    parent: Some(deposit),
+                    lessee: None,
+                    split_tx: None,
+                    split_attempts: Vec::new(),
+                });
+            }
+            {
+                let dep = l.find_mut(&deposit).expect("checked above");
+                dep.state = CoinState::SplitPending;
+                dep.split_tx = Some(tx_bytes.clone());
+                dep.split_attempts.push(txid);
+            }
+            Ok(SplitPlan {
+                tx_bytes,
+                txid,
+                pre_encumbrance_count: k as u32,
+                change_sats: change,
+                change_vout,
+                delay_secs,
+            })
         })
     }
 
-    /// The split confirmed at `height`: children become Unspent, the deposit
-    /// becomes Spent (and drops its cached tx bytes).
-    pub fn confirm_split(&mut self, split_txid: Txid, height: u32) -> Result<()> {
-        let mut confirmed_children = 0;
-        for coin in &mut self.coins {
-            if coin.outpoint.txid == split_txid && coin.state == CoinState::PendingConfirm {
-                coin.state = CoinState::Unspent;
-                coin.created_height = height;
-                confirmed_children += 1;
+    /// RBF fee bump for a stuck split (the review's SplitPending-dead-end
+    /// fix). Rebuilds the split spending the SAME deposit input (mutually
+    /// exclusive with every earlier attempt) at a strictly higher fee,
+    /// REUSING the same child keys and delay durations — k may shrink if the
+    /// fee eats into the last unit's change. All attempts stay tracked until
+    /// one confirms.
+    pub fn bump_split_fee(
+        &mut self,
+        deposit: OutPoint,
+        new_fee_sats: u64,
+        params: &Params,
+        keys: &dyn KeySource,
+    ) -> Result<SplitPlan> {
+        let dep = self
+            .find(&deposit)
+            .ok_or(Error::Validation("ledger: unknown deposit"))?;
+        if dep.class != CoinClass::Deposit || dep.state != CoinState::SplitPending {
+            return Err(Error::Ordering("ledger: fee bump requires a pending split"));
+        }
+        if dep.split_attempts.len() >= MAX_SPLIT_ATTEMPTS {
+            return Err(Error::Abort("ledger: split attempt cap reached"));
+        }
+        let dep_amount = dep.amount_sats;
+        let dep_key_index = dep.key_index;
+        let dep_key_purpose = dep.key_purpose;
+        let last_txid = *dep.split_attempts.last().expect("SplitPending has attempts");
+        // Old fee from the cached bytes; RBF demands strictly more.
+        let old_tx: bitcoin::Transaction = bitcoin::consensus::encode::deserialize(
+            dep.split_tx.as_ref().expect("SplitPending caches its tx"),
+        )
+        .map_err(|_| Error::Abort("ledger: cached split undecodable"))?;
+        let old_out: u64 = old_tx.output.iter().map(|o| o.value.to_sat()).sum();
+        let old_fee = dep_amount - old_out;
+        if new_fee_sats <= old_fee || new_fee_sats > MAX_SPLIT_FEE_SATS {
+            return Err(Error::Validation(
+                "ledger: bump fee must be strictly higher (and sane)",
+            ));
+        }
+        params.validate()?;
+        let unit = params.tier_d_sats + params.delta_fee_sats;
+        let spendable = dep_amount
+            .checked_sub(new_fee_sats)
+            .ok_or(Error::Validation("ledger: fee exceeds deposit"))?;
+        let k = (spendable / unit).min(MAX_PRE_ENC_OUTPUTS);
+        if k == 0 {
+            return Err(Error::Validation(
+                "ledger: bump would consume the last pre-encumbrance unit",
+            ));
+        }
+        let mut change = spendable - k * unit;
+        let mut effective_fee = new_fee_sats;
+        if change > 0 && change < DUST_SATS {
+            effective_fee += change;
+            change = 0;
+        }
+
+        // Reuse the LATEST attempt's child keys + delays (sorted by vout).
+        let mut prev_children: Vec<(u32, u32, u64)> = self
+            .coins
+            .iter()
+            .filter(|c| {
+                c.parent == Some(deposit)
+                    && c.outpoint.txid == last_txid
+                    && c.class == CoinClass::PreEncumbrance
+            })
+            .map(|c| (c.outpoint.vout, c.key_index, c.delay_or_eligible_unix))
+            .collect();
+        prev_children.sort_by_key(|(v, _, _)| *v);
+        if (k as usize) > prev_children.len() {
+            return Err(Error::Abort("ledger: bump grew k (impossible with higher fee)"));
+        }
+        let prev_change_key: Option<u32> = self
+            .coins
+            .iter()
+            .find(|c| {
+                c.parent == Some(deposit)
+                    && c.outpoint.txid == last_txid
+                    && c.class == CoinClass::OnboardingChange
+            })
+            .map(|c| c.key_index);
+        let change_vout = if change > 0 {
+            Some(sample_range_u64(0, k)? as u32)
+        } else {
+            None
+        };
+
+        self.transact(|l| {
+            let n_outputs = k + change_vout.map_or(0, |_| 1);
+            let mut outputs: Vec<(ScriptBuf, u64)> = Vec::with_capacity(n_outputs as usize);
+            let mut child_meta: Vec<(u32, u32, u64)> = Vec::new();
+            let mut change_meta: Option<(u32, u32)> = None;
+            let mut pre_i = 0usize;
+            for vout in 0..n_outputs as u32 {
+                if Some(vout) == change_vout {
+                    let idx = match prev_change_key {
+                        Some(idx) => idx,
+                        None => l.issue_key(KeyPurpose::OnboardingChange, keys)?.0,
+                    };
+                    let spk = crate::tx::setup::pre_encumbrance_spk(
+                        keys.derive_xonly(KeyPurpose::OnboardingChange, idx)?,
+                    )?;
+                    change_meta = Some((vout, idx));
+                    outputs.push((spk, change));
+                } else {
+                    let (_, key_index, delay) = prev_children[pre_i];
+                    let spk = crate::tx::setup::pre_encumbrance_spk(
+                        keys.derive_xonly(KeyPurpose::PreEncumbrance, key_index)?,
+                    )?;
+                    child_meta.push((vout, key_index, delay));
+                    pre_i += 1;
+                    outputs.push((spk, unit));
+                }
             }
-        }
-        if confirmed_children == 0 {
-            return Err(Error::Validation("ledger: unknown split txid"));
-        }
-        for coin in &mut self.coins {
-            if coin.state == CoinState::SplitPending {
-                if let Some(tx) = &coin.split_tx {
-                    // Match the deposit whose cached split produced this txid.
-                    let parsed: bitcoin::Transaction =
-                        bitcoin::consensus::encode::deserialize(tx)
-                            .map_err(|_| Error::Abort("ledger: cached split undecodable"))?;
-                    if parsed.compute_txid() == split_txid {
-                        coin.state = CoinState::Spent;
-                        coin.split_tx = None;
+
+            let dep_xonly = keys.derive_xonly(dep_key_purpose, dep_key_index)?;
+            let spend = crate::tx::setup::unsigned_onboarding_split(
+                deposit, dep_amount, dep_xonly, &outputs, effective_fee,
+            )?;
+            let sig = keys.sign_key_path(dep_key_purpose, dep_key_index, spend.sighash)?;
+            let tx_bytes = crate::tx::txbuild::finalize_key_spend(spend, sig);
+            let parsed: bitcoin::Transaction =
+                bitcoin::consensus::encode::deserialize(&tx_bytes)
+                    .map_err(|_| Error::Abort("split re-decode"))?;
+            let txid = parsed.compute_txid();
+
+            let delay_secs: Vec<u64> = child_meta.iter().map(|(_, _, d)| *d).collect();
+            for (vout, key_index, delay) in &child_meta {
+                l.coins.push(CoinRecord {
+                    outpoint: OutPoint::new(txid, *vout),
+                    amount_sats: unit,
+                    class: CoinClass::PreEncumbrance,
+                    state: CoinState::PendingConfirm,
+                    key_purpose: KeyPurpose::PreEncumbrance,
+                    key_index: *key_index,
+                    created_height: 0,
+                    delay_or_eligible_unix: *delay,
+                    eligible_height: 0,
+                    deposit_linked: false,
+                    parent: Some(deposit),
+                    lessee: None,
+                    split_tx: None,
+                    split_attempts: Vec::new(),
+                });
+            }
+            if let Some((vout, idx)) = change_meta {
+                l.coins.push(CoinRecord {
+                    outpoint: OutPoint::new(txid, vout),
+                    amount_sats: change,
+                    class: CoinClass::OnboardingChange,
+                    state: CoinState::PendingConfirm,
+                    key_purpose: KeyPurpose::OnboardingChange,
+                    key_index: idx,
+                    created_height: 0,
+                    delay_or_eligible_unix: 0,
+                    eligible_height: 0,
+                    deposit_linked: false,
+                    parent: Some(deposit),
+                    lessee: None,
+                    split_tx: None,
+                    split_attempts: Vec::new(),
+                });
+            }
+            {
+                let dep = l.find_mut(&deposit).expect("checked above");
+                dep.split_tx = Some(tx_bytes.clone());
+                dep.split_attempts.push(txid);
+            }
+            Ok(SplitPlan {
+                tx_bytes,
+                txid,
+                pre_encumbrance_count: k as u32,
+                change_sats: change,
+                change_vout,
+                delay_secs,
+            })
+        })
+    }
+
+    /// One split attempt confirmed at `height`: its children activate with
+    /// their eligibility ANCHORED NOW (wall clock + chain height), losing
+    /// attempts' children are dropped (mutually exclusive txs), the deposit
+    /// becomes Spent. The signed bytes are RETAINED for shallow-reorg
+    /// rebroadcast (the driver re-detects and re-confirms after a reorg).
+    pub fn confirm_split(
+        &mut self,
+        split_txid: Txid,
+        height: u32,
+        clock: &dyn WalletClock,
+    ) -> Result<()> {
+        let deposit_op = self
+            .coins
+            .iter()
+            .find(|c| c.class == CoinClass::Deposit && c.split_attempts.contains(&split_txid))
+            .map(|c| c.outpoint)
+            .ok_or(Error::Validation("ledger: unknown split txid"))?;
+        let now = clock.now_unix();
+        self.transact(|l| {
+            for coin in &mut l.coins {
+                if coin.parent == Some(deposit_op) && coin.state == CoinState::PendingConfirm {
+                    if coin.outpoint.txid == split_txid {
+                        coin.state = CoinState::Unspent;
+                        coin.created_height = height;
+                        if coin.class == CoinClass::PreEncumbrance {
+                            let delay = coin.delay_or_eligible_unix;
+                            coin.delay_or_eligible_unix = now.saturating_add(delay);
+                            coin.eligible_height = height
+                                .saturating_add((delay / SECS_PER_BLOCK) as u32);
+                        }
+                    } else {
+                        coin.state = CoinState::Spent; // superseded attempt
                     }
                 }
             }
-        }
-        self.persist()
+            l.coins.retain(|c| {
+                !(c.parent == Some(deposit_op)
+                    && c.state == CoinState::Spent
+                    && c.created_height == 0)
+            });
+            let dep = l.find_mut(&deposit_op).expect("found above");
+            dep.state = CoinState::Spent;
+            Ok(())
+        })
     }
 
     // ---- selection (class-pure, non-mixing) ------------------------------
 
-    /// Select ONE eligible pre-encumbrance coin of exactly `unit_sats`
-    /// (= D + Δ_fee for the tier) and LEASE it to the caller (a live swap).
-    /// Eligibility = confirmed + randomized delay elapsed. Distinguishes
-    /// "none exist" (Ok(None)) from "exist but still maturing" (Err) so the
-    /// UX can say when.
+    /// Select ONE eligible pre-encumbrance coin of exactly `unit_sats` and
+    /// LEASE it to `lessee` (the swap_session_id). Eligibility is
+    /// DOUBLE-ANCHORED: wall clock AND chain height must both have passed —
+    /// shifting the system clock alone cannot collapse the delay.
     pub fn lease_pre_encumbrance(
         &mut self,
         unit_sats: u64,
         clock: &dyn WalletClock,
+        tip_height: u32,
+        lessee: [u8; 32],
     ) -> Result<Option<CoinRecord>> {
         let now = clock.now_unix();
         let mut immature = false;
@@ -542,7 +877,7 @@ impl Ledger {
                 && c.state == CoinState::Unspent
                 && c.amount_sats == unit_sats
             {
-                if c.eligible_at_unix <= now {
+                if c.delay_or_eligible_unix <= now && c.eligible_height <= tip_height {
                     chosen = Some(i);
                     break;
                 }
@@ -550,12 +885,11 @@ impl Ledger {
             }
         }
         match chosen {
-            Some(i) => {
-                self.coins[i].state = CoinState::Leased;
-                let rec = self.coins[i].clone();
-                self.persist()?;
-                Ok(Some(rec))
-            }
+            Some(i) => self.transact(|l| {
+                l.coins[i].state = CoinState::Leased;
+                l.coins[i].lessee = Some(lessee);
+                Ok(Some(l.coins[i].clone()))
+            }),
             None if immature => Err(Error::Deadline(
                 "pre-encumbrance coins exist but are still in their onboarding delay",
             )),
@@ -563,88 +897,137 @@ impl Ledger {
         }
     }
 
-    /// Lease a reserve coin for the CPFP backstop (rank 6). Reserve class
-    /// ONLY — the backstop can never accidentally reach a swap-path coin.
-    pub fn lease_reserve(&mut self) -> Result<Option<CoinRecord>> {
+    /// Lease a reserve coin for the CPFP backstop. Refund bumps are silent
+    /// (spec); COMPLETION bumps demand the typed linkage acknowledgement —
+    /// and the caller must then record the taint on the swapped output via
+    /// `record_swapped_output(.., deposit_linked = true)`.
+    pub fn lease_reserve(
+        &mut self,
+        target: BumpTarget,
+        linkage_ack: Option<LinkageAck>,
+        lessee: [u8; 32],
+    ) -> Result<Option<CoinRecord>> {
+        if target == BumpTarget::Completion && linkage_ack.is_none() {
+            return Err(Error::Ordering(
+                "bumping a completion from reserve requires the linkage acknowledgement",
+            ));
+        }
         let idx = self
             .coins
             .iter()
             .position(|c| c.class == CoinClass::Reserve && c.state == CoinState::Unspent);
         match idx {
-            Some(i) => {
-                self.coins[i].state = CoinState::Leased;
-                let rec = self.coins[i].clone();
-                self.persist()?;
-                Ok(Some(rec))
-            }
+            Some(i) => self.transact(|l| {
+                l.coins[i].state = CoinState::Leased;
+                l.coins[i].lessee = Some(lessee);
+                Ok(Some(l.coins[i].clone()))
+            }),
             None => Ok(None),
         }
     }
 
+    /// Startup reconciliation (the orphaned-lease fix): release every lease
+    /// whose lessee is not in the live set (crash between lease and swap-
+    /// record creation). Returns the released outpoints.
+    pub fn reconcile_leases(&mut self, live_lessees: &[[u8; 32]]) -> Result<Vec<OutPoint>> {
+        self.transact(|l| {
+            let mut released = Vec::new();
+            for c in &mut l.coins {
+                if c.state == CoinState::Leased {
+                    let live = c.lessee.map(|who| live_lessees.contains(&who)).unwrap_or(false);
+                    if !live {
+                        c.state = CoinState::Unspent;
+                        c.lessee = None;
+                        released.push(c.outpoint);
+                    }
+                }
+            }
+            Ok(released)
+        })
+    }
+
     /// A leased coin's swap/backstop was aborted before it was spent.
     pub fn release_lease(&mut self, outpoint: OutPoint) -> Result<()> {
-        let c = self
-            .find_mut(&outpoint)
-            .ok_or(Error::Validation("ledger: unknown outpoint"))?;
-        if c.state != CoinState::Leased {
-            return Err(Error::Ordering("ledger: coin is not leased"));
-        }
-        c.state = CoinState::Unspent;
-        self.persist()
+        self.transact(|l| {
+            let c = l
+                .find_mut(&outpoint)
+                .ok_or(Error::Validation("ledger: unknown outpoint"))?;
+            if c.state != CoinState::Leased {
+                return Err(Error::Ordering("ledger: coin is not leased"));
+            }
+            c.state = CoinState::Unspent;
+            c.lessee = None;
+            Ok(())
+        })
     }
 
     /// A leased (or unspent) coin was consumed on-chain.
     pub fn mark_spent(&mut self, outpoint: OutPoint) -> Result<()> {
-        let c = self
-            .find_mut(&outpoint)
-            .ok_or(Error::Validation("ledger: unknown outpoint"))?;
-        if !matches!(c.state, CoinState::Leased | CoinState::Unspent) {
-            return Err(Error::Ordering("ledger: coin is not spendable"));
-        }
-        c.state = CoinState::Spent;
-        self.persist()
+        self.transact(|l| {
+            let c = l
+                .find_mut(&outpoint)
+                .ok_or(Error::Validation("ledger: unknown outpoint"))?;
+            if !matches!(c.state, CoinState::Leased | CoinState::Unspent) {
+                return Err(Error::Ordering("ledger: coin is not spendable"));
+            }
+            c.state = CoinState::Spent;
+            c.lessee = None;
+            Ok(())
+        })
     }
 
     /// Record a completed swap's output: exactly D at a fresh destination.
+    /// `deposit_linked` must be true when a deposit-provenance reserve coin
+    /// bumped this swap's completion — the taint persists with the coin.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_swapped_output(
         &mut self,
         outpoint: OutPoint,
         amount_sats: u64,
         key_index: u32,
         height: u32,
+        deposit_linked: bool,
     ) -> Result<()> {
         if self.find(&outpoint).is_some() {
             return Err(Error::Validation("ledger: outpoint already tracked"));
         }
-        self.coins.push(CoinRecord {
-            outpoint,
-            amount_sats,
-            class: CoinClass::Swapped,
-            key_purpose: KeyPurpose::SwapDestination,
-            state: CoinState::Unspent,
-            key_index,
-            created_height: height,
-            eligible_at_unix: 0,
-            split_tx: None,
-        });
-        self.persist()
+        self.transact(|l| {
+            l.coins.push(CoinRecord {
+                outpoint,
+                amount_sats,
+                class: CoinClass::Swapped,
+                state: CoinState::Unspent,
+                key_purpose: KeyPurpose::SwapDestination,
+                key_index,
+                created_height: height,
+                delay_or_eligible_unix: 0,
+                eligible_height: 0,
+                deposit_linked,
+                parent: None,
+                lessee: None,
+                split_tx: None,
+                split_attempts: Vec::new(),
+            });
+            Ok(())
+        })
     }
 
-    /// Promote the onboarding change output to the reserve pool. Reserve
-    /// coins share provenance with the DEPOSIT (not with any swap escrow),
-    /// which is what the backstop's linkage rule requires — but promoting is
-    /// still an explicit, logged act, never automatic.
+    /// Promote the onboarding change output to the reserve pool. Explicit
+    /// and persisted; the coin keeps its `OnboardingChange` key purpose, so
+    /// its deposit provenance remains readable forever.
     pub fn promote_change_to_reserve(&mut self, outpoint: OutPoint) -> Result<()> {
-        let c = self
-            .find_mut(&outpoint)
-            .ok_or(Error::Validation("ledger: unknown outpoint"))?;
-        if c.class != CoinClass::OnboardingChange || c.state != CoinState::Unspent {
-            return Err(Error::Ordering(
-                "ledger: only unspent onboarding change can become reserve",
-            ));
-        }
-        c.class = CoinClass::Reserve;
-        self.persist()
+        self.transact(|l| {
+            let c = l
+                .find_mut(&outpoint)
+                .ok_or(Error::Validation("ledger: unknown outpoint"))?;
+            if c.class != CoinClass::OnboardingChange || c.state != CoinState::Unspent {
+                return Err(Error::Ordering(
+                    "ledger: only unspent onboarding change can become reserve",
+                ));
+            }
+            c.class = CoinClass::Reserve;
+            Ok(())
+        })
     }
 
     // ---- queries ---------------------------------------------------------
@@ -661,16 +1044,19 @@ impl Ledger {
         self.coins.iter_mut().find(|c| &c.outpoint == outpoint)
     }
 
-    // ---- persistence -------------------------------------------------------
+    // ---- persistence -----------------------------------------------------
     //
-    // v1 layout (sealed): [1 ver=1][1 first_deposit_acked][4 next_key_index]
-    // [4 count] then per coin: [32 txid][4 vout][8 amount][1 class][1 state]
-    // [4 key_index][4 created_height][8 eligible_at][1 has_split_tx]
-    // ([4 len][bytes] if set).
+    // v2 layout (sealed): [1 ver=2][1 first_deposit_acked][4 next_key_index]
+    // [4 count] then per coin:
+    // [32 txid][4 vout][8 amount][1 class][1 state][1 key_purpose]
+    // [4 key_index][4 created_height][8 delay_or_eligible][4 eligible_height]
+    // [1 flags: b0 deposit_linked, b1 parent, b2 lessee, b3 split_tx,
+    //  b4 attempts]
+    // [36 parent]? [32 lessee]? [4 len + bytes split_tx]? [1 n + 32n attempts]?
 
     fn persist(&self) -> Result<()> {
-        let mut v = Vec::with_capacity(64 + self.coins.len() * 64);
-        v.push(1u8);
+        let mut v = Vec::with_capacity(64 + self.coins.len() * 96);
+        v.push(2u8);
         v.push(self.first_deposit_acked as u8);
         v.extend_from_slice(&self.next_key_index.to_le_bytes());
         v.extend_from_slice(&(self.coins.len() as u32).to_le_bytes());
@@ -683,14 +1069,41 @@ impl Ledger {
             v.push(purpose_to_byte(c.key_purpose));
             v.extend_from_slice(&c.key_index.to_le_bytes());
             v.extend_from_slice(&c.created_height.to_le_bytes());
-            v.extend_from_slice(&c.eligible_at_unix.to_le_bytes());
-            match &c.split_tx {
-                Some(tx) => {
-                    v.push(1);
-                    v.extend_from_slice(&(tx.len() as u32).to_le_bytes());
-                    v.extend_from_slice(tx);
+            v.extend_from_slice(&c.delay_or_eligible_unix.to_le_bytes());
+            v.extend_from_slice(&c.eligible_height.to_le_bytes());
+            let mut flags = 0u8;
+            if c.deposit_linked {
+                flags |= 1;
+            }
+            if c.parent.is_some() {
+                flags |= 2;
+            }
+            if c.lessee.is_some() {
+                flags |= 4;
+            }
+            if c.split_tx.is_some() {
+                flags |= 8;
+            }
+            if !c.split_attempts.is_empty() {
+                flags |= 16;
+            }
+            v.push(flags);
+            if let Some(p) = &c.parent {
+                v.extend_from_slice(&p.txid.to_byte_array());
+                v.extend_from_slice(&p.vout.to_le_bytes());
+            }
+            if let Some(who) = &c.lessee {
+                v.extend_from_slice(who);
+            }
+            if let Some(tx) = &c.split_tx {
+                v.extend_from_slice(&(tx.len() as u32).to_le_bytes());
+                v.extend_from_slice(tx);
+            }
+            if !c.split_attempts.is_empty() {
+                v.push(c.split_attempts.len() as u8);
+                for t in &c.split_attempts {
+                    v.extend_from_slice(&t.to_byte_array());
                 }
-                None => v.push(0),
             }
         }
         let tek = crate::crypto::storage::derive_tek(&self.platform_key, &ledger_salt());
@@ -703,13 +1116,21 @@ impl Ledger {
             .map_err(|_| Error::Abort("ledger write/sync failed"))?;
         drop(f);
         std::fs::rename(&tmp, &self.path).map_err(|_| Error::Abort("ledger rename failed"))?;
+        // Directory-entry durability: on unix, fsync the dir so the rename
+        // itself survives power loss; NTFS journals metadata (documented).
+        #[cfg(unix)]
+        {
+            if let Ok(d) = std::fs::File::open(self.path.parent().unwrap_or(Path::new("."))) {
+                let _ = d.sync_all();
+            }
+        }
         Ok(())
     }
 }
 
 fn parse_ledger(b: &[u8]) -> Result<(Vec<CoinRecord>, u32, bool)> {
     let mut at = 0usize;
-    if take_arr::<1>(b, &mut at)?[0] != 1 {
+    if take_arr::<1>(b, &mut at)?[0] != 2 {
         return Err(Error::Validation("ledger: unknown version"));
     }
     let acked = match take_arr::<1>(b, &mut at)?[0] {
@@ -729,21 +1150,46 @@ fn parse_ledger(b: &[u8]) -> Result<(Vec<CoinRecord>, u32, bool)> {
         let key_purpose = purpose_from_byte(take_arr::<1>(b, &mut at)?[0])?;
         let key_index = take_le_u32(b, &mut at)?;
         let created_height = take_le_u32(b, &mut at)?;
-        let eligible_at_unix = take_le_u64(b, &mut at)?;
-        let split_tx = match take_arr::<1>(b, &mut at)?[0] {
-            0 => None,
-            1 => {
-                let len = take_le_u32(b, &mut at)? as usize;
-                let end = at
-                    .checked_add(len)
-                    .ok_or(Error::Validation("ledger: split length overflow"))?;
-                let s = b
-                    .get(at..end)
-                    .ok_or(Error::Validation("ledger truncated (split tx)"))?;
-                at = end;
-                Some(s.to_vec())
+        let delay_or_eligible_unix = take_le_u64(b, &mut at)?;
+        let eligible_height = take_le_u32(b, &mut at)?;
+        let flags = take_arr::<1>(b, &mut at)?[0];
+        if flags & !0x1f != 0 {
+            return Err(Error::Validation("ledger: unknown flag bits"));
+        }
+        let parent = if flags & 2 != 0 {
+            let ptxid = Txid::from_byte_array(take_arr::<32>(b, &mut at)?);
+            let pvout = take_le_u32(b, &mut at)?;
+            Some(OutPoint::new(ptxid, pvout))
+        } else {
+            None
+        };
+        let lessee = if flags & 4 != 0 {
+            Some(take_arr::<32>(b, &mut at)?)
+        } else {
+            None
+        };
+        let split_tx = if flags & 8 != 0 {
+            let len = take_le_u32(b, &mut at)? as usize;
+            let end = at
+                .checked_add(len)
+                .ok_or(Error::Validation("ledger: split length overflow"))?;
+            let s = b
+                .get(at..end)
+                .ok_or(Error::Validation("ledger truncated (split tx)"))?;
+            at = end;
+            Some(s.to_vec())
+        } else {
+            None
+        };
+        let split_attempts = if flags & 16 != 0 {
+            let n = take_arr::<1>(b, &mut at)?[0] as usize;
+            let mut v = Vec::with_capacity(n);
+            for _ in 0..n {
+                v.push(Txid::from_byte_array(take_arr::<32>(b, &mut at)?));
             }
-            _ => return Err(Error::Validation("ledger: malformed split flag")),
+            v
+        } else {
+            Vec::new()
         };
         coins.push(CoinRecord {
             outpoint: OutPoint::new(txid, vout),
@@ -753,8 +1199,13 @@ fn parse_ledger(b: &[u8]) -> Result<(Vec<CoinRecord>, u32, bool)> {
             key_purpose,
             key_index,
             created_height,
-            eligible_at_unix,
+            delay_or_eligible_unix,
+            eligible_height,
+            deposit_linked: flags & 1 != 0,
+            parent,
+            lessee,
             split_tx,
+            split_attempts,
         });
     }
     if at != b.len() {
@@ -822,185 +1273,281 @@ mod tests {
         (ledger, ModeledKeySource::new(&ModeledEnclave))
     }
 
+    /// Register a deposit at a freshly-issued address (valid spk binding).
+    fn add_deposit(
+        ledger: &mut Ledger,
+        keys: &ModeledKeySource,
+        op: OutPoint,
+        amount: u64,
+        first: bool,
+    ) {
+        let (idx, spk) = ledger.next_deposit_address(keys).unwrap();
+        ledger
+            .register_deposit(op, amount, 100, idx, &spk, keys, first.then(ack))
+            .unwrap();
+    }
+
+    const LESSEE: [u8; 32] = [0xEE; 32];
+
     #[test]
-    fn phase0_gate_is_typed_and_textual() {
-        // Wrong copy: no token.
+    fn phase0_gate_is_typed_textual_and_not_consumed_by_failure() {
         assert!(acknowledge_phase0("I agree").is_err());
         assert!(acknowledge_phase0(&PHASE0_WARNING[..40]).is_err());
-        // Exact copy: token.
         acknowledge_phase0(PHASE0_WARNING).unwrap();
 
-        // First deposit demands the second showing.
         let dir = tempfile::tempdir().unwrap();
         let (mut ledger, keys) = fresh(dir.path());
-        let (dep_idx, _spk) = ledger.next_deposit_address(&keys).unwrap();
+        let (idx, spk) = ledger.next_deposit_address(&keys).unwrap();
+
+        // Without the re-ack: refused.
         let err = ledger
-            .register_deposit(outpoint(1), 5_000_000, 100, dep_idx, None)
+            .register_deposit(outpoint(1), 5_000_000, 100, idx, &spk, &keys, None)
             .unwrap_err();
         assert!(matches!(err, Error::Ordering(_)));
+
+        // A FAILED registration (bad spk binding) must not consume the gate:
+        let wrong_spk = crate::tx::setup::pre_encumbrance_spk([7u8; 32]).unwrap();
+        assert!(ledger
+            .register_deposit(outpoint(1), 5_000_000, 100, idx, &wrong_spk, &keys, Some(ack()))
+            .is_err());
+        // ...so the NEXT registration still demands (and gets) the ack.
+        let err = ledger
+            .register_deposit(outpoint(1), 5_000_000, 100, idx, &spk, &keys, None)
+            .unwrap_err();
+        assert!(matches!(err, Error::Ordering(_)), "gate consumed by a failed attempt");
         ledger
-            .register_deposit(outpoint(1), 5_000_000, 100, dep_idx, Some(ack()))
+            .register_deposit(outpoint(1), 5_000_000, 100, idx, &spk, &keys, Some(ack()))
             .unwrap();
         // Second deposit: no re-ack needed.
+        let (idx2, spk2) = ledger.next_deposit_address(&keys).unwrap();
         ledger
-            .register_deposit(outpoint(2), 3_000_000, 101, dep_idx, None)
+            .register_deposit(outpoint(2), 3_000_000, 101, idx2, &spk2, &keys, None)
             .unwrap();
     }
 
     #[test]
-    fn split_arithmetic_exact_units_single_change_and_dust_folding() {
+    fn split_arithmetic_units_shuffled_change_dust_and_caps() {
         let dir = tempfile::tempdir().unwrap();
         let (mut ledger, keys) = fresh(dir.path());
-        let params = Params::testnet_provisional(); // unit = 1_005_000
+        let params = Params::testnet_provisional();
         let unit = params.tier_d_sats + params.delta_fee_sats;
-        let clock = FixedClock(1_000_000);
 
         // 3 units + healthy change.
-        let (idx, _) = ledger.next_deposit_address(&keys).unwrap();
-        let dep_amount = 3 * unit + 50_000 + 1_000; // 3 units + change + fee
-        ledger
-            .register_deposit(outpoint(1), dep_amount, 100, idx, Some(ack()))
-            .unwrap();
-        let plan = ledger
-            .split_deposit(outpoint(1), &params, 1_000, &keys, &clock)
-            .unwrap();
+        let dep_amount = 3 * unit + 50_000 + 1_000;
+        add_deposit(&mut ledger, &keys, outpoint(1), dep_amount, true);
+        let plan = ledger.split_deposit(outpoint(1), &params, 1_000, &keys).unwrap();
         assert_eq!(plan.pre_encumbrance_count, 3);
         assert_eq!(plan.change_sats, 50_000);
         let tx: bitcoin::Transaction =
             bitcoin::consensus::encode::deserialize(&plan.tx_bytes).unwrap();
-        assert_eq!(tx.input.len(), 1, "single deposit input");
-        assert_eq!(tx.output.len(), 4, "3 pre-encumbrance + 1 change");
-        for out in &tx.output[..3] {
-            assert_eq!(out.value.to_sat(), unit, "every pre-encumbrance output exactly D+fee");
+        assert_eq!(tx.input.len(), 1);
+        assert_eq!(tx.output.len(), 4);
+        let cv = plan.change_vout.expect("change present") as usize;
+        assert_eq!(tx.output[cv].value.to_sat(), 50_000);
+        for (i, out) in tx.output.iter().enumerate() {
+            if i != cv {
+                assert_eq!(out.value.to_sat(), unit);
+            }
         }
-        assert_eq!(tx.output[3].value.to_sat(), 50_000);
-        // Fee conservation.
         let out_total: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
         assert_eq!(dep_amount - out_total, 1_000);
-        // Every output key is fresh and distinct.
         let spks: std::collections::HashSet<_> =
             tx.output.iter().map(|o| o.script_pubkey.clone()).collect();
         assert_eq!(spks.len(), 4, "no address reuse across split outputs");
 
-        // Sub-dust change folds into the fee.
-        let (idx2, _) = ledger.next_deposit_address(&keys).unwrap();
-        let dep2 = 2 * unit + 300 + 1_000; // change would be 300 < dust
-        ledger
-            .register_deposit(outpoint(2), dep2, 100, idx2, None)
-            .unwrap();
-        let plan2 = ledger
-            .split_deposit(outpoint(2), &params, 1_000, &keys, &clock)
-            .unwrap();
-        assert_eq!(plan2.pre_encumbrance_count, 2);
+        // Sub-dust change folds into the fee (P2TR dust = 330).
+        add_deposit(&mut ledger, &keys, outpoint(2), 2 * unit + 300 + 1_000, false);
+        let plan2 = ledger.split_deposit(outpoint(2), &params, 1_000, &keys).unwrap();
         assert_eq!(plan2.change_sats, 0);
+        assert!(plan2.change_vout.is_none());
         let tx2: bitcoin::Transaction =
             bitcoin::consensus::encode::deserialize(&plan2.tx_bytes).unwrap();
-        assert_eq!(tx2.output.len(), 2, "no dust change output");
-        let out2: u64 = tx2.output.iter().map(|o| o.value.to_sat()).sum();
-        assert_eq!(dep2 - out2, 1_300, "dust folded into fee");
+        assert_eq!(tx2.output.len(), 2);
+        // 330-sat change is RELAYABLE and kept (not burned).
+        add_deposit(&mut ledger, &keys, outpoint(3), unit + 330 + 1_000, false);
+        let plan3 = ledger.split_deposit(outpoint(3), &params, 1_000, &keys).unwrap();
+        assert_eq!(plan3.change_sats, 330);
 
-        // Too small for one unit: refused.
-        let (idx3, _) = ledger.next_deposit_address(&keys).unwrap();
-        ledger.register_deposit(outpoint(3), unit / 2, 100, idx3, None).unwrap();
-        assert!(ledger.split_deposit(outpoint(3), &params, 1_000, &keys, &clock).is_err());
+        // Too small; absurd fee; double-split: refused.
+        add_deposit(&mut ledger, &keys, outpoint(4), unit / 2, false);
+        assert!(ledger.split_deposit(outpoint(4), &params, 1_000, &keys).is_err());
+        add_deposit(&mut ledger, &keys, outpoint(5), 3 * unit, false);
+        assert!(ledger.split_deposit(outpoint(5), &params, 200_000, &keys).is_err());
+        assert!(ledger.split_deposit(outpoint(1), &params, 1_000, &keys).is_err());
 
-        // A deposit cannot be split twice (state moved to SplitPending).
-        assert!(ledger.split_deposit(outpoint(1), &params, 1_000, &keys, &clock).is_err());
+        // k cap: a whale deposit yields at most 64 units, excess in change.
+        add_deposit(&mut ledger, &keys, outpoint(6), 100 * unit + 1_000, false);
+        let plan6 = ledger.split_deposit(outpoint(6), &params, 1_000, &keys).unwrap();
+        assert_eq!(plan6.pre_encumbrance_count, 64);
+        assert_eq!(plan6.change_sats, 36 * unit);
     }
 
     #[test]
-    fn eligibility_delay_gates_leasing_and_survives_reopen() {
+    fn delay_anchors_at_confirmation_with_dual_anchor_gate() {
         let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, keys) = fresh(dir.path());
         let params = Params::testnet_provisional();
         let unit = params.tier_d_sats + params.delta_fee_sats;
-        let t0 = 1_700_000_000u64;
-        let plan;
-        {
-            let (mut ledger, keys) = fresh(dir.path());
-            let (idx, _) = ledger.next_deposit_address(&keys).unwrap();
-            ledger
-                .register_deposit(outpoint(1), 2 * unit + 2_000, 100, idx, Some(ack()))
-                .unwrap();
-            plan = ledger
-                .split_deposit(outpoint(1), &params, 2_000, &keys, &FixedClock(t0))
-                .unwrap();
-            ledger.confirm_split(plan.txid, 105).unwrap();
+        add_deposit(&mut ledger, &keys, outpoint(1), 2 * unit + 2_000, true);
+        let plan = ledger.split_deposit(outpoint(1), &params, 2_000, &keys).unwrap();
 
-            // Delays are in [24h, 72h + 1h) from t0.
-            for &e in &plan.eligible_at_unix {
-                assert!(e >= t0 + 24 * 3600, "delay below the 24h floor");
-                assert!(e < t0 + 72 * 3600 + 3600, "delay above 72h + jitter");
-            }
-
-            // Before eligibility: coins exist but are immature => Err.
-            assert!(matches!(
-                ledger.lease_pre_encumbrance(unit, &FixedClock(t0 + 3600)),
-                Err(Error::Deadline(_))
-            ));
-            // ===== crash =====
+        // Delays are DURATIONS in [24h, 72h + 1h); nothing eligible yet.
+        for &d in &plan.delay_secs {
+            assert!((24 * 3600..73 * 3600).contains(&d));
         }
-        // Fresh process: eligibility persisted, still gated.
-        let mut ledger = Ledger::open(dir.path(), &ModeledEnclave).unwrap();
+        for c in ledger.coins().iter().filter(|c| c.class == CoinClass::PreEncumbrance) {
+            assert_eq!(c.eligibility_unix(), None, "no absolute time before confirm");
+        }
+
+        // The split lingers; confirmation happens MUCH later — the delay
+        // must anchor from HERE, not from signing.
+        let confirm_time = 2_000_000_000u64;
+        let confirm_height = 900_000u32;
+        ledger.confirm_split(plan.txid, confirm_height, &FixedClock(confirm_time)).unwrap();
+        for c in ledger.coins().iter().filter(|c| c.class == CoinClass::PreEncumbrance) {
+            let e = c.eligibility_unix().unwrap();
+            assert!(e >= confirm_time + 24 * 3600, "delay must restart at confirmation");
+            assert!(c.eligible_height > confirm_height, "height anchor set");
+        }
+
+        // Dual anchor: clock passed but chain NOT → still gated (an
+        // NTP-shifted clock alone cannot collapse the delay).
+        let clock_ok = FixedClock(confirm_time + 74 * 3600);
         assert!(matches!(
-            ledger.lease_pre_encumbrance(unit, &FixedClock(t0 + 3600)),
+            ledger.lease_pre_encumbrance(unit, &clock_ok, confirm_height + 1, LESSEE),
             Err(Error::Deadline(_))
         ));
-        // After the max possible delay: leasable.
-        let late = FixedClock(t0 + 73 * 3600 + 1);
-        let coin = ledger.lease_pre_encumbrance(unit, &late).unwrap().expect("eligible");
-        assert_eq!(coin.class, CoinClass::PreEncumbrance);
-        assert_eq!(coin.amount_sats, unit);
-        // Leased: a second lease gets the OTHER coin, then none.
-        let coin2 = ledger.lease_pre_encumbrance(unit, &late).unwrap().expect("second");
-        assert_ne!(coin.outpoint, coin2.outpoint, "leasing must not double-select");
-        assert!(ledger.lease_pre_encumbrance(unit, &late).unwrap().is_none());
-        // Release one: leasable again.
-        ledger.release_lease(coin.outpoint).unwrap();
-        assert!(ledger.lease_pre_encumbrance(unit, &late).unwrap().is_some());
+        // Chain passed but clock NOT → still gated.
+        assert!(matches!(
+            ledger.lease_pre_encumbrance(unit, &FixedClock(confirm_time + 1), 2_000_000, LESSEE),
+            Err(Error::Deadline(_))
+        ));
+        // Both passed → leases, and carries the lessee.
+        let coin = ledger
+            .lease_pre_encumbrance(unit, &clock_ok, 2_000_000, LESSEE)
+            .unwrap()
+            .expect("eligible");
+        assert_eq!(coin.lessee, Some(LESSEE));
     }
 
     #[test]
-    fn non_mixing_selectors_are_class_pure() {
+    fn bump_split_fee_rbf_reuses_keys_and_all_attempts_tracked() {
         let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, keys) = fresh(dir.path());
         let params = Params::testnet_provisional();
         let unit = params.tier_d_sats + params.delta_fee_sats;
-        let (mut ledger, keys) = fresh(dir.path());
-        let (idx, _) = ledger.next_deposit_address(&keys).unwrap();
-        ledger
-            .register_deposit(outpoint(1), unit + 60_000 + 1_000, 100, idx, Some(ack()))
-            .unwrap();
-        let clock = FixedClock(1_000);
-        let plan = ledger.split_deposit(outpoint(1), &params, 1_000, &keys, &clock).unwrap();
-        ledger.confirm_split(plan.txid, 105).unwrap();
-        let change_op = OutPoint::new(plan.txid, plan.pre_encumbrance_count);
+        add_deposit(&mut ledger, &keys, outpoint(1), 2 * unit + 50_000, true);
 
-        // Reserve selector sees nothing until change is explicitly promoted.
-        assert!(ledger.lease_reserve().unwrap().is_none());
+        let plan1 = ledger.split_deposit(outpoint(1), &params, 1_000, &keys).unwrap();
+        // Bump must be strictly higher.
+        assert!(ledger.bump_split_fee(outpoint(1), 1_000, &params, &keys).is_err());
+        let plan2 = ledger.bump_split_fee(outpoint(1), 5_000, &params, &keys).unwrap();
+        assert_ne!(plan1.txid, plan2.txid);
+        assert_eq!(plan2.pre_encumbrance_count, 2);
+
+        // Same child KEYS reused across attempts (same spks, new txid).
+        let tx1: bitcoin::Transaction =
+            bitcoin::consensus::encode::deserialize(&plan1.tx_bytes).unwrap();
+        let tx2: bitcoin::Transaction =
+            bitcoin::consensus::encode::deserialize(&plan2.tx_bytes).unwrap();
+        let spks1: std::collections::HashSet<_> =
+            tx1.output.iter().map(|o| o.script_pubkey.clone()).collect();
+        let spks2: std::collections::HashSet<_> =
+            tx2.output.iter().map(|o| o.script_pubkey.clone()).collect();
+        assert_eq!(spks1, spks2, "attempts must reuse the same child keys");
+
+        // Both attempts' children tracked while pending.
+        let pending: Vec<_> = ledger
+            .coins()
+            .iter()
+            .filter(|c| c.state == CoinState::PendingConfirm)
+            .collect();
+        assert_eq!(pending.len(), 6, "2 attempts x (2 pre-enc + 1 change)");
+
+        // Attempt 2 confirms: its children activate; attempt 1's vanish.
+        ledger.confirm_split(plan2.txid, 500, &FixedClock(1_000)).unwrap();
+        assert!(ledger
+            .coins()
+            .iter()
+            .all(|c| c.outpoint.txid != plan1.txid), "losing attempt dropped");
+        let active: Vec<_> = ledger
+            .coins()
+            .iter()
+            .filter(|c| c.outpoint.txid == plan2.txid && c.state == CoinState::Unspent)
+            .collect();
+        assert_eq!(active.len(), 3);
+        // The deposit retains the signed bytes for reorg recovery.
+        let dep = ledger.find(&outpoint(1)).unwrap();
+        assert_eq!(dep.state, CoinState::Spent);
+        assert!(dep.split_tx.is_some(), "bytes retained for shallow-reorg rebroadcast");
+    }
+
+    #[test]
+    fn linkage_ack_gates_completion_bumps_and_taint_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, keys) = fresh(dir.path());
+        let params = Params::testnet_provisional();
+        let unit = params.tier_d_sats + params.delta_fee_sats;
+        add_deposit(&mut ledger, &keys, outpoint(1), unit + 60_000 + 1_000, true);
+        let plan = ledger.split_deposit(outpoint(1), &params, 1_000, &keys).unwrap();
+        ledger.confirm_split(plan.txid, 105, &FixedClock(1_000)).unwrap();
+        let change_op = OutPoint::new(plan.txid, plan.change_vout.unwrap());
+
         ledger.promote_change_to_reserve(change_op).unwrap();
-        let r = ledger.lease_reserve().unwrap().expect("reserve");
-        assert_eq!(r.class, CoinClass::Reserve);
+        // The promoted coin keeps its provenance-readable key purpose.
+        assert_eq!(
+            ledger.find(&change_op).unwrap().key_purpose,
+            KeyPurpose::OnboardingChange
+        );
+
+        // Refund bump: silent (no ack needed).
+        let r = ledger.lease_reserve(BumpTarget::Refund, None, LESSEE).unwrap().unwrap();
+        ledger.release_lease(r.outpoint).unwrap();
+
+        // Completion bump: refused without the typed linkage ack.
+        assert!(matches!(
+            ledger.lease_reserve(BumpTarget::Completion, None, LESSEE),
+            Err(Error::Ordering(_))
+        ));
+        assert!(acknowledge_linkage("ok").is_err());
+        let ack = acknowledge_linkage(LINKAGE_WARNING).unwrap();
+        let r = ledger
+            .lease_reserve(BumpTarget::Completion, Some(ack), LESSEE)
+            .unwrap()
+            .expect("reserve leased");
         assert_eq!(r.outpoint, change_op);
 
-        // The pre-encumbrance selector can never return the change/reserve
-        // coin even when amounts collide: class-pure by construction.
-        assert!(matches!(
-            ledger.lease_pre_encumbrance(unit, &FixedClock(2_000)),
-            Err(Error::Deadline(_)),
-        ));
-        // A deposit can never be leased as pre-encumbrance, even at the
-        // EXACT unit amount: class-pure selection, not amount matching.
-        let (idx2, _) = ledger.next_deposit_address(&keys).unwrap();
-        ledger.register_deposit(outpoint(9), unit, 100, idx2, None).unwrap();
-        // Far future: the real pre-encumbrance coin is mature and leases...
-        let leased = ledger
-            .lease_pre_encumbrance(unit, &FixedClock(u64::MAX))
-            .unwrap()
-            .expect("mature pre-encumbrance coin");
-        assert_eq!(leased.class, CoinClass::PreEncumbrance);
-        assert_ne!(leased.outpoint, outpoint(9));
-        // ...and once it is taken, the unit-amount DEPOSIT still never
-        // matches: nothing left to lease.
-        assert!(ledger.lease_pre_encumbrance(unit, &FixedClock(u64::MAX)).unwrap().is_none());
+        // The bumped swap's output carries the persisted taint.
+        ledger
+            .record_swapped_output(outpoint(9), params.tier_d_sats, 42, 200, true)
+            .unwrap();
+        drop(ledger);
+        let ledger = Ledger::open(dir.path(), &ModeledEnclave).unwrap();
+        assert!(ledger.find(&outpoint(9)).unwrap().deposit_linked, "taint must persist");
+    }
+
+    #[test]
+    fn lease_reconciliation_releases_orphans_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, keys) = fresh(dir.path());
+        let params = Params::testnet_provisional();
+        let unit = params.tier_d_sats + params.delta_fee_sats;
+        add_deposit(&mut ledger, &keys, outpoint(1), 2 * unit + 2_000, true);
+        let plan = ledger.split_deposit(outpoint(1), &params, 2_000, &keys).unwrap();
+        ledger.confirm_split(plan.txid, 105, &FixedClock(1_000)).unwrap();
+
+        let late = FixedClock(u64::MAX);
+        let live = [0xAA; 32];
+        let dead = [0xBB; 32];
+        let c1 = ledger.lease_pre_encumbrance(unit, &late, u32::MAX, live).unwrap().unwrap();
+        let c2 = ledger.lease_pre_encumbrance(unit, &late, u32::MAX, dead).unwrap().unwrap();
+
+        // Crash: the `dead` swap never wrote a SwapRecord. Reconcile against
+        // the live set.
+        let released = ledger.reconcile_leases(&[live]).unwrap();
+        assert_eq!(released, vec![c2.outpoint], "only the orphan released");
+        assert_eq!(ledger.find(&c1.outpoint).unwrap().state, CoinState::Leased);
+        assert_eq!(ledger.find(&c2.outpoint).unwrap().state, CoinState::Unspent);
     }
 
     #[test]
@@ -1009,26 +1556,18 @@ mod tests {
         let marker_amount = 0x00AB_CDEF_1234_5678u64;
         {
             let (mut ledger, keys) = fresh(dir.path());
-            let (idx, _) = ledger.next_deposit_address(&keys).unwrap();
-            ledger
-                .register_deposit(outpoint(1), marker_amount, 100, idx, Some(ack()))
-                .unwrap();
-
-            // Single instance while open.
+            add_deposit(&mut ledger, &keys, outpoint(1), marker_amount, true);
             match Ledger::open(dir.path(), &ModeledEnclave) {
                 Err(Error::Abort(_)) => {}
                 Err(e) => panic!("wrong error: {e:?}"),
                 Ok(_) => panic!("second instance must be refused"),
             }
         }
-        // Sealed at rest: the raw file must not contain the amount bytes.
         let raw = std::fs::read(dir.path().join("ledger.bin")).unwrap();
         assert!(
             !raw.windows(8).any(|w| w == marker_amount.to_le_bytes()),
             "coin amounts leaked to disk in plaintext"
         );
-
-        // Tamper => FAIL CLOSED (no silent empty ledger).
         let p = dir.path().join("ledger.bin");
         let mut bad = std::fs::read(&p).unwrap();
         let last = bad.len() - 1;
@@ -1042,52 +1581,31 @@ mod tests {
     }
 
     #[test]
-    fn split_tx_is_persisted_until_confirmed_for_crash_rebroadcast() {
+    fn split_tx_is_persisted_for_crash_rebroadcast_and_keys_never_reused() {
         let dir = tempfile::tempdir().unwrap();
         let params = Params::testnet_provisional();
         let unit = params.tier_d_sats + params.delta_fee_sats;
-        let txid;
         let tx_bytes;
+        let i1;
         {
             let (mut ledger, keys) = fresh(dir.path());
-            let (idx, _) = ledger.next_deposit_address(&keys).unwrap();
-            ledger
-                .register_deposit(outpoint(1), unit + 1_000, 100, idx, Some(ack()))
-                .unwrap();
-            let plan = ledger
-                .split_deposit(outpoint(1), &params, 1_000, &keys, &FixedClock(0))
-                .unwrap();
-            txid = plan.txid;
+            add_deposit(&mut ledger, &keys, outpoint(1), unit + 1_000, true);
+            let plan = ledger.split_deposit(outpoint(1), &params, 1_000, &keys).unwrap();
             tx_bytes = plan.tx_bytes;
+            i1 = ledger.next_deposit_address(&keys).unwrap().0;
             // ===== crash before broadcast/confirm =====
         }
         let mut ledger = Ledger::open(dir.path(), &ModeledEnclave).unwrap();
         let dep = ledger.find(&outpoint(1)).unwrap();
         assert_eq!(dep.state, CoinState::SplitPending);
-        assert_eq!(
-            dep.split_tx.as_deref(),
-            Some(tx_bytes.as_slice()),
-            "signed split must be rebroadcastable from the ledger alone"
-        );
-        // Confirm clears the cache and activates the children.
-        ledger.confirm_split(txid, 200).unwrap();
-        let dep = ledger.find(&outpoint(1)).unwrap();
-        assert_eq!(dep.state, CoinState::Spent);
-        assert!(dep.split_tx.is_none());
-    }
-
-    #[test]
-    fn key_indices_are_never_reused_across_restart() {
-        let dir = tempfile::tempdir().unwrap();
-        let i1;
-        {
-            let (mut ledger, keys) = fresh(dir.path());
-            i1 = ledger.next_deposit_address(&keys).unwrap().0;
-            // ===== crash =====
-        }
-        let mut ledger = Ledger::open(dir.path(), &ModeledEnclave).unwrap();
+        assert_eq!(dep.split_tx.as_deref(), Some(tx_bytes.as_slice()));
+        // Key counter survived (no on-chain reuse), and the restore floor
+        // can only raise it.
         let keys = ModeledKeySource::new(&ModeledEnclave);
         let i2 = ledger.next_deposit_address(&keys).unwrap().0;
-        assert!(i2 > i1, "key index must survive restart (no reuse)");
+        assert!(i2 > i1);
+        ledger.raise_key_index_floor(i2 + 100).unwrap();
+        let i3 = ledger.next_deposit_address(&keys).unwrap().0;
+        assert!(i3 >= i2 + 100, "floor must raise the counter");
     }
 }
