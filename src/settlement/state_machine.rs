@@ -275,20 +275,33 @@ impl Funding {
     }
 
     /// Confirm both escrows against the chain view, enforce the co-funding
-    /// window, compute S, and derive the role. Both funding outpoints are
-    /// supplied by the (stubbed) discovery/tx layer: `our_funding` is the escrow
-    /// WE funded, `their_funding` is the counterparty's.
+    /// window, compute S, and derive the role (v3.14 Phase 4). Both funding
+    /// outpoints are supplied by the (stubbed) discovery/tx layer: `our_funding`
+    /// is the escrow WE funded, `their_funding` the counterparty's; the two
+    /// session pubkeys fix the canonical user ordering.
     ///
-    /// Role derivation is deterministic and ANTISYMMETRIC in the two funding
-    /// txids, so the two parties derive OPPOSITE roles from the same public
-    /// data (v3.13 "role from txids + S"). Here: the party whose funded escrow
-    /// has the lexicographically smaller txid is the SecretHolder.
+    /// Role derivation (v3.14, verbatim):
+    ///   `role_seed = SHA256("newkey-role" ‖ txid_lower ‖ txid_higher ‖ S)`
+    /// where txid_lower/higher are the two funding txids ordered by byte value
+    /// (both parties agree) and S is the confirmation height. The canonical user
+    /// order is the lexicographic sort of session pubkeys — the SAME sort MuSig2
+    /// KeyAgg uses (`canonical_key_agg`), so the two wallets never diverge. The
+    /// seed then fixes which canonical user is SH (chooses t, publishes T, moves
+    /// first) vs SL. Re-rolling a role costs a real on-chain funding, so grinding
+    /// is uneconomical.
+    ///
+    /// NOTE: the exact bit that maps `role_seed` → SH is a v3.13 detail; the
+    /// low-bit selection below is a documented stand-in. The seed FORMULA and
+    /// the canonical ordering are authoritative (v3.14).
     pub fn await_funded(
         self,
         chain: &impl crate::chain::ChainView,
         our_funding: bitcoin::OutPoint,
         their_funding: bitcoin::OutPoint,
+        our_session_pubkey: &ValidatedPoint,
+        their_session_pubkey: &ValidatedPoint,
     ) -> Result<Funded> {
+        use bitcoin::hashes::Hash as _;
         self.params.validate()?; // ordering invariant (review item #5)
         let our_h = chain
             .funding_height(our_funding)
@@ -305,13 +318,33 @@ impl Funding {
         // S is the LATER of the two confirmations (the conservative baseline).
         let s_height = our_h.max(their_h);
 
-        // Antisymmetric role derivation from the funding txids.
-        let ours = our_funding.txid.to_string();
-        let theirs = their_funding.txid.to_string();
-        if ours == theirs {
+        // role_seed = SHA256("newkey-role" || txid_lower || txid_higher || S_be).
+        let our_txid = our_funding.txid.to_byte_array();
+        let their_txid = their_funding.txid.to_byte_array();
+        if our_txid == their_txid {
             return Err(Error::Validation("both escrows share a funding txid"));
         }
-        let role = if ours < theirs { Role::SecretHolder } else { Role::SecretLearner };
+        let (lo, hi) = if our_txid <= their_txid {
+            (our_txid, their_txid)
+        } else {
+            (their_txid, our_txid)
+        };
+        let mut preimage = Vec::with_capacity(11 + 32 + 32 + 4);
+        preimage.extend_from_slice(b"newkey-role");
+        preimage.extend_from_slice(&lo);
+        preimage.extend_from_slice(&hi);
+        preimage.extend_from_slice(&s_height.to_be_bytes());
+        let seed = bitcoin::hashes::sha256::Hash::hash(&preimage).to_byte_array();
+
+        // Canonical user A = lexicographically smaller session pubkey (same sort
+        // as KeyAgg). The seed's low bit selects which canonical user is SH.
+        let we_are_a = our_session_pubkey.to_bytes() < their_session_pubkey.to_bytes();
+        let seed_picks_a = (seed[0] & 1) == 0;
+        let role = if we_are_a == seed_picks_a {
+            Role::SecretHolder
+        } else {
+            Role::SecretLearner
+        };
 
         // We sweep the COUNTERPARTY's escrow (SH sweeps E_sl via Comp->SH; SL
         // sweeps E_sh via Comp->SL), so the sweep anchor is their funding height.

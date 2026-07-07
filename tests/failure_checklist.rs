@@ -553,8 +553,11 @@ fn partial_funding_funded_side_reclaims() {
     chain.fund(op, s_height); // only SL funds
 
     // await_funded fails: the counterparty escrow is not confirmed.
+    let our_pk = ValidatedPoint::from_bytes(&sl.pk.serialize()).unwrap();
+    let their_pk = ValidatedPoint::from_bytes(&sh.pk.serialize()).unwrap();
     let peer = PeerSession::new([0x55u8; 32], Box::new(duplex().0));
-    let funded = Funding::new(params.clone(), peer).await_funded(&chain, op, their_op);
+    let funded =
+        Funding::new(params.clone(), peer).await_funded(&chain, op, their_op, &our_pk, &their_pk);
     assert!(matches!(funded, Err(Error::Deadline(_))), "await_funded must fail on partial funding");
 
     // SL reclaims E_sl via the pre-armed refund once the early CSV matures.
@@ -666,13 +669,19 @@ fn cofunding_skew_anchors_claim_to_swept_escrow_not_s() {
     chain.fund(op_sh_funded, f_sh);
     chain.fund(op_sl_funded, f_sl);
 
-    // SL's view: our_funding = E_sl, their_funding = E_sh.
+    // The party that funded E_sl (and sweeps E_sh) runs await_funded. The
+    // anchoring property is role-independent: sweep_escrow_height is always the
+    // COUNTERPARTY escrow's height, so we assert on that, not on the (now
+    // hash-derived) role.
+    let sl = keypair();
+    let sh = keypair();
+    let our_pk = ValidatedPoint::from_bytes(&sl.pk.serialize()).unwrap();
+    let their_pk = ValidatedPoint::from_bytes(&sh.pk.serialize()).unwrap();
     let funded = Funding::new(params.clone(), PeerSession::new([1u8; 32], Box::new(duplex().0)))
-        .await_funded(&chain, op_sl_funded, op_sh_funded)
-        .expect("SL funded");
-    assert_eq!(funded.role(), Role::SecretLearner);
+        .await_funded(&chain, op_sl_funded, op_sh_funded, &our_pk, &their_pk)
+        .expect("funded");
     assert_eq!(funded.s_height(), f_sl, "S is the later confirmation");
-    assert_eq!(funded.sweep_escrow_height(), f_sh, "anchor is E_sh's own height");
+    assert_eq!(funded.sweep_escrow_height(), f_sh, "anchor is the swept escrow's own height");
 
     // The true on-chain maturity of SH's refund of E_sh (relative to E_sh):
     let true_deadline = f_sh as u64 + params.delta_late();
@@ -737,7 +746,7 @@ fn exchange_rejects_wrong_taproot_output_key() {
     );
 }
 
-// ---- await_funded role derivation (chain-view coverage) -------------------
+// ---- await_funded role derivation (v3.14 role_seed = SHA256(...)) ---------
 #[test]
 fn await_funded_derives_opposite_roles_and_enforces_cofunding_window() {
     let params = Params::testnet_provisional();
@@ -748,12 +757,16 @@ fn await_funded_derives_opposite_roles_and_enforces_cofunding_window() {
     chain.fund(op_a, s);
     chain.fund(op_b, s + params.cofunding_window); // within the window
 
-    // Both parties derive from the same public data; roles are opposite.
-    let mk = || {
-        Funding::new(params.clone(), PeerSession::new([1u8; 32], Box::new(duplex().0)))
-    };
-    let a = mk().await_funded(&chain, op_a, op_b).expect("A funded");
-    let b = mk().await_funded(&chain, op_b, op_a).expect("B funded");
+    // Two parties, distinct session pubkeys; each computes the same role_seed
+    // and derives OPPOSITE roles (antisymmetric in the canonical pubkey order).
+    let a_party = keypair();
+    let b_party = keypair();
+    let pk_a = ValidatedPoint::from_bytes(&a_party.pk.serialize()).unwrap();
+    let pk_b = ValidatedPoint::from_bytes(&b_party.pk.serialize()).unwrap();
+    let mk = || Funding::new(params.clone(), PeerSession::new([1u8; 32], Box::new(duplex().0)));
+
+    let a = mk().await_funded(&chain, op_a, op_b, &pk_a, &pk_b).expect("A funded");
+    let b = mk().await_funded(&chain, op_b, op_a, &pk_b, &pk_a).expect("B funded");
     assert_ne!(a.role(), b.role(), "the two parties must derive opposite roles");
     // S is the later confirmation.
     assert_eq!(a.s_height(), s + params.cofunding_window);
@@ -762,6 +775,6 @@ fn await_funded_derives_opposite_roles_and_enforces_cofunding_window() {
     let chain2 = SimChain::new(s);
     chain2.fund(op_a, s);
     chain2.fund(op_b, s + params.cofunding_window + 1);
-    let out = mk().await_funded(&chain2, op_a, op_b);
+    let out = mk().await_funded(&chain2, op_a, op_b, &pk_a, &pk_b);
     assert!(matches!(out, Err(Error::Deadline(_))));
 }
