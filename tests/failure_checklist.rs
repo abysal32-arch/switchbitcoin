@@ -16,7 +16,7 @@
 
 use bitcoin::{OutPoint, Txid};
 use musig2::KeyAggContext;
-use newkey::chain::{ChainView, SimChain, SpendStatus};
+use newkey::chain::{ChainView, DualSourceChainView, SimChain, Source, SpendStatus};
 use newkey::crypto::adaptor::AdaptorSecret;
 use newkey::crypto::{ValidatedFinalSig, ValidatedPoint};
 use newkey::settlement::params::Params;
@@ -851,6 +851,53 @@ fn equivocated_nonce_reveal_is_rejected() {
         "equivocated nonce reveal was not caught by the commit-reveal interlock"
     );
     let _ = h.join();
+}
+
+// ---- Self-verifying dual-source chain view defeats an eclipse (v3.13) ------
+// Signing never proceeds on unverified state: if a lying explorer fabricates a
+// confirmation but the self-verifying source disagrees, await_funded refuses.
+#[test]
+fn await_funded_refuses_under_eclipse_but_proceeds_on_agreement() {
+    let params = Params::testnet_provisional();
+    let s = 600_000u32;
+    let op_a = OutPoint::new(txid_from(1), 0);
+    let op_b = OutPoint::new(txid_from(2), 0);
+    let a_party = keypair();
+    let b_party = keypair();
+    let pk_a = ValidatedPoint::from_bytes(&a_party.pk.serialize()).unwrap();
+    let pk_b = ValidatedPoint::from_bytes(&b_party.pk.serialize()).unwrap();
+
+    // Eclipse: the self-verifying source sees the truth (unfunded); a lying
+    // explorer claims both escrows confirmed. The gate must refuse.
+    let honest = SimChain::new(s);
+    let liar = SimChain::new(s);
+    liar.fund(op_a, s);
+    liar.fund(op_b, s);
+    let eclipsed = DualSourceChainView::new(
+        Source::new(honest, true),
+        Source::new(liar, false),
+    )
+    .unwrap();
+    let out = Funding::new(params.clone(), PeerSession::new([1u8; 32], Box::new(duplex().0)))
+        .await_funded(&eclipsed, op_a, op_b, &pk_a, &pk_b);
+    assert!(
+        matches!(out, Err(Error::Deadline(_))),
+        "await_funded must not proceed when a source disagrees (eclipse)"
+    );
+
+    // Agreement: both sources back the same (truthful) chain; funding confirms.
+    let truth = SimChain::new(s);
+    truth.fund(op_a, s);
+    truth.fund(op_b, s);
+    let agreed = DualSourceChainView::new(
+        Source::new(truth.clone(), true),
+        Source::new(truth.clone(), false),
+    )
+    .unwrap();
+    let funded = Funding::new(params, PeerSession::new([1u8; 32], Box::new(duplex().0)))
+        .await_funded(&agreed, op_a, op_b, &pk_a, &pk_b)
+        .expect("agreeing dual-source view must confirm funding");
+    assert_eq!(funded.s_height(), s);
 }
 
 // ---- await_funded role derivation (v3.14 role_seed = SHA256(...)) ---------

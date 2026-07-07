@@ -195,6 +195,155 @@ impl ChainView for SimChain {
     }
 }
 
+// ===== Self-verifying dual-source chain view (v3.13) =======================
+//
+// v3.13: "At least one of the two required chain-state sources must be
+// self-verifying — BIP 157/158 compact-block filters checked against
+// independently obtained headers — not merely a second trusted explorer.
+// Disagreement resolves to wait-or-abort." This defeats a fully-eclipsed
+// all-API path: a lying explorer cannot fabricate confirmation, because the
+// self-verifying source validates PoW headers and will DISAGREE, and the gate
+// then refuses to proceed on unverified state.
+
+/// One chain-state source. A real deployment pairs a self-verifying BIP 157/158
+/// client with an ordinary explorer; here a source wraps any `ChainView`.
+pub trait ChainSource {
+    fn tip_height(&self) -> u32;
+    fn funding_height(&self, outpoint: OutPoint) -> Option<u32>;
+    fn spend_status(&self, escrow_outpoint: OutPoint) -> SpendStatus;
+    fn broadcast(&self, tx_bytes: &[u8]) -> Result<Txid>;
+    /// True iff this source validates compact-block filters against
+    /// independently-obtained PoW headers — i.e. it cannot be made to lie about
+    /// confirmation by an eclipse. At least one source of a pair must be this.
+    fn is_self_verifying(&self) -> bool;
+}
+
+/// A labeled source over any `ChainView` (e.g. a `SimChain`). The label records
+/// whether this source is the self-verifying one.
+pub struct Source<C: ChainView> {
+    view: C,
+    self_verifying: bool,
+}
+
+impl<C: ChainView> Source<C> {
+    pub fn new(view: C, self_verifying: bool) -> Self {
+        Source { view, self_verifying }
+    }
+}
+
+impl<C: ChainView> ChainSource for Source<C> {
+    fn tip_height(&self) -> u32 {
+        self.view.tip_height()
+    }
+    fn funding_height(&self, outpoint: OutPoint) -> Option<u32> {
+        self.view.funding_height(outpoint)
+    }
+    fn spend_status(&self, escrow_outpoint: OutPoint) -> SpendStatus {
+        self.view.spend_status(escrow_outpoint)
+    }
+    fn broadcast(&self, tx_bytes: &[u8]) -> Result<Txid> {
+        self.view.broadcast(tx_bytes)
+    }
+    fn is_self_verifying(&self) -> bool {
+        self.self_verifying
+    }
+}
+
+/// A chain view backed by TWO independent sources, at least one self-verifying.
+/// Reads are cross-verified: the `verified_*` methods return `Err(Deadline)` on
+/// disagreement so the settlement gate resolves to WAIT-OR-ABORT and never
+/// proceeds on unverified state.
+///
+/// It also implements `ChainView` so it drops into every existing consumer: on
+/// disagreement the reads collapse to the CONSERVATIVE value (fewer blocks
+/// elapsed, funding not-yet-confirmed, spend still pending) so a caller that
+/// ignores the distinction still never acts on unverified state — it simply
+/// waits. Callers that want to distinguish "disagreement" from "not yet" use
+/// the `verified_*` methods.
+pub struct DualSourceChainView<A: ChainSource, B: ChainSource> {
+    a: A,
+    b: B,
+}
+
+impl<A: ChainSource, B: ChainSource> DualSourceChainView<A, B> {
+    /// Requires at least one self-verifying source (else `Err`).
+    pub fn new(a: A, b: B) -> Result<Self> {
+        if !a.is_self_verifying() && !b.is_self_verifying() {
+            return Err(Error::Validation(
+                "dual-source chain view requires at least one self-verifying source",
+            ));
+        }
+        Ok(DualSourceChainView { a, b })
+    }
+
+    /// Broadcast to the self-verifying source (the authoritative real chain);
+    /// also to the other so an honest shared backing observes it.
+    pub fn broadcast(&self, tx_bytes: &[u8]) -> Result<Txid> {
+        // Prefer the self-verifying source as the authoritative broadcast target.
+        let (primary, secondary) = if self.a.is_self_verifying() {
+            (&self.a as &dyn ChainSource, &self.b as &dyn ChainSource)
+        } else {
+            (&self.b as &dyn ChainSource, &self.a as &dyn ChainSource)
+        };
+        let txid = primary.broadcast(tx_bytes)?;
+        let _ = secondary.broadcast(tx_bytes); // best-effort; may be the same backing
+        Ok(txid)
+    }
+
+    /// Tip height, only if both sources agree. Disagreement => wait-or-abort.
+    pub fn verified_tip_height(&self) -> Result<u32> {
+        let (x, y) = (self.a.tip_height(), self.b.tip_height());
+        if x == y {
+            Ok(x)
+        } else {
+            Err(Error::Deadline("chain sources disagree on tip; wait-or-abort"))
+        }
+    }
+
+    /// Funding confirmation height, only if both sources agree (including both
+    /// agreeing it is unconfirmed). Disagreement => wait-or-abort.
+    pub fn verified_funding_height(&self, outpoint: OutPoint) -> Result<Option<u32>> {
+        let (x, y) = (self.a.funding_height(outpoint), self.b.funding_height(outpoint));
+        if x == y {
+            Ok(x)
+        } else {
+            Err(Error::Deadline(
+                "chain sources disagree on funding confirmation; wait-or-abort (never proceed on unverified state)",
+            ))
+        }
+    }
+
+    /// Spend status, only if both sources agree. Disagreement => wait-or-abort.
+    pub fn verified_spend_status(&self, escrow_outpoint: OutPoint) -> Result<SpendStatus> {
+        let (x, y) = (self.a.spend_status(escrow_outpoint), self.b.spend_status(escrow_outpoint));
+        if x == y {
+            Ok(x)
+        } else {
+            Err(Error::Deadline("chain sources disagree on spend status; wait-or-abort"))
+        }
+    }
+}
+
+impl<A: ChainSource, B: ChainSource> ChainView for DualSourceChainView<A, B> {
+    // Conservative disagreement-mapping: never act on unverified state.
+    fn tip_height(&self) -> u32 {
+        // Fewer blocks elapsed is the safe reading (no premature maturity/runway).
+        self.verified_tip_height().unwrap_or_else(|_| self.a.tip_height().min(self.b.tip_height()))
+    }
+    fn funding_height(&self, outpoint: OutPoint) -> Option<u32> {
+        // Disagreement => treat as NOT confirmed (the gate waits).
+        self.verified_funding_height(outpoint).unwrap_or(None)
+    }
+    fn spend_status(&self, escrow_outpoint: OutPoint) -> SpendStatus {
+        // Disagreement => "pending", so a refund never fires against an
+        // unverified state and a completion is never assumed.
+        self.verified_spend_status(escrow_outpoint).unwrap_or(SpendStatus::InMempool)
+    }
+    fn broadcast(&self, tx_bytes: &[u8]) -> Result<Txid> {
+        DualSourceChainView::broadcast(self, tx_bytes)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,5 +437,75 @@ mod tests {
         // Higher fee (500): replaces the incumbent.
         assert!(chain.broadcast(&spend_tx_out(op(0), 9_500)).is_ok());
         assert!(matches!(chain.spend_status(op(0)), SpendStatus::InMempool));
+    }
+
+    // ----- Self-verifying dual-source chain view -----
+
+    #[test]
+    fn dual_source_requires_at_least_one_self_verifying() {
+        let a = Source::new(SimChain::new(100), false);
+        let b = Source::new(SimChain::new(100), false);
+        assert!(DualSourceChainView::new(a, b).is_err());
+
+        let a = Source::new(SimChain::new(100), true); // self-verifying
+        let b = Source::new(SimChain::new(100), false);
+        assert!(DualSourceChainView::new(a, b).is_ok());
+    }
+
+    #[test]
+    fn agreeing_sources_pass_through() {
+        // Both sources back the SAME chain (Arc clone) => always agree.
+        let chain = SimChain::new(100);
+        chain.fund(op(0), 100);
+        let dual = DualSourceChainView::new(
+            Source::new(chain.clone(), true),
+            Source::new(chain.clone(), false),
+        )
+        .unwrap();
+        assert_eq!(dual.verified_tip_height().unwrap(), 100);
+        assert_eq!(dual.verified_funding_height(op(0)).unwrap(), Some(100));
+        assert_eq!(dual.verified_spend_status(op(0)).unwrap(), SpendStatus::Unspent);
+        // ChainView adapter agrees too.
+        assert_eq!(dual.funding_height(op(0)), Some(100));
+    }
+
+    #[test]
+    fn disagreement_resolves_to_wait_or_abort() {
+        // Two DIFFERENT chains that disagree on funding confirmation.
+        let honest = SimChain::new(100); // op(0) NOT funded here
+        let other = SimChain::new(100);
+        other.fund(op(0), 100); // claims it IS funded
+        let dual = DualSourceChainView::new(
+            Source::new(honest, true), // self-verifying, says unconfirmed
+            Source::new(other, false), // explorer, says confirmed
+        )
+        .unwrap();
+        // verified_* surfaces the disagreement explicitly.
+        assert!(matches!(dual.verified_funding_height(op(0)), Err(Error::Deadline(_))));
+        // ChainView adapter collapses to the conservative "not confirmed".
+        assert_eq!(dual.funding_height(op(0)), None);
+    }
+
+    #[test]
+    fn eclipse_all_api_path_is_defeated_by_the_self_verifying_source() {
+        // A fully-eclipsed all-API attack: a LYING explorer fabricates a
+        // confirmation to trick us into proceeding. The self-verifying source
+        // (which validates PoW headers) cannot be fooled, so it disagrees, and
+        // the gate refuses to proceed on unverified state — no theft.
+        let self_verifying = SimChain::new(100); // truth: op(0) unfunded
+        let lying_explorer = SimChain::new(100);
+        lying_explorer.fund(op(0), 100); // the lie
+        lying_explorer.mine(); // and pretends a spend confirmed, etc.
+
+        let dual = DualSourceChainView::new(
+            Source::new(self_verifying, true),
+            Source::new(lying_explorer, false),
+        )
+        .unwrap();
+
+        // The gate never treats the escrow as confirmed on the strength of the
+        // lying explorer alone.
+        assert!(dual.verified_funding_height(op(0)).is_err());
+        assert_eq!(dual.funding_height(op(0)), None, "eclipse must not yield a false confirmation");
     }
 }
