@@ -20,6 +20,18 @@
 //!   - A funded escrow is never persisted without its pre-armed refund (G2's
 //!     crash half): the store refuses such a record.
 
+//!   * `manifest` — signed, versioned parameter ingestion (v3.13 "signed
+//!     manifest" trust path). BIP340-verified against the pinned trust root,
+//!     strictly-monotonic version gate, ordering invariant asserted on every
+//!     ingest regardless of signature, Δ_fee-version swap refusal. Uses the
+//!     pinned libsecp256k1 for verification — no new curve math, and none of
+//!     it lives in the settlement crypto modules.
+
+pub mod manifest;
 pub mod store;
 
+pub use manifest::{
+    ClaimDelayPosture, ManifestOpenReport, ManifestStore, ManifestTrustRoot, ModeledTrustRoot,
+    SignedManifest,
+};
 pub use store::{EnclaveKeyProvider, ModeledEnclave, RecoveryAction, SwapPhase, SwapRecord, SwapStore};
