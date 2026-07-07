@@ -853,6 +853,167 @@ fn equivocated_nonce_reveal_is_rejected() {
     let _ = h.join();
 }
 
+// ---- FULL swap under co-funding skew (end-to-end regression for the anchor)-
+// The SH-funded escrow (which SL sweeps) confirms EARLIER than the SL-funded
+// escrow, so S = f_sl > f_sh. Drives the complete six-message exchange +
+// broadcast + extract + claim through await_funded (not funded_manual), and
+// proves SL's claim confirms before the SWEPT escrow's own refund maturity
+// (f_sh + Δ_late) — tighter than the spec's S + Δ_late shorthand.
+#[test]
+fn full_swap_under_cofunding_skew() {
+    let params = Params::testnet_provisional();
+    let delta_late = u32::try_from(params.delta_late()).unwrap();
+    let cw = params.cofunding_window;
+    let f_sh = 900_000u32; // SH-funded escrow (E_sh) confirms FIRST
+    let f_sl = f_sh + cw; // SL-funded escrow (E_sl) later; S = f_sl (max skew)
+    let escrow_amount = params.tier_d_sats + params.delta_fee_sats;
+    let d = params.tier_d_sats;
+
+    let sh = keypair();
+    let sl = keypair();
+    let internal = aggregate_internal(sh.pk, sl.pk);
+    let escrow_comp_sh = Escrow::new(&internal, &sl.pk, params.delta_early).unwrap(); // E_sl (SH sweeps)
+    let escrow_comp_sl = Escrow::new(&internal, &sh.pk, delta_late).unwrap(); // E_sh (SL sweeps)
+    let sl_pk = ValidatedPoint::from_bytes(&sl.pk.serialize()).unwrap();
+    let sh_pk = ValidatedPoint::from_bytes(&sh.pk.serialize()).unwrap();
+
+    // Grind funding txids so the role_seed assigns roles matching the escrow
+    // construction: the party funding E_sh derives SecretHolder, E_sl SecretLearner.
+    let (op_sl_funded, op_sh_funded) = 'g: {
+        for a in 1u8..120 {
+            for b in 1u8..120 {
+                if a == b {
+                    continue;
+                }
+                let (op_sl, op_sh) = (OutPoint::new(txid_from(a), 0), OutPoint::new(txid_from(b), 0));
+                let c = SimChain::new(f_sl);
+                c.fund(op_sh, f_sh);
+                c.fund(op_sl, f_sl);
+                let role = Funding::new(params.clone(), PeerSession::new([0u8; 32], Box::new(duplex().0)))
+                    .await_funded(&c, op_sl, op_sh, &sl_pk, &sh_pk)
+                    .unwrap()
+                    .role();
+                if role == Role::SecretLearner {
+                    break 'g (op_sl, op_sh);
+                }
+            }
+        }
+        panic!("no txid pair yields the intended role assignment");
+    };
+
+    // The real shared chain at skewed heights.
+    let chain = SimChain::new(f_sl);
+    chain.fund(op_sh_funded, f_sh);
+    chain.fund(op_sl_funded, f_sl);
+
+    // Real completion sighashes + roots + output keys.
+    let dest = escrow_comp_sh.funding_script_pubkey().clone();
+    let comp_sh_spend =
+        build_completion(&escrow_comp_sh, op_sl_funded, escrow_amount, dest.clone(), d).unwrap();
+    let comp_sl_spend =
+        build_completion(&escrow_comp_sl, op_sh_funded, escrow_amount, dest, d).unwrap();
+    let (msg_sh, msg_sl) = (comp_sh_spend.sighash, comp_sl_spend.sighash);
+    let (root_sh, root_sl) = (escrow_comp_sh.merkle_root(), escrow_comp_sl.merkle_root());
+    let (ok_sh, ok_sl) = (escrow_comp_sh.output_key_xonly(), escrow_comp_sl.output_key_xonly());
+
+    let swap_id = [0x7eu8; 32];
+    let store = tempfile::tempdir().unwrap();
+    let lease_sh = tempfile::tempdir().unwrap();
+    let lease_sl = tempfile::tempdir().unwrap();
+    let (io_sh, io_sl) = duplex();
+
+    // SH thread: await_funded (must derive SecretHolder), exchange, broadcast.
+    let sh_chain = chain.clone();
+    let sh_params = params.clone();
+    let comp_sh_for_sh = comp_sh_spend.clone();
+    let sh_handle = std::thread::spawn(move || -> Result<(Vec<u8>, [u8; 64])> {
+        let refund = PreArmedRefund::from_signed_tx(vec![0xaa; 64], f_sh + delta_late)?;
+        let receipt = confirm_watchtower_handoff(&refund, refund.fingerprint())?;
+        let (t, _) = AdaptorSecret::generate()?;
+        let peer = PeerSession::new(swap_id, Box::new(io_sh));
+        let funded = Funding::new(sh_params, peer).await_funded(
+            &sh_chain,
+            op_sh_funded,
+            op_sl_funded,
+            &ValidatedPoint::from_bytes(&sh.pk.serialize())?,
+            &ValidatedPoint::from_bytes(&sl.pk.serialize())?,
+        )?;
+        assert_eq!(funded.role(), Role::SecretHolder);
+        let possessing = funded.run_adaptor_exchange(ExchangeInputs {
+            our_seckey: sh.sk,
+            their_pubkey: ValidatedPoint::from_bytes(&sl.pk.serialize())?,
+            msg_comp_sh: msg_sh,
+            msg_comp_sl: msg_sl,
+            pre_armed_refund: refund,
+            adaptor_secret: Some(t),
+            lease_dir: Some(lease_sh.path().to_path_buf()),
+            possession_store: None,
+            taproot_root_comp_sh: Some(root_sh),
+            taproot_root_comp_sl: Some(root_sl),
+            taproot_output_comp_sh: Some(ok_sh),
+            taproot_output_comp_sl: Some(ok_sl),
+        })?;
+        // Deadline = S + Δ_early - Δ_buffer; broadcast with ample runway.
+        let sig = possessing.broadcast_completion(f_sl + 5, &receipt)?;
+        Ok((finalize_key_spend(comp_sh_for_sh, sig.0), sig.0))
+    });
+
+    // SL side: await_funded (SecretLearner, sweep = f_sh), exchange.
+    let peer = PeerSession::new(swap_id, Box::new(io_sl));
+    let funded = Funding::new(params.clone(), peer)
+        .await_funded(&chain, op_sl_funded, op_sh_funded, &sl_pk, &sh_pk)
+        .unwrap();
+    assert_eq!(funded.role(), Role::SecretLearner);
+    assert_eq!(funded.s_height(), f_sl, "S is the later confirmation");
+    assert_eq!(funded.sweep_escrow_height(), f_sh, "SL claim anchored to the swept escrow, not S");
+    let sl_possessing = funded
+        .run_adaptor_exchange(ExchangeInputs {
+            our_seckey: sl.sk,
+            their_pubkey: sh_pk.clone(),
+            msg_comp_sh: msg_sh,
+            msg_comp_sl: msg_sl,
+            pre_armed_refund: PreArmedRefund::from_signed_tx(vec![0xbb; 64], f_sl + params.delta_early)
+                .unwrap(),
+            adaptor_secret: None,
+            lease_dir: Some(lease_sl.path().to_path_buf()),
+            possession_store: Some(store.path().to_path_buf()),
+            taproot_root_comp_sh: Some(root_sh),
+            taproot_root_comp_sl: Some(root_sl),
+            taproot_output_comp_sh: Some(ok_sh),
+            taproot_output_comp_sl: Some(ok_sl),
+        })
+        .unwrap();
+
+    let (comp_sh_final, comp_sh_sig) = sh_handle.join().unwrap().expect("SH side");
+
+    // SH's Comp->SH confirms (revealing t).
+    chain.broadcast(&comp_sh_final).expect("Comp->SH accepted");
+    chain.mine();
+    assert!(matches!(chain.spend_status(op_sl_funded), SpendStatus::Confirmed(_)));
+
+    // SL extracts t and claims.
+    let observed = ValidatedFinalSig::from_bytes(&comp_sh_sig).unwrap();
+    let reveal_height = chain.tip_height();
+    let plan = sl_possessing.claim_after_reveal(&observed, reveal_height).expect("extract + claim");
+
+    // THE PROPERTY: SL's worst-case claim confirms before the SWEPT escrow's own
+    // refund maturity (f_sh + Δ_late) — which under skew is STRICTLY earlier than
+    // the spec's S + Δ_late shorthand. The anchor is what keeps this safe.
+    let true_deadline = f_sh as u64 + params.delta_late();
+    assert!(
+        reveal_height as u64 + plan.delay_blocks as u64 + params.claim_confirm_allowance as u64
+            <= true_deadline,
+        "claim must confirm before the swept escrow's refund matures"
+    );
+    assert!(true_deadline < f_sl as u64 + params.delta_late(), "skew is real (cofunding_window > 0)");
+
+    // The claim is a valid taproot key-path spend of the SH-funded escrow.
+    let comp_sl_final = finalize_key_spend(comp_sl_spend, plan.comp_sl_final.0);
+    chain.broadcast(&comp_sl_final).expect("Comp->SL accepted");
+    chain.mine();
+    assert!(matches!(chain.spend_status(op_sh_funded), SpendStatus::Confirmed(_)));
+}
+
 // ---- Self-verifying dual-source chain view defeats an eclipse (v3.13) ------
 // Signing never proceeds on unverified state: if a lying explorer fabricates a
 // confirmation but the self-verifying source disagrees, await_funded refuses.
