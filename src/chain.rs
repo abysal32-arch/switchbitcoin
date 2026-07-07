@@ -26,6 +26,25 @@ pub enum SpendStatus {
     Confirmed(u32),
 }
 
+/// Tri-state verified funding read for the proceed-to-sign / encumbrance
+/// gate. The point is to distinguish a source DISAGREEMENT (transient — the
+/// self-verifying source holds the truth, so WAIT and re-poll) from a
+/// genuine WRONG amount (a hostile escrow — abort). Collapsing both to
+/// "not verified" lets a single lying non-authoritative source force a
+/// terminal abort of an honestly-funded swap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FundingReading {
+    /// Not confirmed (on the agreement-required view).
+    Unconfirmed,
+    /// Confirmed at `height`; `amount` is Some when both sources agree on it,
+    /// None when a source cannot report it.
+    Confirmed { height: u32, amount: Option<u64> },
+    /// Sources disagree, or the amount cannot be cross-verified. The
+    /// self-verifying source is authoritative and can be re-polled — the
+    /// caller must WAIT, never treat this as terminal.
+    Unverifiable,
+}
+
 /// What the settlement layer needs from a chain. Read-only queries plus
 /// broadcast; `&self` with interior mutability so it can be shared.
 pub trait ChainView {
@@ -47,6 +66,29 @@ pub trait ChainView {
     /// an unknown spend conservatively as a winning completion).
     fn spend_txid(&self, _outpoint: OutPoint) -> Option<Txid> {
         None
+    }
+    /// Tri-state encumbrance read (see `FundingReading`). Default (a single
+    /// source, which is its own authority and never disagrees with itself)
+    /// composes height + amount and NEVER returns `Unverifiable`. A
+    /// dual-source view overrides this to surface real disagreement so the
+    /// caller waits instead of aborting.
+    fn verified_funding_reading(&self, outpoint: OutPoint) -> FundingReading {
+        match self.funding_height(outpoint) {
+            None => FundingReading::Unconfirmed,
+            Some(height) => FundingReading::Confirmed {
+                height,
+                amount: self.funding_amount(outpoint),
+            },
+        }
+    }
+    /// Funding height per the AUTHORITATIVE (self-verifying) source. Cannot be
+    /// fooled into hiding or fabricating a confirmation, so it is the correct
+    /// read for the no-show / abandon judgment (a genuinely-funded
+    /// counterparty must never be declared a no-show because a lying explorer
+    /// disagrees). NOT for proceed-to-sign, which stays agreement-required.
+    /// Default = `funding_height` (a single source is its own authority).
+    fn authoritative_funding_height(&self, outpoint: OutPoint) -> Option<u32> {
+        self.funding_height(outpoint)
     }
     /// Broadcast a fully-signed tx to the mempool. Enforces funding existence,
     /// relative-timelock maturity, and no-double-spend. Idempotent for a tx
@@ -452,6 +494,19 @@ impl<A: ChainSource, B: ChainSource> ChainView for DualSourceChainView<A, B> {
         // Authoritative (self-verifying) source: a lying explorer must not be
         // able to misattribute a spend and trick us into "take the swap".
         self.sv().spend_txid(outpoint)
+    }
+    fn verified_funding_reading(&self, outpoint: OutPoint) -> FundingReading {
+        // Real tri-state: a source disagreement (or an un-reportable amount)
+        // becomes `Unverifiable` (wait, don't abort); genuine agreement gives
+        // the confirmed amount.
+        match self.verified_funding(outpoint) {
+            Ok(None) => FundingReading::Unconfirmed,
+            Ok(Some((height, amount))) => FundingReading::Confirmed { height, amount: Some(amount) },
+            Err(_) => FundingReading::Unverifiable,
+        }
+    }
+    fn authoritative_funding_height(&self, outpoint: OutPoint) -> Option<u32> {
+        self.sv().funding_height(outpoint)
     }
     fn broadcast(&self, tx_bytes: &[u8]) -> Result<Txid> {
         DualSourceChainView::broadcast(self, tx_bytes)

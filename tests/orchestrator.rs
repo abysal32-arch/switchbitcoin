@@ -213,6 +213,90 @@ fn fund_and_run_reclaims_via_abort_driver() {
     );
 }
 
+/// The adversarial-review regression: a lying NON-authoritative source
+/// (the explorer) that disagrees on the counterparty escrow's amount must
+/// only DELAY (Wait), never force a terminal Abort of an honestly-funded
+/// swap — and once it stops lying, the swap Proceeds.
+#[test]
+fn lying_explorer_delays_but_cannot_force_abort() {
+    let manifest = SignedManifest::provisional();
+    let params = manifest.params().clone();
+    let coord = FundingCoordinator::from_manifest(&manifest);
+    let unit = params.tier_d_sats + params.delta_fee_sats;
+    let s = 900_000u32;
+    let block_x = s + 100;
+
+    let our_escrow = OutPoint::new(txid(1), 0);
+    let their_escrow = OutPoint::new(txid(2), 0);
+
+    // Honest self-verifying source: both escrows confirmed at exactly D+fee.
+    let honest = SimChain::new(s);
+    honest.fund_with_amount(our_escrow, s, unit);
+    honest.fund_with_amount(their_escrow, s, unit);
+    // Lying explorer: reports the counterparty escrow at the WRONG amount.
+    let liar = SimChain::new(s);
+    liar.fund_with_amount(our_escrow, s, unit);
+    liar.fund_with_amount(their_escrow, s, unit + 1);
+
+    let view = DualSourceChainView::new(
+        Source::new(honest.clone(), true),  // self-verifying = truth
+        Source::new(liar.clone(), false),   // explorer = lying
+    )
+    .unwrap();
+
+    // The sources disagree on the counterparty amount → the swap WAITS
+    // (does NOT abort), because the self-verifying source holds the truth.
+    assert_eq!(
+        coord
+            .next_funding_action(&view, FundingOrder::First, our_escrow, their_escrow, true, true, block_x)
+            .unwrap(),
+        FundingAction::Wait,
+        "a lying explorer must not force a terminal abort"
+    );
+
+    // Even past Block X, the no-show judgment uses the AUTHORITATIVE source,
+    // which shows the counterparty genuinely funded → still not a no-show.
+    while honest.tip_height() < block_x {
+        honest.mine();
+        liar.mine();
+    }
+    assert_eq!(
+        coord
+            .next_funding_action(&view, FundingOrder::First, our_escrow, their_escrow, true, true, block_x)
+            .unwrap(),
+        FundingAction::Wait,
+        "Block-X must not abort a counterparty confirmed on the authoritative source"
+    );
+
+    // The explorer stops lying (re-syncs to the truth): now the sources agree
+    // and the swap Proceeds — the liar only delayed it.
+    liar.fund_with_amount(their_escrow, s, unit);
+    assert!(matches!(
+        coord
+            .next_funding_action(&view, FundingOrder::First, our_escrow, their_escrow, true, true, block_x)
+            .unwrap(),
+        FundingAction::Proceed { .. }
+    ));
+
+    // But a GENUINE wrong amount (BOTH sources agree it is not D+fee) still
+    // aborts — the fix distinguishes disagreement from a hostile escrow.
+    let honest2 = SimChain::new(s);
+    honest2.fund_with_amount(their_escrow, s, unit - 500);
+    let liar2 = SimChain::new(s);
+    liar2.fund_with_amount(their_escrow, s, unit - 500);
+    let view2 = DualSourceChainView::new(
+        Source::new(honest2, true),
+        Source::new(liar2, false),
+    )
+    .unwrap();
+    assert_eq!(
+        coord
+            .next_funding_action(&view2, FundingOrder::First, our_escrow, their_escrow, true, true, block_x)
+            .unwrap(),
+        FundingAction::Abort("counterparty escrow is not exactly D+delta_fee; abort")
+    );
+}
+
 fn txid(seed: u8) -> bitcoin::Txid {
     let mut b = [0u8; 32];
     b[0] = seed;

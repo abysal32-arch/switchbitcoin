@@ -130,34 +130,40 @@ impl FundingCoordinator {
         jitter_ready: bool,
         block_x: u32,
     ) -> Result<FundingAction> {
+        use crate::chain::FundingReading;
         let expected = self.expected_escrow_amount()?;
         let tip = chain.tip_height();
-        let our_h = chain.funding_height(our_escrow);
-        let their_h = chain.funding_height(their_escrow);
 
-        // Block-X wallet-policy deadline: if both are not yet confirmed by X,
-        // abandon and discard. (Checked before anything else so a stalled
-        // swap always terminates.)
-        if tip >= block_x && !(our_h.is_some() && their_h.is_some()) {
+        // Block-X no-show judgment uses the AUTHORITATIVE (self-verifying)
+        // funding heights: a lying non-authoritative source can DELAY but must
+        // never be able to declare a genuinely-funded counterparty a no-show
+        // (which would irreversibly abort an honest swap). The self-verifying
+        // source cannot be fooled into hiding a confirmation.
+        let our_auth = chain.authoritative_funding_height(our_escrow);
+        let their_auth = chain.authoritative_funding_height(their_escrow);
+        if tip >= block_x && !(our_auth.is_some() && their_auth.is_some()) {
             return Ok(FundingAction::Abort("Block X funding deadline passed; abandon to refunds"));
         }
 
-        // Encumbrance verification of the counterparty escrow: once it is
-        // confirmed, it MUST hold exactly D+Δ_fee — a wrong amount is a
-        // malformed/hostile counterparty; abort rather than sign against it.
-        // (Absent amount from a non-amount source collapses to None here,
-        // which we treat as "not yet verified", not "wrong" — Wait, not
-        // Abort — so an under-capable source degrades safely.)
-        if their_h.is_some() {
-            match chain.funding_amount(their_escrow) {
-                Some(a) if a != expected => {
-                    return Ok(FundingAction::Abort(
-                        "counterparty escrow is not exactly D+delta_fee; abort",
-                    ));
-                }
-                _ => {}
+        // Tri-state encumbrance read of the counterparty escrow. Only a
+        // GENUINE wrong amount (both sources agree it is != D+Δ_fee) is a
+        // hostile escrow that warrants a terminal Abort. A mere source
+        // DISAGREEMENT (`Unverifiable`) or an un-reportable amount must NOT
+        // abort — the self-verifying source holds the truth and we re-poll.
+        let their_reading = chain.verified_funding_reading(their_escrow);
+        if let FundingReading::Confirmed { amount: Some(a), .. } = their_reading {
+            if a != expected {
+                return Ok(FundingAction::Abort(
+                    "counterparty escrow is not exactly D+delta_fee; abort",
+                ));
             }
         }
+        // The counterparty escrow is VERIFIED-encumbered iff both sources
+        // agree it is confirmed at exactly D+Δ_fee.
+        let their_encumbrance_ok = matches!(
+            their_reading,
+            FundingReading::Confirmed { amount: Some(a), .. } if a == expected
+        );
 
         // Have we funded yet?
         if !our_setup_broadcast {
@@ -167,10 +173,10 @@ impl FundingCoordinator {
             return Ok(match order {
                 // First funder broadcasts as soon as jitter elapses.
                 FundingOrder::First => FundingAction::BroadcastOurSetup,
-                // Second funder waits for the first escrow to be VERIFIED
-                // confirmed at exactly D+Δ_fee before committing funds.
+                // Second funder funds only after the first escrow is VERIFIED
+                // at exactly D+Δ_fee.
                 FundingOrder::Second => {
-                    if their_h.is_some() && chain.funding_amount(their_escrow) == Some(expected) {
+                    if their_encumbrance_ok {
                         FundingAction::BroadcastOurSetup
                     } else {
                         FundingAction::Wait
@@ -179,8 +185,11 @@ impl FundingCoordinator {
             });
         }
 
-        // We have funded; wait for both confirmations.
-        let (Some(oh), Some(th)) = (our_h, their_h) else {
+        // We have funded; the proceed-to-sign gate stays AGREEMENT-REQUIRED
+        // (never proceed on unverified state): wait for both confirmations on
+        // the cross-verified reading.
+        let (Some(oh), Some(th)) = (chain.funding_height(our_escrow), chain.funding_height(their_escrow))
+        else {
             return Ok(FundingAction::Wait);
         };
 
@@ -188,12 +197,12 @@ impl FundingCoordinator {
         if oh.abs_diff(th) > self.params.cofunding_window {
             return Ok(FundingAction::Abort("co-funding window exceeded; abandon to refunds"));
         }
-        // Final encumbrance re-check (defense in depth): both must be at
-        // exactly D+Δ_fee. Our own is under our control; verify theirs.
-        if chain.funding_amount(their_escrow) != Some(expected) {
-            return Ok(FundingAction::Abort(
-                "counterparty escrow not verified at D+delta_fee; abort",
-            ));
+        // Final encumbrance gate: proceed only when VERIFIED at D+Δ_fee. If it
+        // is merely unverifiable (source disagreement), WAIT — never abort an
+        // honestly-funded swap on a single lying source. (A persistent liar
+        // degrades to refund-at-maturity, a delay, never theft.)
+        if !their_encumbrance_ok {
+            return Ok(FundingAction::Wait);
         }
         Ok(FundingAction::Proceed {
             our_height: oh,
