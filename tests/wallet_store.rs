@@ -3,13 +3,20 @@
 //! These prove the two crash stories END TO END, from the persisted record
 //! alone — no in-memory state survives the "crash" in either test:
 //!
-//!   1. Crash AFTER SL releases (post-G1): the SwapStore record points at the
-//!      sealed possession record; a fresh process restores, extracts t from
-//!      the observed reveal, and claims on the SimChain.
-//!   2. Crash DURING a signing session (INV-2): reopen routes the swap to
-//!      ABORT_REFUND, and the pre-armed refund persisted INSIDE the record
-//!      reclaims the funds at CSV maturity — the record alone is a complete
-//!      exit.
+//!   1. Crash INSIDE the G1 window — after the exchange persisted the
+//!      possession record but BEFORE the orchestrator's put(Released) (the
+//!      critical from the adversarial review): open() must route the swap to
+//!      Released by G1 evidence, and a fresh process restores, extracts t
+//!      from the observed reveal, and claims on the SimChain.
+//!   2. Crash DURING a signing session before anything was persisted
+//!      (INV-2): reopen routes the swap to ABORT_REFUND, and the pre-armed
+//!      refund persisted INSIDE the record reclaims the funds at CSV
+//!      maturity — the record alone is a complete exit.
+//!
+//! Both tests follow the orchestrator write-ordering contract from
+//! `wallet::mod`: put(Funding) before money moves, the possession pointer
+//! registered at put(Signing), the completion tx persisted at
+//! put(Completing) before broadcast.
 
 use bitcoin::{OutPoint, Txid};
 use newkey::chain::{ChainView, SimChain, SpendStatus};
@@ -71,11 +78,14 @@ fn hex32(id: &[u8; 32]) -> String {
     s
 }
 
-/// Crash story 1: SL releases (G1 satisfied, possession record + SwapRecord
-/// persisted), the process dies, and a FRESH process finishes the swap using
-/// nothing but the wallet store.
+/// Crash story 1 — THE adversarial-review critical: SL's process dies inside
+/// the G1 window (possession record persisted by the exchange; the enabling
+/// partial possibly on the wire; put(Released) never reached). The wallet
+/// record still says Signing. A fresh process must NOT refund-strand: open()
+/// routes to Released by G1 evidence and the swap completes from the store
+/// alone.
 #[test]
-fn sl_crash_after_release_recovers_from_store_and_claims() {
+fn sl_crash_in_g1_window_recovers_from_store_and_claims() {
     let sh = keypair();
     let sl = keypair();
     let params = Params::testnet_provisional();
@@ -90,10 +100,6 @@ fn sl_crash_after_release_recovers_from_store_and_claims() {
     let escrow_comp_sl = Escrow::new(&internal, &sh.pk, delta_late).expect("E_sh");
     let op_comp_sh = OutPoint::new(txid_from(2), 0); // SL-funded
     let op_comp_sl = OutPoint::new(txid_from(1), 0); // SH-funded
-
-    let chain = SimChain::new(s_height);
-    chain.fund(op_comp_sh, s_height);
-    chain.fund(op_comp_sl, s_height);
 
     let dest = escrow_comp_sh.funding_script_pubkey().clone();
     let comp_sh_spend =
@@ -126,6 +132,39 @@ fn sl_crash_after_release_recovers_from_store_and_claims() {
     let wallet_dir = tempfile::tempdir().unwrap();
     let (io_sh, io_sl) = duplex();
 
+    // Ordering contract rule 1: the record exists BEFORE money moves.
+    let sid = swap_session_id(sl.pk, sh.pk).expect("sid");
+    let (store, actions) = SwapStore::open(wallet_dir.path(), &ModeledEnclave).unwrap();
+    assert!(actions.is_empty());
+    let mut rec = SwapRecord {
+        swap_session_id: sid,
+        role: Role::SecretLearner,
+        phase: SwapPhase::Funding,
+        params: params.clone(),
+        s_height: 0,
+        sweep_escrow_height: 0,
+        our_escrow_outpoint: Some(op_comp_sh),
+        their_escrow_outpoint: Some(op_comp_sl),
+        pre_armed_refund: Some(sl_refund.clone()),
+        completion_tx: None,
+        possession_record: None,
+    };
+    store.put(&rec).unwrap();
+
+    let chain = SimChain::new(s_height);
+    chain.fund(op_comp_sh, s_height);
+    chain.fund(op_comp_sl, s_height);
+
+    // Ordering contract rule 2: the (deterministic) possession pointer is
+    // registered at put(Signing), BEFORE the exchange runs.
+    let possession_path =
+        possession_store.path().join(format!("{}.possession", hex32(&sid)));
+    rec.phase = SwapPhase::Signing;
+    rec.s_height = s_height;
+    rec.sweep_escrow_height = s_height;
+    rec.possession_record = Some(possession_path.clone());
+    store.put(&rec).unwrap();
+
     let sh_params = params.clone();
     let sh_handle = std::thread::spawn(move || -> Result<(Vec<u8>, [u8; 64])> {
         let refund = PreArmedRefund::from_signed_tx(vec![0xaa; 64], s_height + delta_late)?;
@@ -152,27 +191,6 @@ fn sl_crash_after_release_recovers_from_store_and_claims() {
         Ok((final_tx, sig.0))
     });
 
-    // SL side: walk the wallet record through the REAL lifecycle as the
-    // (future rank-4) orchestrator will: Funding -> Signing -> Released.
-    let sid = swap_session_id(sl.pk, sh.pk).expect("sid");
-    let (store, actions) = SwapStore::open(wallet_dir.path(), &ModeledEnclave).unwrap();
-    assert!(actions.is_empty());
-    let mut rec = SwapRecord {
-        swap_session_id: sid,
-        role: Role::SecretLearner,
-        phase: SwapPhase::Funding,
-        params: params.clone(),
-        s_height,
-        sweep_escrow_height: s_height,
-        our_escrow_outpoint: Some(op_comp_sh),
-        their_escrow_outpoint: Some(op_comp_sl),
-        pre_armed_refund: Some(sl_refund.clone()),
-        possession_record: None,
-    };
-    store.put(&rec).unwrap();
-    rec.phase = SwapPhase::Signing;
-    store.put(&rec).unwrap();
-
     let peer = PeerSession::new(swap_id, Box::new(io_sl));
     let funded = Funding::new(params.clone(), peer)
         .funded_manual(Role::SecretLearner, s_height)
@@ -193,29 +211,29 @@ fn sl_crash_after_release_recovers_from_store_and_claims() {
             taproot_output_comp_sl: Some(outkey_sl),
         })
         .expect("SL exchange");
-
-    // G1 satisfied: record the release with the possession-record path.
-    let possession_path =
-        possession_store.path().join(format!("{}.possession", hex32(&sid)));
     assert!(possession_path.exists(), "possession record not persisted");
-    rec.phase = SwapPhase::Released;
-    rec.possession_record = Some(possession_path);
-    store.put(&rec).unwrap();
 
     let (comp_sh_final, comp_sh_sig) = sh_handle.join().unwrap().expect("SH side");
 
-    // ===== CRASH: all SL in-memory state dies. =====
+    // ===== CRASH — inside the G1 window: the exchange persisted the
+    // possession record and (from SH's completed run) the enabling partial
+    // WAS delivered, but put(Released) never happened. The on-disk phase is
+    // still Signing. All SL in-memory state dies.
     drop(sl_possessing);
     drop(store);
 
-    // SH's completion lands while SL is down.
+    // SH's completion lands while SL is down: the exact branch that was
+    // fund-loss before the fix (refund would be stranded; extraction is the
+    // only path to SL's funds).
     chain.broadcast(&comp_sh_final).expect("Comp->SH accepted");
     chain.mine();
     assert!(matches!(chain.spend_status(op_comp_sh), SpendStatus::Confirmed(_)));
 
     // ===== FRESH PROCESS: the wallet store is ALL that survives. =====
     let (store, actions) = SwapStore::open(wallet_dir.path(), &ModeledEnclave).unwrap();
-    assert!(actions.is_empty(), "Released must not be force-aborted: {actions:?}");
+    // G1 evidence routing: possession record exists + authenticates =>
+    // Released (restore-and-extract), NOT AbortRefund.
+    assert_eq!(actions, vec![RecoveryAction::RestoredPostRelease { swap_session_id: sid }]);
     let rec = store.get(&sid).unwrap().expect("record survived");
     assert_eq!(rec.phase, SwapPhase::Released);
 
@@ -230,21 +248,30 @@ fn sl_crash_after_release_recovers_from_store_and_claims() {
         .claim_after_reveal(&observed, chain.tip_height())
         .expect("extract + claim after restore");
     let comp_sl_final = finalize_key_spend(comp_sl_spend, plan.comp_sl_final.0);
+
+    // Ordering contract rule 3: persist the finalized claim BEFORE broadcast.
+    let mut rec = rec;
+    rec.phase = SwapPhase::Completing;
+    rec.completion_tx = Some(comp_sl_final.clone());
+    store.put(&rec).unwrap();
+
     chain.broadcast(&comp_sl_final).expect("Comp->SL accepted");
     chain.mine();
     assert!(matches!(chain.spend_status(op_comp_sl), SpendStatus::Confirmed(_)));
 
-    // Close out the record: Completing -> Completed.
-    let mut rec = rec;
-    rec.phase = SwapPhase::Completing;
-    store.put(&rec).unwrap();
     rec.phase = SwapPhase::Completed;
     store.put(&rec).unwrap();
+
+    // And the Completing record really is self-sufficient: a fresh process
+    // could have rebroadcast the persisted bytes verbatim.
+    let reread = store.get(&sid).unwrap().unwrap();
+    assert_eq!(reread.completion_tx.as_deref(), Some(comp_sl_final.as_slice()));
 }
 
-/// Crash story 2: the process dies MID-SIGNING. INV-2 routes the swap to
-/// ABORT_REFUND on reopen, and the pre-armed refund persisted inside the
-/// record reclaims the escrow at CSV maturity — no other state needed.
+/// Crash story 2: the process dies MID-SIGNING before the exchange persisted
+/// anything (no possession record). INV-2 routes the swap to ABORT_REFUND on
+/// reopen, and the pre-armed refund persisted inside the record reclaims the
+/// escrow at CSV maturity — no other state needed.
 #[test]
 fn crash_mid_signing_reclaims_via_persisted_refund() {
     let sh = keypair();
@@ -259,9 +286,7 @@ fn crash_mid_signing_reclaims_via_persisted_refund() {
     // SL's escrow (E_sl): early refund leaf keyed to SL.
     let escrow = Escrow::new(&internal, &sl.pk, params.delta_early).expect("E_sl");
     let op = OutPoint::new(txid_from(9), 0);
-
-    let chain = SimChain::new(s_height);
-    chain.fund(op, s_height);
+    let op_theirs = OutPoint::new(txid_from(8), 0);
 
     let dest = escrow.funding_script_pubkey().clone();
     let refund =
@@ -270,6 +295,7 @@ fn crash_mid_signing_reclaims_via_persisted_refund() {
 
     let sid = swap_session_id(sl.pk, sh.pk).expect("sid");
     let wallet_dir = tempfile::tempdir().unwrap();
+    let possession_store = tempfile::tempdir().unwrap();
     {
         let (store, _) = SwapStore::open(wallet_dir.path(), &ModeledEnclave).unwrap();
         let mut rec = SwapRecord {
@@ -277,20 +303,29 @@ fn crash_mid_signing_reclaims_via_persisted_refund() {
             role: Role::SecretLearner,
             phase: SwapPhase::Funding,
             params: params.clone(),
-            s_height,
+            s_height: 0,
             sweep_escrow_height: 0,
             our_escrow_outpoint: Some(op),
-            their_escrow_outpoint: None,
+            their_escrow_outpoint: Some(op_theirs),
             pre_armed_refund: Some(refund),
+            completion_tx: None,
             possession_record: None,
         };
         store.put(&rec).unwrap();
         rec.phase = SwapPhase::Signing;
+        rec.s_height = s_height;
+        rec.possession_record = Some(
+            possession_store.path().join(format!("{}.possession", hex32(&sid))),
+        );
         store.put(&rec).unwrap();
-        // ===== CRASH mid-session: nonces die with the process. =====
+        // ===== CRASH mid-session: nonces die with the process; the
+        // possession record was never written (no G1 evidence). =====
     }
 
-    // Fresh process: INV-2.
+    let chain = SimChain::new(s_height);
+    chain.fund(op, s_height);
+
+    // Fresh process: INV-2 — no G1 evidence => ABORT_REFUND.
     let (store, actions) = SwapStore::open(wallet_dir.path(), &ModeledEnclave).unwrap();
     assert_eq!(actions, vec![RecoveryAction::AbortedLiveSigning { swap_session_id: sid }]);
     let rec = store.get(&sid).unwrap().expect("record");

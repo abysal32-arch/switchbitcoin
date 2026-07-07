@@ -16,7 +16,7 @@
 
 use crate::{Error, Result};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Params {
     /// Exactly-equal swapped output per tier (satoshis). Testnet: 0.01 tBTC.
     pub tier_d_sats: u64,
