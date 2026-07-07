@@ -44,6 +44,12 @@
 //!     ceiling, mempool-first reveal detection, plus SH broadcast-vs-refund
 //!     runway routing. The primary privacy-vs-liveness dial.
 
+//!   * `abort_hygiene` — coordinator-free anti-griefing (v3.15): a
+//!     UTXO-keyed cooldown/ban tracker for counterparties who match then
+//!     abandon. Pure LIVENESS policy — it never affects an in-flight swap's
+//!     fund safety (forward-or-refund holds regardless).
+
+pub mod abort_hygiene;
 pub mod claim_scheduler;
 pub mod keys;
 pub mod ledger;
