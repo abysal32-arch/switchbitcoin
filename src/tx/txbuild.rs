@@ -25,13 +25,13 @@ pub struct SpendTx {
 
 /// TRUC / BIP431 topology version. Every contract transaction (Setup,
 /// Completion, Refund) is version 3 for its RBF-pinning protection (v3.13).
-const TRUC_VERSION: Version = Version(3);
+pub(crate) const TRUC_VERSION: Version = Version(3);
 
 /// The ephemeral anchor output (P2A, BIP336): `OP_1 <0x4e73>`, 0 value. Every
 /// contract tx carries one so a CPFP child can bump it ONLY under a genuine fee
 /// spike beyond the baked-in Δ_fee — a congestion-only, opt-in backstop
 /// (v3.13). On the happy path it is left unspent, so it adds no external link.
-fn ephemeral_anchor() -> TxOut {
+pub(crate) fn ephemeral_anchor() -> TxOut {
     TxOut {
         value: Amount::ZERO,
         script_pubkey: ScriptBuf::from_bytes(vec![0x51, 0x02, 0x4e, 0x73]),

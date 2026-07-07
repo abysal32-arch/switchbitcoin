@@ -25,6 +25,7 @@ use newkey::settlement::state_machine::{
 };
 use newkey::signing::{commit_and_reveal, SigningSession, SingleSignerLease};
 use newkey::tx::escrow::Escrow;
+use newkey::tx::setup::build_setup;
 use newkey::tx::txbuild::{build_completion, finalize_key_spend, SpendTx};
 use newkey::wire::parse_message;
 use newkey::{Error, Result};
@@ -1022,6 +1023,128 @@ fn full_swap_under_cofunding_skew() {
     chain.broadcast(&comp_sl_final).expect("Comp->SL accepted");
     chain.mine();
     assert!(matches!(chain.spend_status(op_sh_funded), SpendStatus::Confirmed(_)));
+}
+
+// ---- Full swap funded by REAL Setup transactions (zero-change, SL-first) ---
+// Pre-encumbrance UTXO -> Setup (whole-UTXO, no change, TRUC+anchor) -> real
+// escrow outpoint -> the adaptor swap runs on it. Proves the funding phase
+// end-to-end, not against synthetic outpoints.
+#[test]
+fn full_swap_from_real_setup_funding() {
+    let params = Params::testnet_provisional();
+    let delta_late = u32::try_from(params.delta_late()).unwrap();
+    let s = 800_000u32;
+    let amount = params.tier_d_sats + params.delta_fee_sats; // D + Δ_fee (whole pre-enc)
+    let d = params.tier_d_sats;
+
+    let sh = keypair();
+    let sl = keypair();
+    let internal = aggregate_internal(sh.pk, sl.pk);
+    let escrow_comp_sh = Escrow::new(&internal, &sl.pk, params.delta_early).unwrap(); // E_sl
+    let escrow_comp_sl = Escrow::new(&internal, &sh.pk, delta_late).unwrap(); // E_sh
+
+    let chain = SimChain::new(s);
+    // Pre-encumbrance UTXOs of EXACTLY D + Δ_fee (Phase 1 onboarding output).
+    let pre_sl = OutPoint::new(txid_from(10), 0);
+    let pre_sh = OutPoint::new(txid_from(11), 0);
+    chain.fund_with_amount(pre_sl, s, amount);
+    chain.fund_with_amount(pre_sh, s, amount);
+
+    // SL-first funding: build + broadcast SL's Setup, then SH's; confirm both.
+    let (setup_sl, op_e_sl) = build_setup(pre_sl, amount, &escrow_comp_sh, &sl.sk).unwrap();
+    chain.broadcast(&setup_sl).expect("SL Setup accepted");
+    let (setup_sh, op_e_sh) = build_setup(pre_sh, amount, &escrow_comp_sl, &sh.sk).unwrap();
+    chain.broadcast(&setup_sh).expect("SH Setup accepted");
+    chain.mine(); // both Setups confirm; the escrow outputs become real outpoints
+    let s_conf = chain.tip_height();
+
+    // Zero-change: each Setup has exactly [escrow, anchor], no change output, and
+    // the escrow now holds the whole D + Δ_fee as a real, spendable outpoint.
+    let setup_tx: bitcoin::Transaction = bitcoin::consensus::encode::deserialize(&setup_sl).unwrap();
+    assert_eq!(setup_tx.output.len(), 2, "Setup has no change output");
+    assert_eq!(setup_tx.output[0].value.to_sat(), amount);
+    assert_eq!(chain.funding_height(op_e_sl), Some(s_conf), "E_sl is a real confirmed escrow");
+    assert_eq!(chain.funding_height(op_e_sh), Some(s_conf), "E_sh is a real confirmed escrow");
+
+    // Real completion sighashes on the REAL escrow outpoints created by the Setups.
+    let dest = escrow_comp_sh.funding_script_pubkey().clone();
+    let comp_sh = build_completion(&escrow_comp_sh, op_e_sl, amount, dest.clone(), d).unwrap();
+    let comp_sl = build_completion(&escrow_comp_sl, op_e_sh, amount, dest, d).unwrap();
+    let (msg_sh, msg_sl) = (comp_sh.sighash, comp_sl.sighash);
+    let (root_sh, root_sl) = (escrow_comp_sh.merkle_root(), escrow_comp_sl.merkle_root());
+    let (ok_sh, ok_sl) = (escrow_comp_sh.output_key_xonly(), escrow_comp_sl.output_key_xonly());
+
+    let swap_id = [0x88u8; 32];
+    let store = tempfile::tempdir().unwrap();
+    let lease_sh = tempfile::tempdir().unwrap();
+    let lease_sl = tempfile::tempdir().unwrap();
+    let (io_sh, io_sl) = duplex();
+    let sh_params = params.clone();
+    let comp_sh_for_sh = comp_sh.clone();
+    let sh_h = std::thread::spawn(move || -> Result<(Vec<u8>, [u8; 64])> {
+        let refund = PreArmedRefund::from_signed_tx(vec![0xaa; 64], s_conf + delta_late)?;
+        let receipt = confirm_watchtower_handoff(&refund, refund.fingerprint())?;
+        let (t, _) = AdaptorSecret::generate()?;
+        let peer = PeerSession::new(swap_id, Box::new(io_sh));
+        let funded = Funding::new(sh_params, peer).funded_manual(Role::SecretHolder, s_conf)?;
+        let possessing = funded.run_adaptor_exchange(ExchangeInputs {
+            our_seckey: sh.sk,
+            their_pubkey: ValidatedPoint::from_bytes(&sl.pk.serialize())?,
+            msg_comp_sh: msg_sh,
+            msg_comp_sl: msg_sl,
+            pre_armed_refund: refund,
+            adaptor_secret: Some(t),
+            lease_dir: Some(lease_sh.path().to_path_buf()),
+            possession_store: None,
+            taproot_root_comp_sh: Some(root_sh),
+            taproot_root_comp_sl: Some(root_sl),
+            taproot_output_comp_sh: Some(ok_sh),
+            taproot_output_comp_sl: Some(ok_sl),
+        })?;
+        let sig = possessing.broadcast_completion(s_conf + 5, &receipt)?;
+        Ok((finalize_key_spend(comp_sh_for_sh, sig.0), sig.0))
+    });
+
+    let peer = PeerSession::new(swap_id, Box::new(io_sl));
+    let funded = Funding::new(params.clone(), peer)
+        .funded_manual(Role::SecretLearner, s_conf)
+        .unwrap();
+    let sl_possessing = funded
+        .run_adaptor_exchange(ExchangeInputs {
+            our_seckey: sl.sk,
+            their_pubkey: ValidatedPoint::from_bytes(&sh.pk.serialize()).unwrap(),
+            msg_comp_sh: msg_sh,
+            msg_comp_sl: msg_sl,
+            pre_armed_refund: PreArmedRefund::from_signed_tx(vec![0xbb; 64], s_conf + params.delta_early)
+                .unwrap(),
+            adaptor_secret: None,
+            lease_dir: Some(lease_sl.path().to_path_buf()),
+            possession_store: Some(store.path().to_path_buf()),
+            taproot_root_comp_sh: Some(root_sh),
+            taproot_root_comp_sl: Some(root_sl),
+            taproot_output_comp_sh: Some(ok_sh),
+            taproot_output_comp_sl: Some(ok_sl),
+        })
+        .unwrap();
+
+    let (comp_sh_final, comp_sh_sig) = sh_h.join().unwrap().expect("SH side");
+
+    // Comp->SH spends the REAL escrow E_sl and confirms.
+    chain.broadcast(&comp_sh_final).expect("Comp->SH accepted");
+    chain.mine();
+    assert!(matches!(chain.spend_status(op_e_sl), SpendStatus::Confirmed(_)));
+
+    // SL extracts t and claims the REAL escrow E_sh.
+    let observed = ValidatedFinalSig::from_bytes(&comp_sh_sig).unwrap();
+    let plan = sl_possessing.claim_after_reveal(&observed, chain.tip_height()).expect("claim");
+    let comp_sl_final = finalize_key_spend(comp_sl.clone(), plan.comp_sl_final.0);
+    chain.broadcast(&comp_sl_final).expect("Comp->SL accepted");
+    chain.mine();
+    assert!(matches!(chain.spend_status(op_e_sh), SpendStatus::Confirmed(_)));
+
+    // Both completion outputs are exactly D.
+    assert_eq!(tx_input_count_and_output_value(&comp_sh_final).1, d);
+    assert_eq!(tx_input_count_and_output_value(&comp_sl_final).1, d);
 }
 
 // ---- Self-verifying dual-source chain view defeats an eclipse (v3.13) ------

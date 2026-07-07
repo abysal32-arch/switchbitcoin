@@ -15,6 +15,7 @@
 //! fund an output we cannot spend. It is checked, not assumed.
 
 pub mod escrow;
+pub mod setup;
 pub mod txbuild;
 
 pub use escrow::{Escrow, EscrowError};

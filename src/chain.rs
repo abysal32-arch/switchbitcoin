@@ -46,6 +46,9 @@ struct Inner {
     funded: HashMap<OutPoint, (u32, u64)>,
     /// escrow outpoint -> (spending txid, confirmed height | None = mempool, fee)
     spends: HashMap<OutPoint, (Txid, Option<u32>, u64)>,
+    /// Broadcast transactions, so a CONFIRMED tx's outputs become spendable
+    /// outpoints (models real UTXO creation: Setup -> escrow -> completion).
+    txs: HashMap<Txid, Transaction>,
     /// Minimum fee (sats) a tx must pay to be relayed — the congestion knob.
     congestion_min_fee: u64,
 }
@@ -60,6 +63,7 @@ impl SimChain {
             height: genesis_height,
             funded: HashMap::new(),
             spends: HashMap::new(),
+            txs: HashMap::new(),
             congestion_min_fee: 0,
         })))
     }
@@ -82,14 +86,28 @@ impl SimChain {
         self.0.lock().unwrap().congestion_min_fee = min_fee_sats;
     }
 
-    /// Mine one block: every mempool spend confirms at the new tip height.
+    /// Mine one block: every mempool spend confirms at the new tip height, and
+    /// each newly-confirmed transaction's outputs become spendable outpoints.
     pub fn mine(&self) {
         let mut g = self.0.lock().unwrap();
         g.height += 1;
         let h = g.height;
-        for (_op, (_txid, conf, _fee)) in g.spends.iter_mut() {
+        let mut newly_confirmed = Vec::new();
+        for (_op, (txid, conf, _fee)) in g.spends.iter_mut() {
             if conf.is_none() {
                 *conf = Some(h);
+                newly_confirmed.push(*txid);
+            }
+        }
+        // Register the outputs of confirmed txs as fundable outpoints (a Setup's
+        // escrow output, a completion's D output, etc.).
+        for txid in newly_confirmed {
+            if let Some(tx) = g.txs.get(&txid).cloned() {
+                for (vout, out) in tx.output.iter().enumerate() {
+                    g.funded
+                        .entry(OutPoint::new(txid, vout as u32))
+                        .or_insert((h, out.value.to_sat()));
+                }
             }
         }
     }
@@ -191,6 +209,7 @@ impl ChainView for SimChain {
         for input in &tx.input {
             g.spends.insert(input.previous_output, (txid, None, fee));
         }
+        g.txs.insert(txid, tx);
         Ok(txid)
     }
 }
