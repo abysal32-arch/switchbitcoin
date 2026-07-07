@@ -381,7 +381,11 @@ impl Funding {
         // Canonical user A = lexicographically smaller session pubkey (same sort
         // as KeyAgg). v3.13: "the least-significant bit assigns" — the LSB of the
         // seed as a big-endian integer (last byte) selects which canonical user
-        // is SH.
+        // is SH. Equal session pubkeys are rejected (else both parties derive the
+        // same role) — the same guard `canonical_pair` enforces for KeyAgg.
+        if our_session_pubkey.to_bytes() == their_session_pubkey.to_bytes() {
+            return Err(Error::Validation("both parties presented the same session pubkey"));
+        }
         let we_are_a = our_session_pubkey.to_bytes() < their_session_pubkey.to_bytes();
         let seed_picks_a = (seed[31] & 1) == 0;
         let role = if we_are_a == seed_picks_a {
@@ -502,6 +506,12 @@ impl Funded {
             return Err(Error::Verification(
                 "counterparty nonces do not match their commitment (concurrent-session interlock)",
             ));
+        }
+        // Reject reflected nonces (counterparty echoing ours) — a degenerate
+        // concurrent-session attack. BIP327 partial verification would also
+        // catch it downstream, but rejecting at receipt is cleaner.
+        if their_revealed.comp_sh == ours.comp_sh || their_revealed.comp_sl == ours.comp_sl {
+            return Err(Error::Verification("counterparty reflected our nonce"));
         }
 
         let agg_nonce_sh = aggregate_nonces(&ours.comp_sh, &their_nonce_sh);
@@ -688,6 +698,15 @@ fn write_possession_record(
     v.extend_from_slice(refund_bytes);
 
     let path = dir.join(format!("{}.possession", hex32(swap_session_id)));
+    // REFUSE to clobber an existing record. swap_session_id is unique per swap
+    // (v3.13: fresh session key per swap), so a collision means session-key
+    // reuse — overwriting would silently destroy the prior swap's extraction
+    // material (fund loss). Fail loudly instead.
+    if path.exists() {
+        return Err(Error::Abort(
+            "possession record already exists for this swap_session_id (reused session key?)",
+        ));
+    }
     let tmp = dir.join(format!("{}.possession.tmp", hex32(swap_session_id)));
     std::fs::write(&tmp, &v).map_err(|_| Error::Abort("possession record write failed"))?;
     std::fs::rename(&tmp, &path)

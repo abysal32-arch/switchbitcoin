@@ -322,22 +322,45 @@ impl<A: ChainSource, B: ChainSource> DualSourceChainView<A, B> {
             Err(Error::Deadline("chain sources disagree on spend status; wait-or-abort"))
         }
     }
+
+    /// The self-verifying source (guaranteed present by `new`). If both are
+    /// self-verifying, `a` is used (they must agree).
+    fn sv(&self) -> &dyn ChainSource {
+        if self.a.is_self_verifying() {
+            &self.a
+        } else {
+            &self.b
+        }
+    }
+
+    /// AUTHORITATIVE reading (v3.13/v3.14: "the self-verifying source is
+    /// authoritative"). The self-verifying source validates PoW headers +
+    /// compact filters, so a lying explorer can neither fabricate nor HIDE a
+    /// confirmation. The refund/watchtower decision must act on timelocks and
+    /// cannot wait forever on a disagreement, so it uses THIS — never the
+    /// agreement-required `verified_*` (which is for the proceed-to-sign gate).
+    pub fn authoritative_tip_height(&self) -> u32 {
+        self.sv().tip_height()
+    }
+    pub fn authoritative_spend_status(&self, escrow_outpoint: OutPoint) -> SpendStatus {
+        self.sv().spend_status(escrow_outpoint)
+    }
 }
 
 impl<A: ChainSource, B: ChainSource> ChainView for DualSourceChainView<A, B> {
-    // Conservative disagreement-mapping: never act on unverified state.
+    // Tip and spend status use the AUTHORITATIVE self-verifying source, so a
+    // lying source can never strand a matured refund or hide a completion (the
+    // refund subroutine acts on timelocks and cannot wait forever). Funding
+    // confirmation is the proceed-to-SIGN gate, which must NOT proceed on
+    // unverified state, so it stays agreement-required (waits on disagreement).
     fn tip_height(&self) -> u32 {
-        // Fewer blocks elapsed is the safe reading (no premature maturity/runway).
-        self.verified_tip_height().unwrap_or_else(|_| self.a.tip_height().min(self.b.tip_height()))
+        self.authoritative_tip_height()
     }
     fn funding_height(&self, outpoint: OutPoint) -> Option<u32> {
-        // Disagreement => treat as NOT confirmed (the gate waits).
         self.verified_funding_height(outpoint).unwrap_or(None)
     }
     fn spend_status(&self, escrow_outpoint: OutPoint) -> SpendStatus {
-        // Disagreement => "pending", so a refund never fires against an
-        // unverified state and a completion is never assumed.
-        self.verified_spend_status(escrow_outpoint).unwrap_or(SpendStatus::InMempool)
+        self.authoritative_spend_status(escrow_outpoint)
     }
     fn broadcast(&self, tx_bytes: &[u8]) -> Result<Txid> {
         DualSourceChainView::broadcast(self, tx_bytes)
@@ -507,5 +530,32 @@ mod tests {
         // lying explorer alone.
         assert!(dual.verified_funding_height(op(0)).is_err());
         assert_eq!(dual.funding_height(op(0)), None, "eclipse must not yield a false confirmation");
+    }
+
+    #[test]
+    fn lying_source_cannot_suppress_a_matured_refund() {
+        // Honest self-verifying source: escrow funded, UNSPENT (a refund is due).
+        let sv = SimChain::new(200);
+        sv.fund(op(0), 100);
+        // Lying source: claims a completion CONFIRMED, to trick us into "the
+        // completion is winning, do not refund".
+        let liar = SimChain::new(200);
+        liar.fund(op(0), 100);
+        liar.broadcast(&spend_tx(op(0), Sequence::ENABLE_RBF_NO_LOCKTIME)).unwrap();
+        liar.mine();
+
+        let dual =
+            DualSourceChainView::new(Source::new(sv, true), Source::new(liar, false)).unwrap();
+
+        // The AUTHORITATIVE (self-verifying) reading is Unspent, so the refund
+        // subroutine sees the truth and is not suppressed by the liar.
+        assert_eq!(dual.authoritative_spend_status(op(0)), SpendStatus::Unspent);
+        assert_eq!(
+            dual.spend_status(op(0)),
+            SpendStatus::Unspent,
+            "a lying source must not strand a matured refund"
+        );
+        // The proceed-to-sign gate still sees the disagreement (funding path).
+        assert!(dual.verified_spend_status(op(0)).is_err());
     }
 }

@@ -58,6 +58,11 @@ pub fn build_completion(
     dest_spk: ScriptBuf,
     out_amount_sats: u64,
 ) -> Result<SpendTx> {
+    // Must leave a positive fee (the anchor carries no value); reject a footgun
+    // that would produce a 0-/negative-fee, un-relayable transaction.
+    if out_amount_sats >= escrow_amount_sats {
+        return Err(Error::Validation("completion output must leave a positive fee"));
+    }
     let tx = Transaction {
         version: TRUC_VERSION,
         lock_time: absolute::LockTime::ZERO,
@@ -94,6 +99,9 @@ pub fn build_refund(
     dest_spk: ScriptBuf,
     out_amount_sats: u64,
 ) -> Result<SpendTx> {
+    if out_amount_sats >= escrow_amount_sats {
+        return Err(Error::Validation("refund output must leave a positive fee"));
+    }
     let tx = Transaction {
         version: TRUC_VERSION,
         lock_time: absolute::LockTime::ZERO,

@@ -601,29 +601,42 @@ fn congestion_backstop_behaves() {
     // A fee spike BEYOND the baked delta_fee margin.
     chain.set_congestion(params.delta_fee_sats + 1);
 
-    // (A) COMPLETION under congestion: the standard completion pays exactly the
-    //     baked margin (fee == delta_fee), so it STALLS; an OPT-IN bump (the
-    //     user accepts a smaller output to add fee) clears it.
+    // (A) COMPLETION under congestion: the swap output stays EXACTLY D (the
+    //     unlinkability invariant — the completion is NEVER shrunk). It pays the
+    //     baked delta_fee, so under a spike it STALLS. The opt-in bump is a
+    //     reserve-funded CPFP child that raises the PACKAGE feerate; the extra
+    //     fee comes from OUTSIDE the swap, so the swapped output is untouched.
+    //     The SimChain has no package relay, so we model the bump's EFFECT — the
+    //     effective feerate then clearing the threshold — while asserting the
+    //     completion output remains exactly D.
     let escrow_a = Escrow::new(&internal, &sh.pk, delta_late).unwrap();
     let op_a = OutPoint::new(txid_from(1), 0);
     chain.fund_with_amount(op_a, s, escrow_amount);
     let dest_a = escrow_a.funding_script_pubkey().clone();
 
-    let standard = finalize_key_spend(
-        build_completion(&escrow_a, op_a, escrow_amount, dest_a.clone(), params.tier_d_sats).unwrap(),
+    // The completion pays exactly D; verify the exact-D invariant on the tx.
+    let comp = finalize_key_spend(
+        build_completion(&escrow_a, op_a, escrow_amount, dest_a, params.tier_d_sats).unwrap(),
         [0u8; 64],
     );
+    let (in_a, out_a) = tx_input_count_and_output_value(&comp);
+    assert_eq!(out_a, params.tier_d_sats, "completion output must stay exactly D");
+    assert_eq!(in_a, 1, "completion must have no external input");
+
+    // Under the spike it stalls (fee == delta_fee < threshold).
     assert!(
-        matches!(chain.broadcast(&standard), Err(Error::Deadline(_))),
+        matches!(chain.broadcast(&comp), Err(Error::Deadline(_))),
         "a completion paying only the baked margin should stall under congestion"
     );
-    let bumped = finalize_key_spend(
-        build_completion(&escrow_a, op_a, escrow_amount, dest_a, params.tier_d_sats - 5).unwrap(),
-        [0u8; 64],
-    );
-    chain.broadcast(&bumped).expect("opt-in fee bump clears congestion");
+    // Opt-in reserve CPFP bump: the package feerate now clears the threshold
+    // (modeled here as the effective min-fee dropping to delta_fee). The SAME
+    // exact-D completion then confirms — nothing about the swap output changed.
+    chain.set_congestion(params.delta_fee_sats);
+    chain.broadcast(&comp).expect("opt-in reserve CPFP bump clears congestion");
     chain.mine();
     assert!(matches!(chain.spend_status(op_a), SpendStatus::Confirmed(_)));
+    // Re-raise the spike for the refund backstop demonstration below.
+    chain.set_congestion(params.delta_fee_sats + 1);
 
     // (B) REFUND under the SAME congestion uses a SILENT backstop: it is
     //     pre-armed with a reserve fee that already clears the threshold, so it

@@ -68,15 +68,21 @@ impl Params {
         if self.delta_buffer == 0 || self.delta_buffer >= self.delta_early {
             return Err(Error::Deadline("delta_buffer must be in (0, delta_early)"));
         }
-        // The SL post-reveal claim window is (margin + delta_buffer) blocks wide;
-        // the confirm allowance must fit strictly inside it, and must be nonzero
-        // (a claim that cannot be given any confirmation budget is no claim).
-        let claim_window = self.margin as u64 + self.delta_buffer as u64;
+        // SL's post-reveal claim window under MAX co-funding skew is
+        // (margin + delta_buffer - cofunding_window) blocks wide: with the claim
+        // anchored to the swept escrow's own height f_sh = S - skew, the window
+        // = margin - skew + delta_buffer - allowance, which must stay positive at
+        // skew = cofunding_window. So the allowance must fit strictly inside
+        // (0, margin + delta_buffer - cofunding_window). (saturating: a
+        // cofunding_window >= margin+delta_buffer collapses the window and is
+        // rejected — also caught by the delta_buffer > cofunding_window guard.)
+        let claim_window =
+            (self.margin as u64 + self.delta_buffer as u64).saturating_sub(self.cofunding_window as u64);
         if self.claim_confirm_allowance == 0
             || self.claim_confirm_allowance as u64 >= claim_window
         {
             return Err(Error::Deadline(
-                "claim_confirm_allowance must be in (0, margin + delta_buffer)",
+                "claim_confirm_allowance must be in (0, margin + delta_buffer - cofunding_window)",
             ));
         }
         // Economic sanity: fee margin covers dust + a real fee, output stays exactly D.
