@@ -208,6 +208,6 @@ fn sl_claim_is_posture_delayed_reveal_observed_and_bound_holds() {
     assert!(matches!(chain.spend_status(op_comp_sl), SpendStatus::Confirmed(_)));
     assert_eq!(
         ClaimScheduler::next_broadcast(&chain, op_comp_sl, &schedule, Some(claim_txid)),
-        ClaimBroadcast::Done
+        ClaimBroadcast::Won
     );
 }

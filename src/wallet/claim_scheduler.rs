@@ -61,12 +61,20 @@ pub struct ScheduledClaim {
 /// The scheduler's decision while waiting to broadcast a prepared claim.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClaimBroadcast {
-    /// The sampled delay has not elapsed: hold.
+    /// The sampled delay has not elapsed, or our own claim is pending
+    /// confirmation: hold.
     Wait,
-    /// The delay elapsed and our claim is not yet on-chain: broadcast now.
+    /// (Re)broadcast our claim NOW: either the delay elapsed with the escrow
+    /// unspent, OR a FOREIGN spend (SH's late refund) is racing us — our
+    /// Comp→SL is RBF-able and timelock-free, so it stays valid and can fight
+    /// the refund by fee (the winning fee bump is the rank-6 backstop's job).
     Broadcast,
-    /// Our claim confirmed (or the escrow was otherwise swept by us): done.
-    Done,
+    /// Terminal: OUR claim confirmed — swap won.
+    Won,
+    /// Terminal: a FOREIGN spend (SH's late refund) confirmed the escrow we
+    /// were sweeping — we LOST the race. The driver must alert + account for
+    /// the loss, never report this as a success.
+    Lost,
 }
 
 impl ClaimScheduler {
@@ -130,18 +138,43 @@ impl ClaimScheduler {
         schedule: &ScheduledClaim,
         our_claim_txid: Option<Txid>,
     ) -> ClaimBroadcast {
+        // Who is spending the escrow we sweep? The ONLY spenders of the 2-of-2
+        // E_sh are our own RBF-able, timelock-free Comp→SL and SH's script-path
+        // late refund (valid only at sweep_height + Δ_late). So a spend that is
+        // NOT ours is necessarily SH's refund racing us — which we can still
+        // beat, because our claim carries no timelock and can RBF.
+        let seen = chain.spend_txid(e_sh_outpoint);
+        let is_ours = matches!((our_claim_txid, seen), (Some(m), Some(s)) if m == s);
         match chain.spend_status(e_sh_outpoint) {
-            // The escrow we sweep is confirmed spent. If it was OUR claim,
-            // we are done; if somehow someone else (only the late refund
-            // could, and only after our deadline), also terminal.
-            SpendStatus::Confirmed(_) => ClaimBroadcast::Done,
-            // A pending spend of the escrow we sweep — ours (awaiting
-            // confirmation) or, at worst, the late refund racing us. Either
-            // way do not double-broadcast: hold. (`our_claim_txid` is
-            // consulted so a future caller can distinguish for reporting.)
+            SpendStatus::Confirmed(_) => {
+                if is_ours {
+                    ClaimBroadcast::Won
+                } else if seen.is_some() {
+                    // A foreign tx (SH's late refund) confirmed the escrow.
+                    ClaimBroadcast::Lost
+                } else if our_claim_txid.is_some() {
+                    // We broadcast and something confirmed but the source can't
+                    // report the txid: best-effort assume it was ours (single
+                    // spend). Degraded-source case; documented.
+                    ClaimBroadcast::Won
+                } else {
+                    // We never broadcast yet something confirmed it: we lost.
+                    ClaimBroadcast::Lost
+                }
+            }
             SpendStatus::InMempool => {
-                let _ = (our_claim_txid, chain.spend_txid(e_sh_outpoint));
-                ClaimBroadcast::Wait
+                if is_ours {
+                    // Our own claim is pending confirmation: hold.
+                    ClaimBroadcast::Wait
+                } else if seen.is_some() || our_claim_txid.is_none() {
+                    // A FOREIGN spend (the late refund) is racing us — do NOT
+                    // stand down: (re)broadcast and fight the race by fee.
+                    ClaimBroadcast::Broadcast
+                } else {
+                    // We broadcast, source can't report the txid: assume it is
+                    // ours and wait rather than spam rebroadcasts.
+                    ClaimBroadcast::Wait
+                }
             }
             SpendStatus::Unspent => {
                 if chain.tip_height() >= schedule.broadcast_at_height {
@@ -210,8 +243,91 @@ fn sample_uniform_inclusive(lo: u64, hi: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chain::SimChain;
     use crate::settlement::params::Params;
     use crate::wallet::manifest::ClaimDelayPosture;
+
+    fn op(seed: u8) -> OutPoint {
+        let mut b = [0u8; 32];
+        b[0] = seed;
+        OutPoint::new(bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::from_byte_array(b)), 0)
+    }
+
+    /// A real spend of `outpoint` paying `out` sats, so the sim gives it a txid.
+    fn spend_of(outpoint: OutPoint, out: u64) -> Vec<u8> {
+        use bitcoin::{absolute, transaction::Version, Amount, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: outpoint,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut { value: Amount::from_sat(out), script_pubkey: ScriptBuf::new() }],
+        };
+        bitcoin::consensus::encode::serialize(&tx)
+    }
+
+    fn synthetic_schedule(broadcast_at: u32) -> ScheduledClaim {
+        ScheduledClaim {
+            comp_sl_final: CompletionSig([0u8; 64]),
+            reveal_height: broadcast_at,
+            delay_blocks: 0,
+            broadcast_at_height: broadcast_at,
+        }
+    }
+
+    /// THE adversarial-review HIGH: a foreign spend of the escrow we sweep
+    /// (SH's late refund) must make us FIGHT (Broadcast), never stand down
+    /// (Wait) — and a foreign CONFIRMED spend is a distinct Lost terminal,
+    /// not a success.
+    #[test]
+    fn foreign_spend_is_fought_and_reported_as_lost_not_won() {
+        let e_sh = op(1);
+        let chain = SimChain::new(500);
+        chain.fund_with_amount(e_sh, 500, 1_000_000);
+        let schedule = synthetic_schedule(400); // delay already elapsed
+
+        // SH's late refund parks in E_sh's mempool; we have NOT broadcast.
+        let foreign = spend_of(e_sh, 900_000);
+        chain.broadcast(&foreign).unwrap();
+        assert_eq!(
+            ClaimScheduler::next_broadcast(&chain, e_sh, &schedule, None),
+            ClaimBroadcast::Broadcast,
+            "must fight a foreign mempool spend, not Wait"
+        );
+
+        // It confirms before we react → Lost (a distinct terminal, not Won).
+        chain.mine();
+        assert_eq!(
+            ClaimScheduler::next_broadcast(&chain, e_sh, &schedule, None),
+            ClaimBroadcast::Lost,
+            "a foreign-confirmed sweep must report Lost, never Won"
+        );
+    }
+
+    #[test]
+    fn our_own_claim_pending_then_confirmed_is_wait_then_won() {
+        let e_sh = op(2);
+        let chain = SimChain::new(500);
+        chain.fund_with_amount(e_sh, 500, 1_000_000);
+        let schedule = synthetic_schedule(400);
+
+        let ours = spend_of(e_sh, 990_000);
+        let our_txid = chain.broadcast(&ours).unwrap();
+        // Our own claim pending → Wait (not a needless rebroadcast).
+        assert_eq!(
+            ClaimScheduler::next_broadcast(&chain, e_sh, &schedule, Some(our_txid)),
+            ClaimBroadcast::Wait
+        );
+        chain.mine();
+        assert_eq!(
+            ClaimScheduler::next_broadcast(&chain, e_sh, &schedule, Some(our_txid)),
+            ClaimBroadcast::Won
+        );
+    }
 
     fn manifest(posture: ClaimDelayPosture) -> SignedManifest {
         SignedManifest::compose(
