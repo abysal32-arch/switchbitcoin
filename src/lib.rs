@@ -33,6 +33,7 @@ pub mod wire;
 pub mod signing;
 pub mod settlement;
 pub mod tx;
+pub mod wallet;
 
 /// Crate-wide error type. `Abort` is the safe sink for EVERY failure path:
 /// any validation failure, verification failure, crash, or timeout maps here,
