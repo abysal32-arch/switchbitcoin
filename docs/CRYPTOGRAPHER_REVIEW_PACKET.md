@@ -183,6 +183,49 @@ Req 1 mandates **libsecp256k1-zkp** (Blockstream fork, MuSig2+adaptor in one aud
 
 ---
 
+## 4.99 Cross-cutting invariant audit (forward-or-refund)
+
+Beyond the per-module adversarial reviews, the whole built system was audited
+against the **single safety invariant** the protocol exists to uphold:
+
+> *Every reachable state of a swap either moves FORWARD toward both parties
+> completing, or decays into an ALREADY-ARMED refund that returns the party's
+> own coin. No reachable state is fund-loss, fund-stuck-with-no-exit, theft,
+> self-double-spend, or a deadline that cannot be met. Recovery never depends
+> on the counterparty being honest, online, or having a working device.*
+
+Six independent adversarial attack lenses (funding phase, signing phase,
+settlement/extract-and-race, crash-and-restart at every point, lying/eclipsed
+chain view, griefing/Sybil) each tried to construct a reachable state that
+breaks the invariant; every candidate was then adversarially verified against
+the code. **Result: the invariant HOLDS.** One candidate surfaced; it was
+refuted on verification; **zero surviving violations.** The prior 11 review
+rounds' criticals (G1-window abort-stranding, co-funding-skew extract-and-race,
+dual-source refund-stranding, boundary race at `delay_max==window`, in-mempool
+refund-race, lying-source forced-abort) are all fixed and regression-tested.
+
+**Two caveats bound the verdict** (both are exactly why THIS review exists):
+1. It is conditional on the external cryptographer blessing the frozen
+   adaptor+timelock composition — this document's whole purpose.
+2. It is conditional on the modeled stand-ins (the `platform_secure_key`
+   enclave key; the `SimChain`, which models consensus *physics* but does not
+   execute Script or verify signatures) being replaced by real infra. Real
+   BIP340 validity is proven separately in `tests/taproot_swap.rs`.
+
+All residual items are either **capital-lockup griefing** (the coin always
+returns — the invariant tolerates a bounded liveness delay, not a loss) or the
+documented deferred infra/discovery seams in Section 5. Anti-griefing posture:
+proof-of-encumbrance (the orchestrator verifies the counterparty escrow at
+exactly D+Δ_fee before signing) + the tight co-funding window + Block-X are the
+built defenses; `wallet::abort_hygiene` adds coordinator-free UTXO-keyed
+rate-limiting of repeat aborters (pure liveness policy, never touches fund
+safety). **Deferred and flagged for THIS review's scope:** burnable fidelity
+bonds (v3.14) would touch the timelock surface, so they are NOT built onto the
+frozen composition — scope them into the review rather than treating their
+absence as a gap.
+
+---
+
 ## 5. KNOWN STAND-INS & DEFERRED (honest inventory)
 
 Nothing below is hidden; each is disclosed in-code. Urgency is for *this prototype review*.
