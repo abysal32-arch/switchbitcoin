@@ -35,12 +35,13 @@ fn valid_partial(k: u32) -> ValidatedPartial {
 }
 
 fn arb_valid_message() -> impl Strategy<Value = Message> {
-    (any::<u32>(), any::<u32>(), 0u8..5).prop_map(|(a, b, which)| match which {
+    (any::<u32>(), any::<u32>(), 0u8..6, any::<[u8; 32]>()).prop_map(|(a, b, which, h)| match which {
         0 => Message::Nonces { comp_sh: valid_nonce(a), comp_sl: valid_nonce(b) },
         1 => Message::AdaptorPointMsg(AdaptorPoint::new(valid_point(a))),
         2 => Message::ShPartials { comp_sh: valid_partial(a), comp_sl: valid_partial(b) },
         3 => Message::SlEnablingPartial(valid_partial(a)),
-        _ => Message::Destination(valid_point(a)),
+        4 => Message::Destination(valid_point(a)),
+        _ => Message::NonceCommitment(h),
     })
 }
 

@@ -242,6 +242,21 @@ pub fn commit_and_reveal(
     })
 }
 
+/// Hash commitment to BOTH of this party's public nonces (Comp->SH and
+/// Comp->SL), for the concurrent-session interlock. Sent and matched on both
+/// sides BEFORE either party reveals its nonces, so neither party can choose
+/// its nonces adaptively after seeing the other's — closing the concurrent-
+/// session (Wagner/Drijvers) surface (v3.13 "commit-to-both-before-revealing-
+/// either").
+pub fn nonce_commitment(nonces: &RevealedNonces) -> [u8; 32] {
+    use bitcoin::hashes::Hash as _;
+    let mut pre = Vec::with_capacity(19 + 66 + 66);
+    pre.extend_from_slice(b"newkey-nonce-commit");
+    pre.extend_from_slice(&nonces.comp_sh.to_bytes());
+    pre.extend_from_slice(&nonces.comp_sl.to_bytes());
+    bitcoin::hashes::sha256::Hash::hash(&pre).to_byte_array()
+}
+
 /// Aggregate the two parties' public nonces for one completion (BIP327 nonce
 /// aggregation is order-independent point summation).
 pub fn aggregate_nonces(ours: &ValidatedPubNonce, theirs: &ValidatedPubNonce) -> AggNonce {

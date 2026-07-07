@@ -15,17 +15,26 @@ use crate::crypto::adaptor::AdaptorPoint;
 use crate::crypto::{ValidatedPartial, ValidatedPoint, ValidatedPubNonce};
 use crate::{Error, Result};
 
+const TAG_NONCE_COMMIT: u8 = 0x00;
 const TAG_NONCES: u8 = 0x01;
 const TAG_ADAPTOR_POINT: u8 = 0x02;
 const TAG_SH_PARTIALS: u8 = 0x03;
 const TAG_SL_ENABLING: u8 = 0x04;
 const TAG_DESTINATION: u8 = 0x05;
 
-/// The Phase-5 messages, in the exact order the possession gate requires.
-/// (Discovery/matching messages are STUBBED out of this build — Requirement 5.)
+/// The Phase-5 messages, in the exact order the possession gate requires
+/// (v3.13 Phase 5 adaptor exchange). Discovery/matching messages are STUBBED
+/// out of this build (Requirement 5).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Message {
-    /// (1) public nonces for BOTH completions (commit-then-reveal happens above this).
+    /// (0) Concurrent-session interlock: a 32-byte hash commitment to BOTH of
+    /// this party's public nonces (Comp->SH and Comp->SL), sent and matched on
+    /// BOTH sides BEFORE either party reveals its nonces. This is what makes
+    /// "commit-to-both-before-revealing-either" real on the wire and closes the
+    /// concurrent-session (Wagner/Drijvers) adaptive-nonce surface.
+    NonceCommitment([u8; 32]),
+    /// (1) public nonces for BOTH completions — the REVEAL, checked against the
+    /// counterparty's prior commitment before it is trusted.
     Nonces { comp_sh: ValidatedPubNonce, comp_sl: ValidatedPubNonce },
     /// (2) SH publishes T = t*G.
     AdaptorPointMsg(AdaptorPoint),
@@ -66,6 +75,10 @@ pub fn parse_message(bytes: &[u8]) -> Result<Message> {
         None => return Err(Error::Validation("empty message")),
     };
     match tag {
+        TAG_NONCE_COMMIT => {
+            let (h, rest) = take::<32>(rest)?;
+            finish(Message::NonceCommitment(h), rest)
+        }
         TAG_NONCES => {
             let (a, rest) = take::<66>(rest)?;
             let (b, rest) = take::<66>(rest)?;
@@ -102,6 +115,12 @@ pub fn parse_message(bytes: &[u8]) -> Result<Message> {
 /// Serialize is the easy direction; still fixed-size and total.
 pub fn serialize_message(m: &Message) -> Vec<u8> {
     match m {
+        Message::NonceCommitment(h) => {
+            let mut v = Vec::with_capacity(1 + 32);
+            v.push(TAG_NONCE_COMMIT);
+            v.extend_from_slice(h);
+            v
+        }
         Message::Nonces { comp_sh, comp_sl } => {
             let mut v = Vec::with_capacity(1 + 66 + 66);
             v.push(TAG_NONCES);
@@ -168,6 +187,7 @@ mod tests {
     #[test]
     fn round_trips_every_variant() {
         let msgs = vec![
+            Message::NonceCommitment([0x5au8; 32]),
             Message::Nonces { comp_sh: test_nonce(), comp_sl: test_nonce() },
             Message::AdaptorPointMsg(AdaptorPoint::new(test_point(7))),
             Message::ShPartials { comp_sh: test_partial(1), comp_sl: test_partial(0) },

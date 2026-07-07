@@ -23,6 +23,21 @@ pub struct SpendTx {
     pub sighash: [u8; 32],
 }
 
+/// TRUC / BIP431 topology version. Every contract transaction (Setup,
+/// Completion, Refund) is version 3 for its RBF-pinning protection (v3.13).
+const TRUC_VERSION: Version = Version(3);
+
+/// The ephemeral anchor output (P2A, BIP336): `OP_1 <0x4e73>`, 0 value. Every
+/// contract tx carries one so a CPFP child can bump it ONLY under a genuine fee
+/// spike beyond the baked-in Δ_fee — a congestion-only, opt-in backstop
+/// (v3.13). On the happy path it is left unspent, so it adds no external link.
+fn ephemeral_anchor() -> TxOut {
+    TxOut {
+        value: Amount::ZERO,
+        script_pubkey: ScriptBuf::from_bytes(vec![0x51, 0x02, 0x4e, 0x73]),
+    }
+}
+
 fn escrow_prevout(escrow: &Escrow, escrow_amount_sats: u64) -> TxOut {
     TxOut {
         value: Amount::from_sat(escrow_amount_sats),
@@ -44,7 +59,7 @@ pub fn build_completion(
     out_amount_sats: u64,
 ) -> Result<SpendTx> {
     let tx = Transaction {
-        version: Version::TWO,
+        version: TRUC_VERSION,
         lock_time: absolute::LockTime::ZERO,
         input: vec![TxIn {
             previous_output: escrow_outpoint,
@@ -52,10 +67,12 @@ pub fn build_completion(
             sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
             witness: Witness::new(),
         }],
-        output: vec![TxOut {
-            value: Amount::from_sat(out_amount_sats),
-            script_pubkey: dest_spk,
-        }],
+        // Output 0 is exactly D to the fresh destination; output 1 is the
+        // 0-value ephemeral anchor (congestion-only backstop). No change output.
+        output: vec![
+            TxOut { value: Amount::from_sat(out_amount_sats), script_pubkey: dest_spk },
+            ephemeral_anchor(),
+        ],
     };
     let prevout = escrow_prevout(escrow, escrow_amount_sats);
     let mut cache = SighashCache::new(&tx);
@@ -78,7 +95,7 @@ pub fn build_refund(
     out_amount_sats: u64,
 ) -> Result<SpendTx> {
     let tx = Transaction {
-        version: Version::TWO,
+        version: TRUC_VERSION,
         lock_time: absolute::LockTime::ZERO,
         input: vec![TxIn {
             previous_output: escrow_outpoint,
@@ -86,10 +103,10 @@ pub fn build_refund(
             sequence: Sequence::from_height(escrow.csv_blocks()),
             witness: Witness::new(),
         }],
-        output: vec![TxOut {
-            value: Amount::from_sat(out_amount_sats),
-            script_pubkey: dest_spk,
-        }],
+        output: vec![
+            TxOut { value: Amount::from_sat(out_amount_sats), script_pubkey: dest_spk },
+            ephemeral_anchor(),
+        ],
     };
     let prevout = escrow_prevout(escrow, escrow_amount_sats);
     let leaf_hash = TapLeafHash::from_script(escrow.refund_leaf().as_script(), LeafVersion::TapScript);

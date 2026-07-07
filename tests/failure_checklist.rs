@@ -746,6 +746,113 @@ fn exchange_rejects_wrong_taproot_output_key() {
     );
 }
 
+// ---- Concurrent-session interlock: equivocated nonces are caught ----------
+// v3.13 requires commit-then-reveal on the wire. If a counterparty reveals
+// nonces that do NOT match its earlier commitment (an adaptive-nonce /
+// Wagner-Drijvers attempt), the victim MUST abort before signing.
+#[test]
+fn equivocated_nonce_reveal_is_rejected() {
+    use newkey::crypto::ValidatedPubNonce;
+    use std::sync::mpsc;
+
+    // A transport that passes the commitment through but SUBSTITUTES a different
+    // (still valid) Nonces reveal, so it no longer matches the commitment.
+    struct Equivocator {
+        tx: mpsc::Sender<Vec<u8>>,
+        rx: mpsc::Receiver<Vec<u8>>,
+    }
+    impl Transport for Equivocator {
+        fn send(&mut self, bytes: &[u8]) -> Result<()> {
+            self.tx.send(bytes.to_vec()).map_err(|_| Error::Abort("hung up"))
+        }
+        fn recv(&mut self) -> Result<Vec<u8>> {
+            let b = self.rx.recv().map_err(|_| Error::Abort("hung up"))?;
+            if b.first() == Some(&0x01) {
+                // Replace the counterparty's real Nonces reveal with different
+                // valid nonces — the commitment check must then fail.
+                let vn = |k: u32| -> ValidatedPubNonce {
+                    let s = |x: u32| {
+                        let mut z = [0u8; 32];
+                        z[28..].copy_from_slice(&x.to_be_bytes());
+                        Scalar::from_slice(&z).unwrap()
+                    };
+                    let mut nb = [0u8; 66];
+                    nb[..33].copy_from_slice(&(s(k) * secp::G).serialize());
+                    nb[33..].copy_from_slice(&(s(k + 1) * secp::G).serialize());
+                    ValidatedPubNonce::from_bytes(&nb).unwrap()
+                };
+                return Ok(newkey::wire::serialize_message(&newkey::wire::Message::Nonces {
+                    comp_sh: vn(101),
+                    comp_sl: vn(103),
+                }));
+            }
+            Ok(b)
+        }
+    }
+
+    let sh = keypair();
+    let sl = keypair();
+    let params = Params::testnet_provisional();
+    let s = 400_000u32;
+    let (tx_a, rx_b) = mpsc::channel();
+    let (tx_b, rx_a) = mpsc::channel();
+    let victim_io = Equivocator { tx: tx_a, rx: rx_a };
+    let honest_io = ChannelTransport { tx: tx_b, rx: rx_b };
+    let swap_id = [0x3fu8; 32];
+    let lease_v = tempfile::tempdir().unwrap();
+    let lease_h = tempfile::tempdir().unwrap();
+    let store = tempfile::tempdir().unwrap();
+
+    // Honest counterparty (SH) runs in a thread; it will error when the victim aborts.
+    let sh_sk = sh.sk;
+    let sl_pub = sl.pk;
+    let sh_params = params.clone();
+    let h = std::thread::spawn(move || {
+        let refund = PreArmedRefund::from_signed_tx(vec![1; 32], s + 300).unwrap();
+        let (t, _) = AdaptorSecret::generate().unwrap();
+        let peer = PeerSession::new(swap_id, Box::new(honest_io));
+        let funded =
+            Funding::new(sh_params, peer).funded_manual(Role::SecretHolder, s).unwrap();
+        let _ = funded.run_adaptor_exchange(ExchangeInputs {
+            our_seckey: sh_sk,
+            their_pubkey: ValidatedPoint::from_bytes(&sl_pub.serialize()).unwrap(),
+            msg_comp_sh: [1u8; 32],
+            msg_comp_sl: [2u8; 32],
+            pre_armed_refund: refund,
+            adaptor_secret: Some(t),
+            lease_dir: Some(lease_h.path().to_path_buf()),
+            possession_store: None,
+            taproot_root_comp_sh: None,
+            taproot_root_comp_sl: None,
+            taproot_output_comp_sh: None,
+            taproot_output_comp_sl: None,
+        });
+    });
+
+    // Victim (SL) receives equivocated nonces and MUST abort with Verification.
+    let peer = PeerSession::new(swap_id, Box::new(victim_io));
+    let funded = Funding::new(params, peer).funded_manual(Role::SecretLearner, s).unwrap();
+    let out = funded.run_adaptor_exchange(ExchangeInputs {
+        our_seckey: sl.sk,
+        their_pubkey: ValidatedPoint::from_bytes(&sh.pk.serialize()).unwrap(),
+        msg_comp_sh: [1u8; 32],
+        msg_comp_sl: [2u8; 32],
+        pre_armed_refund: PreArmedRefund::from_signed_tx(vec![2; 32], s + 200).unwrap(),
+        adaptor_secret: None,
+        lease_dir: Some(lease_v.path().to_path_buf()),
+        possession_store: Some(store.path().to_path_buf()),
+        taproot_root_comp_sh: None,
+        taproot_root_comp_sl: None,
+        taproot_output_comp_sh: None,
+        taproot_output_comp_sl: None,
+    });
+    assert!(
+        matches!(out, Err(Error::Verification(_))),
+        "equivocated nonce reveal was not caught by the commit-reveal interlock"
+    );
+    let _ = h.join();
+}
+
 // ---- await_funded role derivation (v3.14 role_seed = SHA256(...)) ---------
 #[test]
 fn await_funded_derives_opposite_roles_and_enforces_cofunding_window() {

@@ -27,8 +27,8 @@ use crate::crypto::{ValidatedFinalSig, ValidatedPoint};
 use crate::settlement::params::Params;
 use crate::settlement::refund::{PreArmedRefund, WatchtowerReceipt};
 use crate::signing::{
-    aggregate_nonces, assemble_complete_presig, commit_and_reveal, verify_partial,
-    SigningSession, SingleSignerLease,
+    aggregate_nonces, assemble_complete_presig, commit_and_reveal, nonce_commitment,
+    verify_partial, RevealedNonces, SigningSession, SingleSignerLease,
 };
 use crate::wire::{parse_message, serialize_message, Message};
 use crate::{Error, Result};
@@ -226,6 +226,13 @@ fn canonical_key_agg(ours: Point, theirs: Point) -> Result<KeyAggContext> {
     KeyAggContext::new(keys).map_err(|_| Error::Validation("key aggregation failed"))
 }
 
+fn expect_nonce_commitment(m: Message) -> Result<[u8; 32]> {
+    match m {
+        Message::NonceCommitment(h) => Ok(h),
+        _ => Err(Error::Ordering("expected NonceCommitment message")),
+    }
+}
+
 fn expect_nonces(m: Message) -> Result<(crate::crypto::ValidatedPubNonce, crate::crypto::ValidatedPubNonce)> {
     match m {
         Message::Nonces { comp_sh, comp_sl } => Ok((comp_sh, comp_sl)),
@@ -337,9 +344,11 @@ impl Funding {
         let seed = bitcoin::hashes::sha256::Hash::hash(&preimage).to_byte_array();
 
         // Canonical user A = lexicographically smaller session pubkey (same sort
-        // as KeyAgg). The seed's low bit selects which canonical user is SH.
+        // as KeyAgg). v3.13: "the least-significant bit assigns" — the LSB of the
+        // seed as a big-endian integer (last byte) selects which canonical user
+        // is SH.
         let we_are_a = our_session_pubkey.to_bytes() < their_session_pubkey.to_bytes();
-        let seed_picks_a = (seed[0] & 1) == 0;
+        let seed_picks_a = (seed[31] & 1) == 0;
         let role = if we_are_a == seed_picks_a {
             Role::SecretHolder
         } else {
@@ -428,13 +437,31 @@ impl Funded {
             Rc::clone(&lease), ctx_sl.clone(), inputs.our_seckey, inputs.msg_comp_sl,
         )?;
 
-        // (1) Interlock: commit BOTH, then reveal/exchange nonces.
+        // (0/1) Concurrent-session interlock, ENFORCED ON THE WIRE: each party
+        // commits to BOTH its session nonces, both commitments are exchanged,
+        // and only THEN are nonces revealed. A counterparty therefore cannot
+        // choose its nonces adaptively after seeing ours (Wagner/Drijvers).
         let ours = commit_and_reveal(&mut sess_sh, &mut sess_sl)?;
+        self.peer.send_msg(&Message::NonceCommitment(nonce_commitment(&ours)))?;
+        let their_commitment = expect_nonce_commitment(self.peer.recv_msg()?)?;
+
+        // Both sides have committed; reveal now.
         self.peer.send_msg(&Message::Nonces {
             comp_sh: ours.comp_sh.clone(),
             comp_sl: ours.comp_sl.clone(),
         })?;
         let (their_nonce_sh, their_nonce_sl) = expect_nonces(self.peer.recv_msg()?)?;
+
+        // The revealed nonces MUST match the prior commitment.
+        let their_revealed = RevealedNonces {
+            comp_sh: their_nonce_sh.clone(),
+            comp_sl: their_nonce_sl.clone(),
+        };
+        if nonce_commitment(&their_revealed) != their_commitment {
+            return Err(Error::Verification(
+                "counterparty nonces do not match their commitment (concurrent-session interlock)",
+            ));
+        }
 
         let agg_nonce_sh = aggregate_nonces(&ours.comp_sh, &their_nonce_sh);
         let agg_nonce_sl = aggregate_nonces(&ours.comp_sl, &their_nonce_sl);

@@ -274,9 +274,11 @@ mod tests {
         // and a complete 3-element script-path witness.
         let tx: bitcoin::Transaction =
             bitcoin::consensus::encode::deserialize(refund.tx_bytes()).unwrap();
-        assert_eq!(tx.version, bitcoin::transaction::Version::TWO);
+        assert_eq!(tx.version, bitcoin::transaction::Version(3), "contract txs are TRUC/v3");
         assert!(tx.input[0].sequence.is_relative_lock_time());
         assert_eq!(tx.input[0].witness.len(), 3);
+        // Carries the ephemeral anchor (output 1) alongside the D+Δ_fee−fee refund.
+        assert_eq!(tx.output.len(), 2, "refund carries an ephemeral anchor");
     }
 
     #[test]
