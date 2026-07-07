@@ -34,9 +34,15 @@
 //!     restarts, class-pure non-mixing coin selection, enclave-seam key
 //!     derivation (disk holds indices, never keys).
 
+//!   * `orchestrator` — the wallet's funding + abort decision loop over the
+//!     settlement core (rank 4). Canonical-order funding with deferred
+//!     encumbrance verification, co-funding window + Block-X policy, and the
+//!     re-enterable completion-supersedes refund driver. No new crypto.
+
 pub mod keys;
 pub mod ledger;
 pub mod manifest;
+pub mod orchestrator;
 pub mod store;
 
 pub use manifest::{

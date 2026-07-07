@@ -32,8 +32,22 @@ pub trait ChainView {
     fn tip_height(&self) -> u32;
     /// Confirmation height of a funding output, if confirmed.
     fn funding_height(&self, outpoint: OutPoint) -> Option<u32>;
+    /// Confirmed output amount (sats) of a funding output, if known. Default
+    /// `None` for views that don't track amounts; the deferred encumbrance
+    /// check (escrow == exactly D+Δ_fee) needs this, so amount-bearing views
+    /// (SimChain, a real filter client reading the funding tx) override it.
+    fn funding_amount(&self, _outpoint: OutPoint) -> Option<u64> {
+        None
+    }
     /// Status of whatever spends `escrow_outpoint`.
     fn spend_status(&self, escrow_outpoint: OutPoint) -> SpendStatus;
+    /// The txid currently spending `outpoint` (mempool or confirmed), if any.
+    /// Lets the abort driver tell OUR refund from a counterparty completion.
+    /// Default `None` for views that don't track it (the driver then treats
+    /// an unknown spend conservatively as a winning completion).
+    fn spend_txid(&self, _outpoint: OutPoint) -> Option<Txid> {
+        None
+    }
     /// Broadcast a fully-signed tx to the mempool. Enforces funding existence,
     /// relative-timelock maturity, and no-double-spend. Idempotent for a tx
     /// already accepted.
@@ -136,6 +150,14 @@ impl ChainView for SimChain {
         self.0.lock().unwrap().funded.get(&outpoint).map(|(h, _)| *h)
     }
 
+    fn funding_amount(&self, outpoint: OutPoint) -> Option<u64> {
+        self.0.lock().unwrap().funded.get(&outpoint).map(|(_, a)| *a)
+    }
+
+    fn spend_txid(&self, outpoint: OutPoint) -> Option<Txid> {
+        self.0.lock().unwrap().spends.get(&outpoint).map(|(t, _, _)| *t)
+    }
+
     fn spend_status(&self, escrow_outpoint: OutPoint) -> SpendStatus {
         match self.0.lock().unwrap().spends.get(&escrow_outpoint) {
             None => SpendStatus::Unspent,
@@ -229,7 +251,13 @@ impl ChainView for SimChain {
 pub trait ChainSource {
     fn tip_height(&self) -> u32;
     fn funding_height(&self, outpoint: OutPoint) -> Option<u32>;
+    fn funding_amount(&self, _outpoint: OutPoint) -> Option<u64> {
+        None
+    }
     fn spend_status(&self, escrow_outpoint: OutPoint) -> SpendStatus;
+    fn spend_txid(&self, _outpoint: OutPoint) -> Option<Txid> {
+        None
+    }
     fn broadcast(&self, tx_bytes: &[u8]) -> Result<Txid>;
     /// True iff this source validates compact-block filters against
     /// independently-obtained PoW headers — i.e. it cannot be made to lie about
@@ -257,8 +285,14 @@ impl<C: ChainView> ChainSource for Source<C> {
     fn funding_height(&self, outpoint: OutPoint) -> Option<u32> {
         self.view.funding_height(outpoint)
     }
+    fn funding_amount(&self, outpoint: OutPoint) -> Option<u64> {
+        self.view.funding_amount(outpoint)
+    }
     fn spend_status(&self, escrow_outpoint: OutPoint) -> SpendStatus {
         self.view.spend_status(escrow_outpoint)
+    }
+    fn spend_txid(&self, outpoint: OutPoint) -> Option<Txid> {
+        self.view.spend_txid(outpoint)
     }
     fn broadcast(&self, tx_bytes: &[u8]) -> Result<Txid> {
         self.view.broadcast(tx_bytes)
@@ -332,6 +366,35 @@ impl<A: ChainSource, B: ChainSource> DualSourceChainView<A, B> {
         }
     }
 
+    /// Funding CONFIRMATION HEIGHT AND AMOUNT, only if both sources agree on
+    /// both. This is the deferred-encumbrance-verification read (v3.14
+    /// Phase 5): the counterparty escrow must be confirmed AND hold exactly
+    /// D+Δ_fee before we sign. Disagreement (or a source that cannot report
+    /// the amount) => Err, so we never sign against unverified funding.
+    pub fn verified_funding(&self, outpoint: OutPoint) -> Result<Option<(u32, u64)>> {
+        let (hx, hy) = (self.a.funding_height(outpoint), self.b.funding_height(outpoint));
+        if hx != hy {
+            return Err(Error::Deadline(
+                "chain sources disagree on funding confirmation; wait-or-abort",
+            ));
+        }
+        match hx {
+            None => Ok(None),
+            Some(h) => {
+                let (ax, ay) = (self.a.funding_amount(outpoint), self.b.funding_amount(outpoint));
+                match (ax, ay) {
+                    (Some(x), Some(y)) if x == y => Ok(Some((h, x))),
+                    (Some(_), Some(_)) => Err(Error::Deadline(
+                        "chain sources disagree on funding amount; wait-or-abort",
+                    )),
+                    _ => Err(Error::Deadline(
+                        "a chain source cannot report the funding amount; cannot verify encumbrance",
+                    )),
+                }
+            }
+        }
+    }
+
     /// Spend status, only if both sources agree. Disagreement => wait-or-abort.
     pub fn verified_spend_status(&self, escrow_outpoint: OutPoint) -> Result<SpendStatus> {
         let (x, y) = (self.a.spend_status(escrow_outpoint), self.b.spend_status(escrow_outpoint));
@@ -378,8 +441,17 @@ impl<A: ChainSource, B: ChainSource> ChainView for DualSourceChainView<A, B> {
     fn funding_height(&self, outpoint: OutPoint) -> Option<u32> {
         self.verified_funding_height(outpoint).unwrap_or(None)
     }
+    fn funding_amount(&self, outpoint: OutPoint) -> Option<u64> {
+        // Amount only when both sources agree on height AND amount.
+        self.verified_funding(outpoint).ok().flatten().map(|(_, a)| a)
+    }
     fn spend_status(&self, escrow_outpoint: OutPoint) -> SpendStatus {
         self.authoritative_spend_status(escrow_outpoint)
+    }
+    fn spend_txid(&self, outpoint: OutPoint) -> Option<Txid> {
+        // Authoritative (self-verifying) source: a lying explorer must not be
+        // able to misattribute a spend and trick us into "take the swap".
+        self.sv().spend_txid(outpoint)
     }
     fn broadcast(&self, tx_bytes: &[u8]) -> Result<Txid> {
         DualSourceChainView::broadcast(self, tx_bytes)
