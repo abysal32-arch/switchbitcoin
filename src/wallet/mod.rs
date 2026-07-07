@@ -27,6 +27,15 @@
 //!     pinned libsecp256k1 for verification — no new curve math, and none of
 //!     it lives in the settlement crypto modules.
 
+//!   * `ledger` + `keys` — the coin ledger and onboarding pipeline (v3.13
+//!     Phase 0–1): typed Phase-0 warning gate, auto-split to exactly
+//!     D + Δ_fee pre-encumbrance UTXOs (single change output absorbs all
+//!     rounding), CSPRNG 24–72h encumbrance delay persisted across
+//!     restarts, class-pure non-mixing coin selection, enclave-seam key
+//!     derivation (disk holds indices, never keys).
+
+pub mod keys;
+pub mod ledger;
 pub mod manifest;
 pub mod store;
 

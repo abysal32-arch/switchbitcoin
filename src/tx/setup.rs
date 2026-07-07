@@ -89,6 +89,85 @@ pub fn build_setup(
     Ok((signed, OutPoint::new(setup_tx.compute_txid(), 0)))
 }
 
+/// Build and sign the Phase-1 ONBOARDING SPLIT: spend the whole deposit UTXO
+/// into `outputs` (k pre-encumbrance outputs of exactly D + Δ_fee each, plus
+/// at most one unencumbered change output that absorbs ALL rounding — v3.13
+/// Phase 1). The deposit is an ordinary Taproot single-sig receive
+/// (`pre_encumbrance_spk` of the deposit key), spent key-path.
+///
+/// Unlike the contract transactions (Setup/Completion/Refund), the split is
+/// an ORDINARY wallet transaction: version 2, no ephemeral anchor, and it
+/// pays its own fee (`fee_sats`) like any normal wallet spend — the
+/// history-terminating tx should look like ordinary wallet activity, not
+/// like protocol traffic ("no fee side-channel").
+///
+/// Conservation is enforced: `sum(outputs) + fee_sats == deposit_amount_sats`
+/// exactly, and the fee must be positive. The LEDGER decides the output list
+/// (tier arithmetic, dust folding); this function only refuses to sign
+/// anything that does not conserve the deposit.
+pub fn build_onboarding_split(
+    deposit_outpoint: OutPoint,
+    deposit_amount_sats: u64,
+    deposit_seckey: &secp::Scalar,
+    outputs: &[(ScriptBuf, u64)],
+    fee_sats: u64,
+) -> Result<(Vec<u8>, bitcoin::Txid)> {
+    if outputs.is_empty() {
+        return Err(Error::Validation("split: no outputs"));
+    }
+    if fee_sats == 0 {
+        return Err(Error::Validation("split: fee must be positive"));
+    }
+    let out_total: u64 = outputs
+        .iter()
+        .try_fold(0u64, |acc, (_, a)| acc.checked_add(*a))
+        .ok_or(Error::Validation("split: output total overflows"))?;
+    if out_total
+        .checked_add(fee_sats)
+        .is_none_or(|t| t != deposit_amount_sats)
+    {
+        return Err(Error::Validation(
+            "split: outputs + fee must equal the deposit exactly",
+        ));
+    }
+
+    let deposit_xonly = (*deposit_seckey * secp::G).serialize_xonly();
+    let deposit_spk = pre_encumbrance_spk(deposit_xonly)?;
+
+    let tx = Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: deposit_outpoint,
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: outputs
+            .iter()
+            .map(|(spk, amount)| TxOut {
+                value: Amount::from_sat(*amount),
+                script_pubkey: spk.clone(),
+            })
+            .collect(),
+    };
+
+    let prevout = TxOut {
+        value: Amount::from_sat(deposit_amount_sats),
+        script_pubkey: deposit_spk,
+    };
+    let sighash = SighashCache::new(&tx)
+        .taproot_key_spend_signature_hash(0, &Prevouts::All(&[prevout]), TapSighashType::Default)
+        .map_err(|_| Error::Abort("split key-spend sighash"))?
+        .to_byte_array();
+    let sig = sign_key_path_tweaked(deposit_seckey.serialize(), sighash)?;
+
+    let signed = finalize_key_spend(SpendTx { tx, sighash }, sig);
+    let split_tx: Transaction = bitcoin::consensus::encode::deserialize(&signed)
+        .map_err(|_| Error::Abort("split re-decode"))?;
+    Ok((signed, split_tx.compute_txid()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
