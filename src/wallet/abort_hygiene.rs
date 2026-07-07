@@ -198,6 +198,14 @@ impl GriefingLedger {
         outcome: Outcome,
         now: u64,
     ) -> Result<()> {
+        // A no-fault outcome is a TRUE no-op (review fix): it must not penalize
+        // the peer AND must not count as strike-aging "activity" — otherwise it
+        // would refresh `last_seen` and keep a residual strike from ever aging
+        // out under the TTL, silently disadvantaging an honest peer. So it
+        // never touches the record (nor triggers a needless persist).
+        if outcome == Outcome::NoFaultAbort {
+            return Ok(());
+        }
         // Snapshot for rollback-on-persist-failure (memory never diverges).
         let snapshot = self.records.get(&counterparty_utxo).cloned();
         {
@@ -207,10 +215,17 @@ impl GriefingLedger {
                 Outcome::Completed => {
                     rec.completions = rec.completions.saturating_add(1);
                     rec.strikes = rec.strikes.saturating_sub(self.policy.completion_decay);
-                    // A good swap also clears any active cooldown.
-                    rec.blocked_until = 0;
+                    // A completion clears the cooldown ONLY when it fully
+                    // rehabilitates the peer (strikes back to 0). It must NOT
+                    // instantly wipe a multi-strike ban (review fix): a serial
+                    // griefer at a 30-day ban cannot buy its way out with one
+                    // real swap — the active ban stands and only the FUTURE
+                    // escalation is reduced. An honest peer with a single strike
+                    // still clears immediately (strikes → 0).
+                    if rec.strikes == 0 {
+                        rec.blocked_until = 0;
+                    }
                 }
-                Outcome::NoFaultAbort => { /* activity only; no penalty */ }
                 o if o.is_attributable() => {
                     rec.strikes = rec.strikes.saturating_add(1);
                     let block_secs = if rec.strikes >= self.policy.strikes_to_long_ban {
@@ -251,17 +266,34 @@ impl GriefingLedger {
         }
     }
 
-    /// Forget stale records (last activity older than the TTL). Call
-    /// periodically; also bounds the on-disk size.
+    /// Forget stale records (last activity older than the TTL) while KEEPING
+    /// any still-active ban. Call periodically; also bounds the on-disk size.
+    /// Transactional (review fix): the in-memory drop is rolled back if the
+    /// persist fails, so memory never diverges from disk — the same
+    /// discipline `record_outcome` uses.
     pub fn prune(&mut self, now: u64) -> Result<()> {
         let ttl = self.policy.record_ttl;
-        let before = self.records.len();
-        self.records
-            .retain(|_, r| now < r.blocked_until || now.saturating_sub(r.last_seen) < ttl);
-        if self.records.len() != before {
-            self.persist()?;
+        let removed: Vec<(OutPoint, PeerRecord)> = self
+            .records
+            .iter()
+            .filter(|(_, r)| !(now < r.blocked_until || now.saturating_sub(r.last_seen) < ttl))
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        if removed.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        for (k, _) in &removed {
+            self.records.remove(k);
+        }
+        match self.persist() {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                for (k, v) in removed {
+                    self.records.insert(k, v);
+                }
+                Err(e)
+            }
+        }
     }
 
     pub fn tracked_peers(&self) -> usize {
@@ -402,17 +434,64 @@ mod tests {
     }
 
     #[test]
-    fn completion_rehabilitates_and_clears_cooldown() {
+    fn completion_fully_rehabilitates_a_single_strike_peer() {
         let dir = tempfile::tempdir().unwrap();
         let mut g = open(dir.path());
         let peer = utxo(4);
         let t0 = 1_000u64;
         g.record_outcome(peer, Outcome::CounterpartyNoShow, t0).unwrap();
         assert!(!g.is_allowed(peer, t0));
-        // A completed swap forgives the strike AND clears the active cooldown.
+        // A completed swap forgives the single strike (→ 0) AND clears the
+        // cooldown — an honest peer with one blip is fully rehabilitated.
         g.record_outcome(peer, Outcome::Completed, t0 + 1).unwrap();
-        assert!(g.is_allowed(peer, t0 + 1), "completion clears the cooldown");
+        assert!(g.is_allowed(peer, t0 + 1), "single-strike completion clears the cooldown");
         assert_eq!(g.tracked_peers(), 0, "rehabilitated peer is dropped");
+    }
+
+    /// Review fix (finding 3): a serial griefer at a long ban CANNOT buy its
+    /// way out with one real swap. A completion decays a strike but does NOT
+    /// wipe a multi-strike active ban — only future escalation is reduced.
+    #[test]
+    fn completion_does_not_wipe_a_multi_strike_ban() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut g = open(dir.path());
+        let peer = utxo(5);
+        let t0 = 1_000u64;
+        for _ in 0..5 {
+            g.record_outcome(peer, Outcome::CounterpartyNoShow, t0).unwrap();
+        }
+        // 5 strikes → 30-day ban.
+        assert!(!g.is_allowed(peer, t0 + 100));
+        // One completion: strike 5→4, but the ACTIVE ban still stands.
+        g.record_outcome(peer, Outcome::Completed, t0 + 100).unwrap();
+        assert!(
+            !g.is_allowed(peer, t0 + 100),
+            "one completion must not lift a multi-strike ban"
+        );
+        assert!(!g.is_allowed(peer, t0 + 29 * 24 * 3_600), "ban duration unchanged");
+    }
+
+    /// Review fix (finding 1): a NoFaultAbort is a true no-op — it must not
+    /// refresh the strike-aging clock, so a residual strike on an otherwise-
+    /// honest peer still ages out under the TTL despite ongoing no-fault
+    /// activity.
+    #[test]
+    fn no_fault_activity_does_not_keep_a_residual_strike_alive() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut g = open(dir.path());
+        let peer = utxo(6);
+        let t0 = 1_000u64;
+        // One old attributable strike (cooldown long past).
+        g.record_outcome(peer, Outcome::CounterpartyNoShow, t0).unwrap();
+        // Sustained no-fault activity across > TTL (our crashes / symmetric
+        // expiries) — none of it may refresh the strike's aging clock.
+        for k in 1..100u64 {
+            g.record_outcome(peer, Outcome::NoFaultAbort, t0 + k * 24 * 3_600).unwrap();
+        }
+        // Past the TTL since the STRIKE (not since the last no-fault event):
+        // the strike ages out on prune.
+        g.prune(t0 + 91 * 24 * 3_600).unwrap();
+        assert_eq!(g.tracked_peers(), 0, "residual strike must age out despite no-fault activity");
     }
 
     #[test]
