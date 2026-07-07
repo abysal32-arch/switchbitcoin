@@ -707,8 +707,15 @@ fn write_possession_record(
             "possession record already exists for this swap_session_id (reused session key?)",
         ));
     }
+    // Seal at-rest under the per-swap TEK (v3.13 Phase 3): confidentiality on
+    // top of the integrity the re-verify-on-restore already provided.
+    let tek = crate::crypto::storage::derive_tek(
+        &crate::crypto::storage::platform_secure_key(),
+        swap_session_id,
+    );
+    let sealed = crate::crypto::storage::seal(&tek, &v)?;
     let tmp = dir.join(format!("{}.possession.tmp", hex32(swap_session_id)));
-    std::fs::write(&tmp, &v).map_err(|_| Error::Abort("possession record write failed"))?;
+    std::fs::write(&tmp, &sealed).map_err(|_| Error::Abort("possession record write failed"))?;
     std::fs::rename(&tmp, &path)
         .map_err(|_| Error::Abort("possession record rename failed"))?;
     Ok(path)
@@ -779,9 +786,21 @@ impl Possessing {
     /// invariant, both pre-signatures re-verified against (R + T, P, m), and
     /// both must be bound to the T stored in the record. A tampered or corrupt
     /// record is an Err, never a bogus possession.
-    pub fn restore_secret_learner(record_path: &std::path::Path) -> Result<Possessing> {
-        let b = std::fs::read(record_path)
+    pub fn restore_secret_learner(
+        record_path: &std::path::Path,
+        swap_session_id: &[u8; 32],
+    ) -> Result<Possessing> {
+        let sealed = std::fs::read(record_path)
             .map_err(|_| Error::Abort("possession record unreadable"))?;
+        // Unseal under the per-swap TEK. A wrong swap_session_id, a tampered
+        // blob, or a truncated file all fail the GCM tag here (never a bogus
+        // possession). The AEAD is the integrity gate; the re-verification
+        // below is the semantic gate.
+        let tek = crate::crypto::storage::derive_tek(
+            &crate::crypto::storage::platform_secure_key(),
+            swap_session_id,
+        );
+        let b = crate::crypto::storage::open(&tek, &sealed)?;
         let mut at = 0usize;
         let version: [u8; 1] = take_arr(&b, &mut at)?;
         if version[0] != 2 {
@@ -970,6 +989,7 @@ mod tests {
         sh_completion: CompletionSig,
         sh_t_point: [u8; 33],
         possession_record: std::path::PathBuf,
+        swap_session_id: [u8; 32],
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1042,7 +1062,13 @@ mod tests {
         // The record filename uses the DERIVED swap_session_id, not the routing tag.
         let sid = swap_session_id(sh_keys.pubkey, sl_keys.pubkey).unwrap();
         let possession_record = store_dir.join(format!("{}.possession", hex32(&sid)));
-        ExchangeOutcome { sl_possessing, sh_completion, sh_t_point, possession_record }
+        ExchangeOutcome {
+            sl_possessing,
+            sh_completion,
+            sh_t_point,
+            possession_record,
+            swap_session_id: sid,
+        }
     }
 
     /// Full two-party in-process exchange + settlement crypto:
@@ -1219,8 +1245,9 @@ mod tests {
         drop(out.sl_possessing);
 
         // Fresh process rebuilds from the record — everything re-validated.
-        let restored = Possessing::restore_secret_learner(&out.possession_record)
-            .expect("restore from possession record");
+        let restored =
+            Possessing::restore_secret_learner(&out.possession_record, &out.swap_session_id)
+                .expect("restore from possession record");
         assert_eq!(restored.role(), Role::SecretLearner);
 
         // Extraction + claim succeed post-restore; leg independently verifies.
@@ -1244,14 +1271,41 @@ mod tests {
             &sh_keys, &sl_keys, store.path(),
         );
         let mut bytes = std::fs::read(&out.possession_record).unwrap();
-        // Flip a byte inside the first pre-signature (past the header+params+T).
-        // Header = version(1) + s_height(4) + sweep(4) + params(44) + T(33) = 86;
-        // land 10 bytes into presig_comp_sh so from_bytes re-verify fails.
-        let idx = 1 + 4 + 4 + 44 + 33 + 10;
+        // The on-disk record is now AEAD-sealed: [12-byte nonce] || AES-256-GCM
+        // ciphertext+tag. Flip a byte inside the ciphertext (past the nonce) —
+        // the GCM tag check fails on unseal, so tampering never reaches the
+        // parser, let alone yields a Possessing.
+        let idx = 12 + 10;
         bytes[idx] ^= 0x01;
         let bad = store.path().join("bad.possession");
         std::fs::write(&bad, &bytes).unwrap();
-        assert!(Possessing::restore_secret_learner(&bad).is_err());
+        assert!(Possessing::restore_secret_learner(&bad, &out.swap_session_id).is_err());
+    }
+
+    /// The at-rest record is cryptographically bound to its swap: the TEK is
+    /// per-swap, so an intact record cannot be unsealed under a DIFFERENT
+    /// swap_session_id. The correct sid restores; a wrong one fails the GCM tag.
+    #[test]
+    fn possession_record_is_bound_to_its_swap_session() {
+        let sh_keys = keypair();
+        let sl_keys = keypair();
+        let s_height = 70_000;
+        let store = tempfile::tempdir().expect("store");
+        let out = run_happy_exchange(
+            [0x9au8; 32], [1u8; 32], [2u8; 32], s_height, s_height + 10,
+            &sh_keys, &sl_keys, store.path(),
+        );
+        // Correct sid: restores.
+        assert!(
+            Possessing::restore_secret_learner(&out.possession_record, &out.swap_session_id).is_ok()
+        );
+        // Any other sid: the derived TEK differs, GCM auth fails, no possession.
+        let mut wrong_sid = out.swap_session_id;
+        wrong_sid[0] ^= 0x01;
+        assert!(
+            Possessing::restore_secret_learner(&out.possession_record, &wrong_sid).is_err(),
+            "record must not open under a foreign swap_session_id"
+        );
     }
 
     /// Extraction defensive paths (review item #2): a final signature from a

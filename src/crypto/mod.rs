@@ -8,6 +8,7 @@
 
 pub mod validate;
 pub mod adaptor;
+pub mod storage;
 
 pub use validate::{
     ValidatedFinalSig, ValidatedPartial, ValidatedPoint, ValidatedPubNonce, ValidatedScalar,

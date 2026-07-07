@@ -30,6 +30,12 @@ bitcoin = { version = "0.32" }                     # Taproot/BIP341, PSBT, tx ty
 rand = "0.9"                                       # matches secp256k1 0.31 / musig2 0.4 rand dep
 thiserror = "2"
 zeroize = { version = "1", features = ["derive"] } # scrub secret nonces from memory (INV-1)
+# At-rest storage encryption (v3.13 Phase 3: AES-256-GCM under an HKDF-derived
+# TEK). These are SYMMETRIC storage crypto, NOT the curve math Req 1 pins — that
+# still comes only from libsecp256k1 via musig2/secp.
+aes-gcm = "0.10"                                   # AES-256-GCM AEAD, unique 96-bit nonces
+hkdf = "0.12"                                      # TEK = HKDF-SHA256(platform key, swap_session_id)
+sha2 = "0.10"                                      # HKDF hash
 
 [dev-dependencies]
 proptest = "1"
