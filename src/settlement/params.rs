@@ -89,6 +89,26 @@ impl Params {
         if self.delta_fee_sats == 0 {
             return Err(Error::Deadline("delta_fee must be > 0"));
         }
+        // The swapped output must be a real, non-dust amount, and the fee
+        // margin must be a MARGIN — smaller than the principal it protects.
+        // (A zero/dust tier or a fee that swallows the tier passes no other
+        // check but breaks every economic assumption downstream.)
+        if self.tier_d_sats < 1_000 {
+            return Err(Error::Deadline("tier D must be at least 1000 sats (non-dust)"));
+        }
+        if self.delta_fee_sats >= self.tier_d_sats {
+            return Err(Error::Deadline("delta_fee must be smaller than tier D"));
+        }
+        // Onboarding delay: zero lower bound would defeat the withdrawal<->
+        // encumbrance timing decorrelation entirely; inverted bounds are
+        // malformed.
+        if self.onboarding_delay_hours.0 == 0
+            || self.onboarding_delay_hours.0 > self.onboarding_delay_hours.1
+        {
+            return Err(Error::Deadline(
+                "onboarding delay bounds must satisfy 0 < lo <= hi",
+            ));
+        }
         // On-chain CSV field is BIP68 16-bit relative-height. Both refund
         // maturities must fit, or `Sequence::from_height` would truncate and a
         // refund could mature FAR earlier than intended (collapsing the
@@ -117,9 +137,17 @@ impl Params {
     /// would over-grant by up to `cofunding_window` blocks and open a reachable
     /// extract-and-race window under co-funding skew. Total; never panics.
     /// Returns 0 when the window is already tight or past — claim IMMEDIATELY.
+    ///
+    /// STRICTLY-BEFORE semantics (adversarial-review fix): under BIP68 the SH
+    /// refund is includable in block `anchor + delta_late` itself, so the
+    /// claim must be budgeted to confirm by `deadline - 1` at the latest — a
+    /// budget that merely reaches the deadline puts claim and refund in the
+    /// same block and reopens the race at the boundary. Hence the extra -1.
     pub fn max_claim_delay(&self, anchor_height: u32, reveal_height: u32) -> u64 {
         let deadline = anchor_height as u64 + self.delta_late();
-        let budget_end = deadline.saturating_sub(self.claim_confirm_allowance as u64);
+        let budget_end = deadline
+            .saturating_sub(self.claim_confirm_allowance as u64)
+            .saturating_sub(1);
         budget_end.saturating_sub(reveal_height as u64)
     }
 }

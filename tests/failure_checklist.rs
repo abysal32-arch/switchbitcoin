@@ -463,12 +463,14 @@ fn claim_delay_never_breaches_safe_window() {
                 let max_delay = p.max_claim_delay(s_height, reveal);
 
                 // THE BOUND (review item #5): if any delay is granted, even the
-                // maximum one still confirms before S + delta_late.
+                // maximum one still confirms STRICTLY before S + delta_late —
+                // the refund is includable in the maturity block itself
+                // (BIP68), so landing IN that block is already the race.
                 if max_delay > 0 {
                     prop_assert!(
-                        reveal as u64 + max_delay + p.claim_confirm_allowance as u64
-                            <= s_height as u64 + p.delta_late(),
-                        "max delay {} breaches S + delta_late", max_delay
+                        (reveal as u64 + max_delay + p.claim_confirm_allowance as u64)
+                            < s_height as u64 + p.delta_late(),
+                        "max delay {} reaches the refund-maturity block", max_delay
                     );
                 }
                 // And the bound is total: no panic for any inputs (incl. reveal

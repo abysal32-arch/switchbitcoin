@@ -216,24 +216,35 @@ impl SignedManifest {
             .saturating_sub(self.params.cofunding_window as u64)
             .saturating_sub(self.params.claim_confirm_allowance as u64);
         let mut prev_max = 0u64;
+        let mut prev_min = 0u64;
         for (min, max) in self.delay_bounds {
             if (min as u64) > (max as u64) {
                 return Err(Error::Deadline("manifest: delay bound min exceeds max"));
             }
-            if max as u64 > window {
+            // STRICT: a max that merely REACHES the window budgets the claim
+            // to confirm in the very block the SH refund matures (BIP68 makes
+            // the refund includable in that block) — the boundary IS the
+            // race. Must stay strictly inside. (Mirrors the -1 in
+            // Params::max_claim_delay.)
+            if max as u64 >= window {
                 return Err(Error::Deadline(
-                    "manifest: delay bound exceeds the worst-case claim window",
+                    "manifest: delay bound must stay strictly inside the worst-case claim window",
                 ));
             }
-            // Postures are ordered by decorrelation: widths must not regress.
-            if (max as u64) < prev_max {
-                return Err(Error::Deadline("manifest: posture maxima must be non-decreasing"));
+            // Postures are ordered by decorrelation: neither endpoint may
+            // regress from one posture to the next.
+            if (max as u64) < prev_max || (min as u64) < prev_min {
+                return Err(Error::Deadline("manifest: posture bounds must be non-decreasing"));
             }
             prev_max = max as u64;
+            prev_min = min as u64;
         }
-        if self.cofunding_jitter_max > self.params.cofunding_window {
+        // Jitter is PER-PARTY and the skews add: two parties each jittering
+        // up to j can land 2j apart, so 2*jitter must fit in the window or
+        // honest swaps get pushed into the skew-abort path.
+        if self.cofunding_jitter_max as u64 * 2 > self.params.cofunding_window as u64 {
             return Err(Error::Deadline(
-                "manifest: funding jitter exceeds the co-funding window",
+                "manifest: two-sided funding jitter exceeds the co-funding window",
             ));
         }
         if self.quorum_q == 0 {
@@ -374,73 +385,147 @@ pub enum ManifestOpenReport {
     /// The stored envelope verified; running it.
     Loaded { version: u32 },
     /// The stored envelope failed verification (tampered / wrong network /
-    /// invariant violation). It was quarantined and the wallet FELL BACK to
-    /// the provisional baseline. Surface this to the user: parameters
-    /// changed underneath them.
-    ProvisionalFallback { quarantined: PathBuf },
+    /// invariant violation). It was quarantined (or, if even the quarantine
+    /// rename failed, left in place at the reported path) and the wallet
+    /// FELL BACK to the provisional baseline — but the version FLOOR is
+    /// kept, so old manifests still cannot replay. Surface to the user:
+    /// parameters changed underneath them; re-sync the manifest.
+    ProvisionalFallback { offending: PathBuf },
+    /// The stored envelope VERIFIES but its version is below the recorded
+    /// floor: someone restored an old manifest file (rollback). Quarantined;
+    /// running provisional; floor kept. This is an ALARM, not a log line.
+    RollbackDetected { quarantined: PathBuf, floor: u32 },
+    /// The stored file could not be read (transient I/O). Running
+    /// provisional FOR THIS SESSION; the file is left alone and may verify
+    /// on the next start. Distinct from Fresh so it is never mistaken for a
+    /// clean first run.
+    ProvisionalTransient { path: PathBuf },
 }
 
 /// Durable holder of the wallet's current manifest. One per wallet data dir
-/// (share the SwapStore's dir; the filenames do not collide).
+/// (share the SwapStore's dir; the filenames do not collide). Holds an OS
+/// file lock for its lifetime (same discipline as the SwapStore) so two
+/// instances cannot race the version gate.
+///
+/// DOWNGRADE FLOOR: the highest version ever accepted is persisted in a
+/// sidecar (`manifest.floor`) that SURVIVES quarantine of the manifest
+/// itself — corrupting the stored manifest no longer resets the monotonic
+/// gate to zero. Honest limit (documented, mirrors the store's anti-rollback
+/// note): the sidecar lives on the same disk, so an attacker who can delete
+/// BOTH files still wins; the real fix is the enclave-held monotonic
+/// counter, the same real-infra seam as `platform_secure_key`.
 pub struct ManifestStore {
     path: PathBuf,
+    floor_path: PathBuf,
     current: SignedManifest,
+    /// Highest version ever accepted (persisted; survives quarantine).
+    floor: u32,
+    /// Held for the store's lifetime; released by the OS on process death.
+    _lock: std::fs::File,
 }
 
 impl ManifestStore {
-    /// Load the stored manifest (re-verifying its signature and invariants)
-    /// or fall back to the compiled-in provisional baseline. Never fails
-    /// open: a bad stored manifest is quarantined, not fatal.
-    pub fn open(dir: &Path, root: &dyn ManifestTrustRoot) -> Result<(ManifestStore, ManifestOpenReport)> {
+    /// Load the stored manifest (re-verifying signature, invariants, AND the
+    /// version floor) or fall back to the compiled-in provisional baseline.
+    /// Never fails open on a bad manifest: quarantine (best-effort) + fall
+    /// back + report. Fails only on unusable dir / lock contention.
+    pub fn open(
+        dir: &Path,
+        root: &dyn ManifestTrustRoot,
+    ) -> Result<(ManifestStore, ManifestOpenReport)> {
         std::fs::create_dir_all(dir)
             .map_err(|_| Error::Abort("manifest store dir unavailable"))?;
+        let lock_path = dir.join(".manifest.lock");
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|_| Error::Abort("manifest lock file unavailable"))?;
+        if lock.try_lock().is_err() {
+            return Err(Error::Abort(
+                "another process holds this manifest store (single-instance)",
+            ));
+        }
         let path = dir.join("manifest.current");
+        let floor_path = dir.join("manifest.floor");
+        let mut floor = read_floor(&floor_path);
         let (current, report) = match std::fs::read(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 (SignedManifest::provisional(), ManifestOpenReport::ProvisionalFresh)
             }
-            Err(_) => {
-                // Transient I/O: run provisional for this session but leave
-                // the file alone (it may verify next start).
-                (SignedManifest::provisional(), ManifestOpenReport::ProvisionalFresh)
-            }
+            Err(_) => (
+                SignedManifest::provisional(),
+                ManifestOpenReport::ProvisionalTransient { path: path.clone() },
+            ),
             Ok(envelope) => match verify_manifest(&envelope, root) {
+                Ok(m) if m.version() < floor => {
+                    // A validly-signed but OLD manifest on disk: rollback.
+                    let q = quarantine_manifest(&path).unwrap_or_else(|_| path.clone());
+                    (
+                        SignedManifest::provisional(),
+                        ManifestOpenReport::RollbackDetected { quarantined: q, floor },
+                    )
+                }
                 Ok(m) => {
                     let v = m.version();
+                    // The floor may lag the stored manifest (crash between
+                    // the envelope write and the floor write): catch it up.
+                    if v > floor {
+                        floor = v;
+                        let _ = write_floor(&floor_path, floor); // best-effort
+                    }
                     (m, ManifestOpenReport::Loaded { version: v })
                 }
                 Err(_) => {
-                    let q = quarantine_manifest(&path)?;
+                    // Quarantine best-effort: even if the rename fails, fall
+                    // back rather than refusing to open (never-fatal).
+                    let q = quarantine_manifest(&path).unwrap_or_else(|_| path.clone());
                     (
                         SignedManifest::provisional(),
-                        ManifestOpenReport::ProvisionalFallback { quarantined: q },
+                        ManifestOpenReport::ProvisionalFallback { offending: q },
                     )
                 }
             },
         };
-        Ok((ManifestStore { path, current }, report))
+        Ok((ManifestStore { path, floor_path, current, floor, _lock: lock }, report))
     }
 
     pub fn current(&self) -> &SignedManifest {
         &self.current
     }
 
+    /// True while running the compiled-in version-0 baseline. The rank-4
+    /// orchestrator should surface this before the first swap: v0 wallets
+    /// form their own (small, fingerprintable) anonymity partition, so
+    /// syncing a real manifest first is the private choice.
+    pub fn is_provisional(&self) -> bool {
+        self.current.version() == 0
+    }
+
     /// Ingest a distribution envelope. Verifies signature + invariants, then
-    /// applies the STRICTLY-MONOTONIC version gate: replay of the identical
-    /// current manifest is an idempotent no-op; any other same-or-lower
-    /// version — validly signed or not — is refused (downgrade defense).
-    /// Persisted durably before it takes effect in memory.
-    pub fn ingest(&mut self, envelope: &[u8], root: &dyn ManifestTrustRoot) -> Result<&SignedManifest> {
+    /// applies the STRICTLY-MONOTONIC version gate against BOTH the current
+    /// manifest and the persisted floor (which survives tamper-quarantine of
+    /// the manifest file): replay of the identical current manifest is an
+    /// idempotent no-op; any other same-or-lower version — validly signed or
+    /// not — is refused. Persisted durably before it takes effect in memory.
+    pub fn ingest(
+        &mut self,
+        envelope: &[u8],
+        root: &dyn ManifestTrustRoot,
+    ) -> Result<&SignedManifest> {
         let m = verify_manifest(envelope, root)?;
         if m == self.current {
             return Ok(&self.current); // idempotent re-ingest
         }
-        if m.version() <= self.current.version() {
+        if m.version() <= self.current.version() || m.version() <= self.floor {
             return Err(Error::Ordering(
                 "manifest version must strictly increase (downgrade/replay refused)",
             ));
         }
-        // Durable write-then-apply (same discipline as the SwapStore).
+        // Durable write-then-apply (same discipline as the SwapStore):
+        // envelope first, then the floor, then memory. A crash between the
+        // two writes leaves floor < stored version, which open() repairs.
         let tmp = self.path.with_extension("current.tmp");
         let mut f = std::fs::File::create(&tmp)
             .map_err(|_| Error::Abort("manifest tmp create failed"))?;
@@ -450,16 +535,42 @@ impl ManifestStore {
         drop(f);
         std::fs::rename(&tmp, &self.path)
             .map_err(|_| Error::Abort("manifest rename failed"))?;
+        write_floor(&self.floor_path, m.version())?;
+        self.floor = m.version();
         self.current = m;
         Ok(&self.current)
     }
 
     /// v3.13: "Wallets refuse swaps across mismatched Δ_fee versions."
-    /// The whole manifest is versioned as one unit, so any version mismatch
-    /// refuses the swap (divergent params shrink the anonymity set).
-    pub fn refuses_swap_with(&self, peer_manifest_version: u32) -> bool {
-        peer_manifest_version != self.current.version()
+    /// Compares BOTH the version and the content id: version equality alone
+    /// cannot detect an operator (or compromised key) signing two DIFFERENT
+    /// manifests under one version — a silent anonymity-set split. The
+    /// rank-4 wire exchanges (version, id) and calls this.
+    pub fn refuses_swap_with(&self, peer_version: u32, peer_id: &[u8; 32]) -> bool {
+        peer_version != self.current.version() || peer_id != &self.current.id()
     }
+}
+
+fn read_floor(path: &Path) -> u32 {
+    match std::fs::read(path) {
+        Ok(b) if b.len() == 4 => u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+        // Missing or malformed: floor 0. (An attacker deleting the sidecar
+        // is the documented same-disk limit; accidental corruption of a
+        // 4-byte fsync'd file is the case this degrades gracefully for.)
+        _ => 0,
+    }
+}
+
+fn write_floor(path: &Path, floor: u32) -> Result<()> {
+    let tmp = path.with_extension("floor.tmp");
+    let mut f =
+        std::fs::File::create(&tmp).map_err(|_| Error::Abort("floor tmp create failed"))?;
+    f.write_all(&floor.to_le_bytes())
+        .and_then(|()| f.sync_all())
+        .map_err(|_| Error::Abort("floor write/sync failed"))?;
+    drop(f);
+    std::fs::rename(&tmp, path).map_err(|_| Error::Abort("floor rename failed"))?;
+    Ok(())
 }
 
 fn quarantine_manifest(path: &Path) -> Result<PathBuf> {
@@ -549,17 +660,27 @@ mod tests {
 
     #[test]
     fn unsafe_delay_bounds_are_refused_even_signed() {
-        // Provisional window = 72 + 24 - 12 - 6 = 78: a 79-block max could
-        // push SL past its safe window at max skew.
+        // Provisional window = 72 + 24 - 12 - 6 = 78. STRICT bound: a max
+        // that even REACHES 78 budgets the claim into the refund-maturity
+        // block (the boundary IS the race) — 77 is the largest legal max.
         assert!(SignedManifest::compose(
             3,
             Params::testnet_provisional(),
             ClaimDelayPosture::Moderate,
-            [(0, 6), (6, 36), (12, 79)],
+            [(0, 6), (6, 36), (12, 78)],
             6,
             3,
         )
         .is_err());
+        assert!(SignedManifest::compose(
+            3,
+            Params::testnet_provisional(),
+            ClaimDelayPosture::Moderate,
+            [(0, 6), (6, 36), (12, 77)],
+            6,
+            3,
+        )
+        .is_ok());
         // min > max
         assert!(SignedManifest::compose(
             3,
@@ -580,13 +701,23 @@ mod tests {
             3,
         )
         .is_err());
-        // jitter wider than the co-funding window
+        // posture minima regress
+        assert!(SignedManifest::compose(
+            3,
+            Params::testnet_provisional(),
+            ClaimDelayPosture::Moderate,
+            [(5, 6), (3, 36), (12, 72)],
+            6,
+            3,
+        )
+        .is_err());
+        // TWO-SIDED jitter must fit the window: per-party 7 => 14 > 12.
         assert!(SignedManifest::compose(
             3,
             Params::testnet_provisional(),
             ClaimDelayPosture::Moderate,
             [(0, 6), (6, 36), (12, 72)],
-            13,
+            7,
             3,
         )
         .is_err());
@@ -692,12 +823,15 @@ mod tests {
         assert_eq!(store.current().version(), 7);
     }
 
+    /// THE regression for the review's high finding: tamper-quarantine must
+    /// NOT reset the monotonic floor — an old validly-signed manifest still
+    /// cannot replay after a fallback.
     #[test]
-    fn tampered_stored_manifest_falls_back_to_provisional() {
+    fn tampered_stored_manifest_falls_back_but_keeps_the_version_floor() {
         let dir = tempfile::tempdir().unwrap();
         {
             let (mut store, _) = ManifestStore::open(dir.path(), &ModeledTrustRoot).unwrap();
-            store.ingest(&signed(2), &ModeledTrustRoot).unwrap();
+            store.ingest(&signed(7), &ModeledTrustRoot).unwrap();
         }
         // Tamper on disk.
         let p = dir.path().join("manifest.current");
@@ -705,22 +839,93 @@ mod tests {
         raw[20] ^= 0x01;
         std::fs::write(&p, &raw).unwrap();
 
-        let (store, report) = ManifestStore::open(dir.path(), &ModeledTrustRoot).unwrap();
+        let (mut store, report) = ManifestStore::open(dir.path(), &ModeledTrustRoot).unwrap();
         assert!(
             matches!(report, ManifestOpenReport::ProvisionalFallback { .. }),
             "got {report:?}"
         );
         assert_eq!(store.current().version(), 0, "must fall back to provisional");
+        assert!(store.is_provisional());
         assert!(!p.exists(), "bad manifest must be quarantined aside");
+
+        // The floor survived the quarantine: every historical version is
+        // still refused — only something NEWER than v7 moves forward.
+        for old in [1u32, 4, 7] {
+            assert!(
+                matches!(
+                    store.ingest(&signed(old), &ModeledTrustRoot).unwrap_err(),
+                    Error::Ordering(_)
+                ),
+                "v{old} must not replay after fallback"
+            );
+        }
+        store.ingest(&signed(8), &ModeledTrustRoot).expect("genuinely newer");
+        assert_eq!(store.current().version(), 8);
+    }
+
+    /// A validly-signed but OLD manifest file restored over the current one
+    /// (rollback-by-file-swap) is detected against the floor at open.
+    #[test]
+    fn restored_old_manifest_file_is_detected_as_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_envelope = signed(2);
+        {
+            let (mut store, _) = ManifestStore::open(dir.path(), &ModeledTrustRoot).unwrap();
+            store.ingest(&old_envelope, &ModeledTrustRoot).unwrap();
+            store.ingest(&signed(6), &ModeledTrustRoot).unwrap();
+        }
+        // Attacker restores the captured v2 file over the v6 one.
+        let p = dir.path().join("manifest.current");
+        std::fs::write(&p, &old_envelope).unwrap();
+
+        let (mut store, report) = ManifestStore::open(dir.path(), &ModeledTrustRoot).unwrap();
+        assert!(
+            matches!(report, ManifestOpenReport::RollbackDetected { floor: 6, .. }),
+            "got {report:?}"
+        );
+        assert!(store.is_provisional(), "rollback runs provisional, not the old params");
+        // And the gate still demands > 6.
+        assert!(store.ingest(&signed(6), &ModeledTrustRoot).is_err());
+        store.ingest(&signed(9), &ModeledTrustRoot).expect("newer");
     }
 
     #[test]
-    fn version_mismatch_refuses_the_swap() {
+    fn second_manifest_store_instance_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_store, _) = ManifestStore::open(dir.path(), &ModeledTrustRoot).unwrap();
+        match ManifestStore::open(dir.path(), &ModeledTrustRoot) {
+            Err(Error::Abort(_)) => {}
+            Err(e) => panic!("wrong error: {e:?}"),
+            Ok(_) => panic!("second instance must be refused"),
+        }
+    }
+
+    #[test]
+    fn version_or_content_mismatch_refuses_the_swap() {
         let dir = tempfile::tempdir().unwrap();
         let (mut store, _) = ManifestStore::open(dir.path(), &ModeledTrustRoot).unwrap();
         store.ingest(&signed(4), &ModeledTrustRoot).unwrap();
-        assert!(!store.refuses_swap_with(4), "equal versions must proceed");
-        assert!(store.refuses_swap_with(3), "older peer refused");
-        assert!(store.refuses_swap_with(5), "newer peer refused (we update first)");
+        let our_id = store.current().id();
+        assert!(
+            !store.refuses_swap_with(4, &our_id),
+            "equal version AND content must proceed"
+        );
+        assert!(store.refuses_swap_with(3, &our_id), "older peer refused");
+        assert!(store.refuses_swap_with(5, &our_id), "newer peer refused (we update first)");
+        // Same version, DIFFERENT content (operator misbehavior / split
+        // trust path): version equality alone must not pass the gate.
+        let divergent = SignedManifest::compose(
+            4,
+            Params::testnet_provisional(),
+            ClaimDelayPosture::Aggressive,
+            [(0, 6), (6, 36), (12, 72)],
+            6,
+            3,
+        )
+        .unwrap();
+        assert!(
+            store.refuses_swap_with(4, &divergent.id()),
+            "same-version divergent-content must refuse"
+        );
     }
 }
