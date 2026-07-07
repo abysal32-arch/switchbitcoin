@@ -912,6 +912,21 @@ impl Possessing {
         final_sig_comp_sh: &ValidatedFinalSig,
         current_height: u32,
     ) -> Result<ClaimPlan> {
+        let comp_sl_final = self.extract_and_complete_claim(final_sig_comp_sh)?;
+        // Bounded randomized decorrelation delay, anchored to the SWEPT escrow's
+        // confirmation height (fixes the co-funding-skew race window).
+        let delay_blocks = sample_claim_delay(self.claim_delay_ceiling(current_height));
+        Ok(ClaimPlan { delay_blocks, comp_sl_final })
+    }
+
+    /// The crypto half of the claim, WITHOUT sampling a delay: extract t (via
+    /// the verified CompletePreSig — G1; t·G==T checked) and complete our own
+    /// leg. The wallet's claim scheduler (rank 5) owns the posture/timing and
+    /// calls this once the reveal is observed. SL only.
+    pub fn extract_and_complete_claim(
+        &self,
+        final_sig_comp_sh: &ValidatedFinalSig,
+    ) -> Result<CompletionSig> {
         let presig_comp_sl = match &self.role_state {
             RoleState::SecretLearner { presig_comp_sl } => presig_comp_sl,
             RoleState::SecretHolder { .. } => {
@@ -920,16 +935,32 @@ impl Possessing {
         };
         // Extraction (review item #2): t = s_final - s_hat, checked t*G == T.
         let t = self.presig_comp_sh.extract_secret(final_sig_comp_sh)?;
-
-        // Bounded randomized decorrelation delay, anchored to the SWEPT escrow's
-        // confirmation height (fixes the co-funding-skew race window).
-        let max_delay = self
-            .params
-            .max_claim_delay(self.sweep_escrow_height, current_height);
-        let delay_blocks = sample_claim_delay(max_delay);
-
         let sig = presig_comp_sl.complete_with(&t)?;
-        Ok(ClaimPlan { delay_blocks, comp_sl_final: CompletionSig(sig) })
+        Ok(CompletionSig(sig))
+    }
+
+    /// The HARD settlement ceiling (blocks) on the claim delay at this reveal
+    /// height — anchored to the escrow WE sweep, NOT the co-funding baseline
+    /// S. A posture-sampled delay MUST NOT exceed this; it is what keeps SL
+    /// confirming strictly before the swept escrow's late refund matures
+    /// (review item #5). Returns 0 when the window is already tight.
+    pub fn claim_delay_ceiling(&self, reveal_height: u32) -> u64 {
+        self.params.max_claim_delay(self.sweep_escrow_height, reveal_height)
+    }
+
+    /// SH ONLY: the policy deadline height by which Comp->SH must CONFIRM —
+    /// `S + Δ_early − Δ_buffer`. The claim scheduler's SH-broadcast routing
+    /// needs the runway (`deadline − tip`) to decide broadcast-vs-refund.
+    pub fn sh_broadcast_deadline(&self) -> Result<u32> {
+        match &self.role_state {
+            RoleState::SecretHolder { .. } => {}
+            RoleState::SecretLearner { .. } => {
+                return Err(Error::Ordering("only SH has a completion-broadcast deadline"))
+            }
+        }
+        // Validated params guarantee delta_buffer < delta_early, so this is
+        // >= s_height and fits u32.
+        Ok(self.s_height + self.params.delta_early - self.params.delta_buffer)
     }
 }
 

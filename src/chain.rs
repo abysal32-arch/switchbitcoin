@@ -90,6 +90,14 @@ pub trait ChainView {
     fn authoritative_funding_height(&self, outpoint: OutPoint) -> Option<u32> {
         self.funding_height(outpoint)
     }
+    /// The 64-byte taproot key-path signature in the witness of the tx
+    /// spending `outpoint` (mempool OR confirmed), if that tx is a key-path
+    /// spend. This is how SL observes Comp->SH's REVEALED final signature the
+    /// instant it appears (mempool-first) — the input to extraction. Default
+    /// `None` for views that don't retain witnesses.
+    fn spending_witness_sig(&self, _outpoint: OutPoint) -> Option<[u8; 64]> {
+        None
+    }
     /// Broadcast a fully-signed tx to the mempool. Enforces funding existence,
     /// relative-timelock maturity, and no-double-spend. Idempotent for a tx
     /// already accepted.
@@ -200,6 +208,17 @@ impl ChainView for SimChain {
         self.0.lock().unwrap().spends.get(&outpoint).map(|(t, _, _)| *t)
     }
 
+    fn spending_witness_sig(&self, outpoint: OutPoint) -> Option<[u8; 64]> {
+        let g = self.0.lock().unwrap();
+        let (txid, _, _) = g.spends.get(&outpoint)?;
+        let tx = g.txs.get(txid)?;
+        // The Comp->SH completion is a taproot key-path spend: witness is a
+        // single 64-byte schnorr signature on its first (only) input.
+        let input = tx.input.iter().find(|i| i.previous_output == outpoint)?;
+        let elem = input.witness.iter().next()?;
+        elem.get(..64)?.try_into().ok()
+    }
+
     fn spend_status(&self, escrow_outpoint: OutPoint) -> SpendStatus {
         match self.0.lock().unwrap().spends.get(&escrow_outpoint) {
             None => SpendStatus::Unspent,
@@ -300,6 +319,9 @@ pub trait ChainSource {
     fn spend_txid(&self, _outpoint: OutPoint) -> Option<Txid> {
         None
     }
+    fn spending_witness_sig(&self, _outpoint: OutPoint) -> Option<[u8; 64]> {
+        None
+    }
     fn broadcast(&self, tx_bytes: &[u8]) -> Result<Txid>;
     /// True iff this source validates compact-block filters against
     /// independently-obtained PoW headers — i.e. it cannot be made to lie about
@@ -335,6 +357,9 @@ impl<C: ChainView> ChainSource for Source<C> {
     }
     fn spend_txid(&self, outpoint: OutPoint) -> Option<Txid> {
         self.view.spend_txid(outpoint)
+    }
+    fn spending_witness_sig(&self, outpoint: OutPoint) -> Option<[u8; 64]> {
+        self.view.spending_witness_sig(outpoint)
     }
     fn broadcast(&self, tx_bytes: &[u8]) -> Result<Txid> {
         self.view.broadcast(tx_bytes)
@@ -507,6 +532,11 @@ impl<A: ChainSource, B: ChainSource> ChainView for DualSourceChainView<A, B> {
     }
     fn authoritative_funding_height(&self, outpoint: OutPoint) -> Option<u32> {
         self.sv().funding_height(outpoint)
+    }
+    fn spending_witness_sig(&self, outpoint: OutPoint) -> Option<[u8; 64]> {
+        // The reveal must come from the authoritative source: a lying
+        // explorer must not be able to feed us a bogus "final signature".
+        self.sv().spending_witness_sig(outpoint)
     }
     fn broadcast(&self, tx_bytes: &[u8]) -> Result<Txid> {
         DualSourceChainView::broadcast(self, tx_bytes)

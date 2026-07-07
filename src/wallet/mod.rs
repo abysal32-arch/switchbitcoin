@@ -39,6 +39,12 @@
 //!     encumbrance verification, co-funding window + Block-X policy, and the
 //!     re-enterable completion-supersedes refund driver. No new crypto.
 
+//!   * `claim_scheduler` — the SL randomized claim-delay scheduler (rank 5):
+//!     posture sampling from the manifest clamped to the hard settlement
+//!     ceiling, mempool-first reveal detection, plus SH broadcast-vs-refund
+//!     runway routing. The primary privacy-vs-liveness dial.
+
+pub mod claim_scheduler;
 pub mod keys;
 pub mod ledger;
 pub mod manifest;
