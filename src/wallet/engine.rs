@@ -41,8 +41,15 @@ use std::path::PathBuf;
 
 /// Everything a swap needs beyond the engine's own stores. Assembled by the
 /// funding/exchange glue from the peer session and the tx builders.
+///
+/// NOTE: the swap_session_id is NOT a field — it is DERIVED internally from
+/// `(our_seckey·G, their_pubkey)` so the engine's SwapStore keys, the
+/// possession pointer, and the settlement layer's possession file (name + seal
+/// TEK, which it derives the same way) are provably the same id. A free
+/// caller-supplied id could diverge (e.g. from the PeerSession routing tag,
+/// which is explicitly NOT the authoritative id) and strand SL after release —
+/// a fund loss (adversarial-review HIGH).
 pub struct SwapContext {
-    pub swap_session_id: [u8; 32],
     pub our_seckey: secp::Scalar,
     pub their_pubkey: ValidatedPoint,
     /// The escrow WE funded — our pre-armed refund spends it.
@@ -139,6 +146,16 @@ impl SwapEngine {
         self.keys.as_ref()
     }
 
+    /// The AUTHORITATIVE swap_session_id, derived exactly as the settlement
+    /// layer derives it (canonical order of `our_pubkey`/`their_pubkey`), so
+    /// the engine's store keys and the settlement possession file always agree.
+    pub fn swap_session_id(ctx: &SwapContext) -> Result<[u8; 32]> {
+        let ours = ctx.our_seckey * secp::G;
+        let theirs = secp::Point::from_slice(&ctx.their_pubkey.to_bytes())
+            .map_err(|_| Error::Validation("engine: invalid counterparty pubkey"))?;
+        crate::settlement::state_machine::swap_session_id(ours, theirs)
+    }
+
     /// Persist the initial `Funding` record for a swap (before any escrow
     /// confirms — the rank-1 G2 rule requires the pre-armed refund present).
     pub fn record_funding(
@@ -148,7 +165,7 @@ impl SwapEngine {
         params: crate::settlement::params::Params,
     ) -> Result<()> {
         self.store.put(&SwapRecord {
-            swap_session_id: ctx.swap_session_id,
+            swap_session_id: Self::swap_session_id(ctx)?,
             role,
             phase: SwapPhase::Funding,
             params,
@@ -175,13 +192,28 @@ impl SwapEngine {
         _chain: &impl ChainView,
     ) -> Result<Possessing> {
         let role = funded.role();
-        let params = self.manifest.current().params().clone();
+        let sid = Self::swap_session_id(ctx)?;
         let possession_path = ctx
             .possession_store
-            .join(format!("{}.possession", hex32(&ctx.swap_session_id)));
+            .join(format!("{}.possession", hex32(&sid)));
+
+        // Reuse the params snapshot agreed at record_funding time — NOT the
+        // live manifest, which a mid-swap update could change and so fail the
+        // immutable-params check on this put (adversarial-review MEDIUM).
+        let funding_rec = self
+            .store
+            .get(&sid)?
+            .ok_or(Error::Ordering("run_exchange before record_funding"))?;
+        let params = funding_rec.params.clone();
+
+        // Funding is confirmed (this is `Funded`), so the pre-encumbrance coin
+        // has been spent whole into our escrow on-chain. Mark it spent NOW so
+        // BOTH the completion and the refund terminal leave the ledger correct
+        // — reconcile can never resurrect it (adversarial-review HIGH).
+        self.ledger.mark_spent(ctx.funding_coin).ok();
 
         self.store.put(&SwapRecord {
-            swap_session_id: ctx.swap_session_id,
+            swap_session_id: sid,
             role,
             phase: SwapPhase::Signing,
             params,
@@ -226,7 +258,7 @@ impl SwapEngine {
         if role == Role::SecretLearner {
             let mut rec = self
                 .store
-                .get(&ctx.swap_session_id)?
+                .get(&sid)?
                 .ok_or(Error::Abort("swap record vanished"))?;
             rec.phase = SwapPhase::Released;
             rec.possession_record = Some(possession_path);
@@ -248,6 +280,25 @@ impl SwapEngine {
         ctx: &SwapContext,
         chain: &impl ChainView,
     ) -> Result<SwapOutcome> {
+        let sid = Self::swap_session_id(ctx)?;
+
+        // Idempotency (adversarial-review): a re-driven settle on an already-
+        // advanced swap must NOT re-run the exchange/broadcast or mis-transition
+        // a terminal record. Short-circuit from the persisted completion tx.
+        let rec0 = self.store.get(&sid)?.ok_or(Error::Abort("record vanished"))?;
+        match rec0.phase {
+            SwapPhase::Completed => {
+                let sig = completion_sig_from(&rec0)?;
+                return Ok(SwapOutcome::Completed { our_final_sig: sig });
+            }
+            SwapPhase::Completing => {
+                // Already broadcast/scheduled: just finalize.
+                let sig = completion_sig_from(&rec0)?;
+                return self.finalize_completed(sid, sig);
+            }
+            _ => {}
+        }
+
         let final_sig = match possessing.role() {
             Role::SecretLearner => {
                 let reveal = match ClaimScheduler::observe_reveal(chain, ctx.reveal_escrow_op) {
@@ -261,10 +312,7 @@ impl SwapEngine {
                 let scheduler = ClaimScheduler::from_manifest(self.manifest.current());
                 let schedule: ScheduledClaim =
                     scheduler.schedule_claim(&possessing, &reveal, chain.tip_height())?;
-                let mut rec = self
-                    .store
-                    .get(&ctx.swap_session_id)?
-                    .ok_or(Error::Abort("record vanished"))?;
+                let mut rec = self.store.get(&sid)?.ok_or(Error::Abort("record vanished"))?;
                 rec.phase = SwapPhase::Completing;
                 rec.completion_tx = Some(schedule.comp_sl_final.0.to_vec());
                 self.store.put(&rec)?;
@@ -280,25 +328,40 @@ impl SwapEngine {
                         return Ok(SwapOutcome::Aborted("broadcast gate closed; refund is the exit"));
                     }
                 };
-                let mut rec = self
-                    .store
-                    .get(&ctx.swap_session_id)?
-                    .ok_or(Error::Abort("record vanished"))?;
+                let mut rec = self.store.get(&sid)?.ok_or(Error::Abort("record vanished"))?;
                 rec.phase = SwapPhase::Completing;
                 rec.completion_tx = Some(sig.0.to_vec());
                 self.store.put(&rec)?;
                 sig.0
             }
         };
+        // (The funding coin was already marked spent in run_exchange, once
+        // funding confirmed — so both this path and the refund path leave the
+        // ledger correct.)
+        self.finalize_completed(sid, final_sig)
+    }
 
-        self.ledger.mark_spent(ctx.funding_coin).ok();
-        let mut rec = self
-            .store
-            .get(&ctx.swap_session_id)?
-            .ok_or(Error::Abort("record vanished"))?;
-        rec.phase = SwapPhase::Completed;
-        self.store.put(&rec)?;
-        Ok(SwapOutcome::Completed { our_final_sig: final_sig })
+    fn finalize_completed(&self, sid: [u8; 32], sig: [u8; 64]) -> Result<SwapOutcome> {
+        let mut rec = self.store.get(&sid)?.ok_or(Error::Abort("record vanished"))?;
+        if rec.phase != SwapPhase::Completed {
+            rec.phase = SwapPhase::Completed;
+            self.store.put(&rec)?;
+        }
+        Ok(SwapOutcome::Completed { our_final_sig: sig })
+    }
+
+    /// Record the refund terminal: the swap unwound to its pre-armed refund.
+    /// Persists `Refunded` (the funding coin was already marked spent in
+    /// `run_exchange`, so the ledger is correct on this path too). Idempotent.
+    pub fn record_refunded(&self, ctx: &SwapContext) -> Result<()> {
+        let sid = Self::swap_session_id(ctx)?;
+        if let Some(mut rec) = self.store.get(&sid)? {
+            if rec.phase == SwapPhase::AbortRefund {
+                rec.phase = SwapPhase::Refunded;
+                self.store.put(&rec)?;
+            }
+        }
+        Ok(())
     }
 
     /// Route to the abort path: persist AbortRefund (unless a completion has
@@ -306,7 +369,8 @@ impl SwapEngine {
     /// Best-effort + idempotent — the refund driver / watchtower owns it from
     /// here, so this never fails the caller.
     fn abort(&self, ctx: &SwapContext) {
-        if let Ok(Some(mut rec)) = self.store.get(&ctx.swap_session_id) {
+        let Ok(sid) = Self::swap_session_id(ctx) else { return };
+        if let Ok(Some(mut rec)) = self.store.get(&sid) {
             if !matches!(rec.phase, SwapPhase::Completed | SwapPhase::Refunded) {
                 rec.phase = SwapPhase::AbortRefund;
                 let _ = self.store.put(&rec);
@@ -324,6 +388,19 @@ impl SwapEngine {
         let observed = ValidatedFinalSig::from_bytes(reveal)?;
         Ok(possessing.extract_and_complete_claim(&observed)?.0)
     }
+}
+
+/// The 64-byte completion signature persisted in a record's `completion_tx`
+/// (the engine stores the raw sig there before broadcast).
+fn completion_sig_from(rec: &SwapRecord) -> Result<[u8; 64]> {
+    let bytes = rec
+        .completion_tx
+        .as_ref()
+        .ok_or(Error::Abort("completed record missing its completion signature"))?;
+    bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| Error::Abort("completion signature is not 64 bytes"))
 }
 
 fn hex32(id: &[u8; 32]) -> String {

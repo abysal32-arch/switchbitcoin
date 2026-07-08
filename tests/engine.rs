@@ -190,7 +190,7 @@ fn full_swap_driven_through_the_engine() {
     engine
         .record_funding(
             &make_ctx(
-                sid, sl.sk, sh.pk, op_comp_sh, op_comp_sl, unit, msg_sh, msg_sl,
+                sl.sk, sh.pk, op_comp_sh, op_comp_sl, unit, msg_sh, msg_sl,
                 sl_refund.clone(), None, root_sh, root_sl, ok_sh, ok_sl,
                 lease_sl.path().to_path_buf(), possession_store.path().to_path_buf(),
                 confirm_watchtower_handoff(&sl_refund, sl_refund.fingerprint()).unwrap(),
@@ -211,7 +211,7 @@ fn full_swap_driven_through_the_engine() {
         .funded_manual(Role::SecretLearner, s_height)
         .unwrap();
     let mut ctx = make_ctx(
-        sid, sl.sk, sh.pk, op_comp_sh, op_comp_sl, unit, msg_sh, msg_sl, sl_refund, None,
+        sl.sk, sh.pk, op_comp_sh, op_comp_sl, unit, msg_sh, msg_sl, sl_refund, None,
         root_sh, root_sl, ok_sh, ok_sl, lease_sl.path().to_path_buf(),
         possession_store.path().to_path_buf(), sl_receipt, funding_coin,
     );
@@ -261,13 +261,12 @@ fn engine_open_recovers_a_crashed_signing_swap() {
     let unit = params.tier_d_sats + params.delta_fee_sats;
     let d = params.tier_d_sats;
     let s_height = 500_000u32;
-    let sid = [0x5Au8; 32];
     let wallet_dir = tempfile::tempdir().unwrap();
 
-    // Onboard + lease a coin to this swap, then leave a Signing record (crash).
-    let funding_coin = onboard_one_coin(wallet_dir.path(), unit, sid);
     let sh = keypair();
     let sl = keypair();
+    // The engine derives the id from the keys — the test must key on the same.
+    let sid = swap_session_id(sl.pk, sh.pk).unwrap();
     let internal =
         swapkey::settlement::state_machine::canonical_internal_key(sh.pk, sl.pk).unwrap();
     let escrow = Escrow::new(&internal, &sl.pk, params.delta_early).unwrap();
@@ -276,6 +275,9 @@ fn engine_open_recovers_a_crashed_signing_swap() {
     let refund = PreArmedRefund::arm(&escrow, op, unit, &sl.sk, dest, d, s_height).unwrap();
     let poss = tempfile::tempdir().unwrap();
     let poss_path = poss.path().join(format!("{}.possession", hex(&sid)));
+
+    // Onboard + lease a coin to this swap, then leave a Signing record (crash).
+    let funding_coin = onboard_one_coin(wallet_dir.path(), unit, sid);
 
     {
         let (engine, _) = SwapEngine::open(
@@ -287,7 +289,7 @@ fn engine_open_recovers_a_crashed_signing_swap() {
         .unwrap();
         // Funding → Signing (SL, possession pointer registered), then "crash".
         let ctx = make_ctx(
-            sid, sl.sk, sh.pk, op, OutPoint::new(txid_from(8), 0), unit, [1u8; 32], [2u8; 32],
+            sl.sk, sh.pk, op, OutPoint::new(txid_from(8), 0), unit, [1u8; 32], [2u8; 32],
             refund.clone(), None, escrow.merkle_root(), escrow.merkle_root(),
             escrow.output_key_xonly(), escrow.output_key_xonly(), poss.path().to_path_buf(),
             poss.path().to_path_buf(),
@@ -339,7 +341,6 @@ fn engine_open_recovers_a_crashed_signing_swap() {
 
 #[allow(clippy::too_many_arguments)]
 fn make_ctx(
-    swap_session_id: [u8; 32],
     our_seckey: Scalar,
     their_pk: Point,
     our_escrow_op: OutPoint,
@@ -359,7 +360,6 @@ fn make_ctx(
     funding_coin: OutPoint,
 ) -> SwapContext {
     SwapContext {
-        swap_session_id,
         our_seckey,
         their_pubkey: ValidatedPoint::from_bytes(&their_pk.serialize()).unwrap(),
         our_escrow_op,
