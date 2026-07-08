@@ -49,9 +49,15 @@
 //!     abandon. Pure LIVENESS policy — it never affects an in-flight swap's
 //!     fund safety (forward-or-refund holds regardless).
 
+//!
+//!   * `watchtower_driver` — own-device watchtower poll loop (dead-device
+//!     refund fire) + the congestion fee-backstop routing (silent for
+//!     refunds, consent-gated for completions), rank 6.
+
 pub mod abort_hygiene;
 pub mod claim_scheduler;
 pub mod keys;
+pub mod watchtower_driver;
 pub mod ledger;
 pub mod manifest;
 pub mod orchestrator;

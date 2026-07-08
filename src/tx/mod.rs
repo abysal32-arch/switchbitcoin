@@ -14,6 +14,7 @@
 //! the exact x-only key the escrow ADDRESS commits to. If those differ, we would
 //! fund an output we cannot spend. It is checked, not assumed.
 
+pub mod backstop;
 pub mod escrow;
 pub mod setup;
 pub mod txbuild;
