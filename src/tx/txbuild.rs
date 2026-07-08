@@ -28,9 +28,37 @@ pub struct SpendTx {
 pub(crate) const TRUC_VERSION: Version = Version(3);
 
 /// The ephemeral anchor output (P2A, BIP336): `OP_1 <0x4e73>`, 0 value. Every
-/// contract tx carries one so a CPFP child can bump it ONLY under a genuine fee
-/// spike beyond the baked-in Δ_fee — a congestion-only, opt-in backstop
-/// (v3.13). On the happy path it is left unspent, so it adds no external link.
+/// contract tx carries one so a CPFP child can bump it under a fee spike
+/// beyond the baked-in Δ_fee. On the happy path it is left unspent.
+///
+/// ⚠ KNOWN-NON-STANDARD — THE #1 TESTNET BLOCKER (adversarial review, CONFIRMED
+/// critical). This 0-value anchor is consistent with the SimChain (which has
+/// no dust/standardness/package-relay policy) but is REJECTED by real Bitcoin
+/// Core 28+: a 0-value output only relays via the ephemeral-dust rule, which
+/// requires the PARENT to pay ZERO fee and be submitted in a package with a
+/// child spending the dust — yet `build_completion`/`build_refund` pay a
+/// POSITIVE baked fee, and the Setup (spending the whole D+Δ_fee into the
+/// escrow) pays ZERO and so can never relay standalone at all. So on a real
+/// node every completion, pre-armed refund, and Setup would be rejected at
+/// submission. Exactly the class of defect the sim cannot surface and the
+/// first testnet broadcast will.
+///
+/// TWO COHERENT FIXES (a fee-model decision to make + testnet-validate; see the
+/// review packet §4.98). Both keep escrows EQUAL across a tier (the privacy
+/// linchpin) since every party uses the same formula:
+///   (a) NON-DUST ANCHOR + FEE SPLIT — give the anchor a standard value
+///       (≥ ~240 sats, the P2A dust floor) and set `escrow_amount = D + Δ_fee
+///       − setup_cost` so the Setup carries a real positive fee. Positive-fee
+///       parents then relay standalone and the CPFP is truly congestion-only.
+///       `build_cpfp_bump` already accepts the real `anchor_value_sats`.
+///   (b) 0-FEE PARENTS + MANDATORY 1P1C — drop the positive-fee guards, keep
+///       the 0-value ephemeral anchor, and ALWAYS submit parent+child as a
+///       package. Then the bump is part of every broadcast, not a backstop.
+/// Scheme (a) matches the spec's "baked-in Δ_fee, congestion-only anchor"
+/// intent. It is left unimplemented here deliberately: the exact values
+/// (anchor size, setup/completion fee split) are testnet-tuned and the
+/// structure cannot be validated against real Core policy in-process, so
+/// hacking it now would give false confidence without testnet.
 pub(crate) fn ephemeral_anchor() -> TxOut {
     TxOut {
         value: Amount::ZERO,

@@ -19,9 +19,11 @@
 //!   * a stalled REFUND bumps SILENTLY — a refund already revealed its leaf,
 //!     so there is no privacy left to protect;
 //!   * a stalled COMPLETION bump LINKS the reserve to the swap, a real
-//!     privacy loss, so it is gated behind explicit consent (`LinkageAck`)
-//!     and, when taken, the swapped output is marked deposit-linked (the
-//!     rank-3 ledger already records the taint).
+//!     privacy loss, so it is gated behind explicit consent (`LinkageAck`).
+//!     CALLER CONTRACT: when a consented completion bump is taken, the caller
+//!     MUST pass `deposit_linked = true` to `ledger::record_swapped_output`
+//!     for that swap's output — the taint is not inferred automatically (the
+//!     tighter lease→output binding is a documented rank-3 follow-up).
 //!
 //! If no reserve is available, a completion falls back to abandon-to-refund
 //! (the pre-armed refund is the always-available exit) — never a stuck coin.
@@ -45,6 +47,7 @@ use bitcoin::OutPoint;
 pub struct WatchtowerDriver {
     tower: Watchtower,
     escrow_outpoint: OutPoint,
+    csv_maturity_height: u32,
 }
 
 /// The outcome of one watchtower poll.
@@ -56,6 +59,16 @@ pub enum WatchtowerTick {
     /// The escrow was unspent at/after CSV maturity: the pre-armed refund was
     /// broadcast THIS tick (dead-device recovery — the owner need not be up).
     FiredRefund,
+    /// The refund is MATURE and should fire, but its baked-in fee is below the
+    /// current relay floor so it could not relay (finding #2/#4 — a congestion
+    /// spike beyond Δ_fee with a dead device). This is NOT terminal and NOT a
+    /// bare error: the outer loop must run the SILENT refund backstop
+    /// (`backstop_decision(StalledTx::Refund, congested=true, …)` →
+    /// `BumpSilently`) to CPFP the refund's anchor from a reserve. The
+    /// watchtower process must therefore be provisioned with a reserve coin
+    /// (or a pre-staged, pre-signed child) so it can act with the primary
+    /// device dead — see the module docs.
+    RefundStalledBelowFeeFloor,
     /// The escrow is confirmed spent (a completion won, or our refund already
     /// confirmed): terminal, nothing more to do.
     StandDown,
@@ -69,8 +82,9 @@ impl WatchtowerDriver {
         escrow_outpoint: OutPoint,
         receipt: &WatchtowerReceipt,
     ) -> Result<Self> {
+        let csv_maturity_height = refund.csv_maturity_height();
         let tower = Watchtower::arm(refund, escrow_outpoint, receipt)?;
-        Ok(WatchtowerDriver { tower, escrow_outpoint })
+        Ok(WatchtowerDriver { tower, escrow_outpoint, csv_maturity_height })
     }
 
     /// One poll of the background loop. Idempotent and crash-safe: it
@@ -83,23 +97,47 @@ impl WatchtowerDriver {
             // keep watching rather than standing down forever.
             SpendStatus::InMempool => Ok(WatchtowerTick::Idle),
             SpendStatus::Unspent => {
-                if self.tower.poll(chain)? {
-                    Ok(WatchtowerTick::FiredRefund)
-                } else {
-                    Ok(WatchtowerTick::Idle)
+                // Not matured yet → nothing to fire (Ok(false) from poll).
+                if chain.tip_height() < self.csv_maturity_height {
+                    return Ok(WatchtowerTick::Idle);
+                }
+                // Matured: try to fire. A broadcast failure here is the
+                // refund's fee falling below the relay floor (congestion
+                // beyond Δ_fee) — surface it as an ACTIONABLE stall the outer
+                // loop routes to the silent backstop, NOT a bare error that
+                // strands the escrow past the deadline with a dead device.
+                match self.tower.poll(chain) {
+                    Ok(true) => Ok(WatchtowerTick::FiredRefund),
+                    Ok(false) => Ok(WatchtowerTick::Idle),
+                    Err(_) => Ok(WatchtowerTick::RefundStalledBelowFeeFloor),
                 }
             }
         }
     }
 }
 
-/// Which contract tx the backstop would bump.
+/// Which contract tx the backstop would bump. The distinction is REVEAL- and
+/// role-aware (finding #5): the safe no-reserve fallback differs by whether an
+/// already-signed refund exit still exists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StalledTx {
-    /// A refund — no privacy left; bump silently.
+    /// A refund — no privacy left; bump silently. If it can't fund, WAIT: the
+    /// CSV never expires and it relays when congestion clears.
     Refund,
-    /// A completion — bumping links the reserve to the swap; needs consent.
-    Completion,
+    /// A Setup that won't confirm. Bumping links the reserve to the escrow
+    /// (privacy loss ⇒ consent). If it can't fund, the escrow simply never
+    /// confirms and the pre-encumbrance coin is untouched — the swap aborts
+    /// before anything is locked. (Its structural 0-fee / mandatory-CPFP
+    /// requirement is the fee-model item in `tx::txbuild` / the review packet.)
+    Setup,
+    /// SH's completion BEFORE it is broadcast — nothing revealed yet, so the
+    /// pre-armed refund is still a safe exit if we can't fund the bump.
+    CompletionUnbroadcast,
+    /// A completion ALREADY on the wire — SH's broadcast Comp→SH, or SL's
+    /// post-reveal claim. There is NO refund for a revealed leg (SL abandoning
+    /// its claim would simply lose D), so we must KEEP FIGHTING (RBF /
+    /// rebroadcast), never abandon.
+    CompletionInFlight,
 }
 
 /// The fee-backstop decision for a stalled contract tx.
@@ -107,60 +145,95 @@ pub enum StalledTx {
 pub enum BackstopAction {
     /// Not congested (or the tx already confirmed): nothing to do.
     None,
-    /// Silent auto-bump — a stalled REFUND carries no privacy, so the
-    /// backstop fires without a prompt. Caller: lease a reserve coin and
-    /// build the CPFP child.
+    /// Silent auto-bump — a stalled REFUND carries no privacy. Caller: lease a
+    /// reserve coin and build the CPFP child.
     BumpSilently,
-    /// A stalled COMPLETION: bumping is a real privacy loss, so surface the
-    /// consent prompt to the user. No bump until a `LinkageAck` is provided.
-    NeedsCompletionConsent,
-    /// Consent given: bump the completion (and record the deposit-link taint
-    /// on the swapped output).
-    BumpCompletion,
-    /// Congested but no reserve coin is available to fund the bump. For a
-    /// completion, the safe fallback is to let the pre-armed refund reclaim
-    /// (abandon-to-refund) — never a stuck coin. For a refund, keep
-    /// retrying/waiting for congestion to clear.
-    NoReserveAvailable,
+    /// A stalled Setup/completion: bumping links the reserve to the swap (a
+    /// privacy loss), so surface the consent prompt. No bump until a
+    /// `LinkageAck` is provided.
+    NeedsConsent,
+    /// Consent given: bump (and record the deposit-link taint on the swapped
+    /// output for a completion — see `ledger::record_swapped_output`).
+    BumpConsented,
+    /// REFUND, no reserve: keep waiting — the CSV won't expire and it relays
+    /// once congestion clears. Safe (no stuck coin, no missed deadline).
+    KeepWaiting,
+    /// UNBROADCAST completion, no reserve: abandon to the pre-armed refund
+    /// (the always-available exit). Safe ONLY because nothing was revealed.
+    FallbackToRefund,
+    /// IN-FLIGHT completion / SL claim, no reserve: NEVER abandon — the leg is
+    /// RBF-able and timelock-free and stays valid, so rebroadcast / fee-fight
+    /// until it confirms. (Winning may need the reserve; this is the honest
+    /// "no reserve, keep trying" state, not a stuck coin.)
+    KeepFighting,
+    /// SETUP, no reserve: the escrow will not confirm; the pre-encumbrance
+    /// coin is untouched, so abort the swap cleanly before any lock.
+    AbortBeforeLock,
 }
 
 /// Decide the backstop action for a stalled tx. Pure; the wallet layer wires
-/// this to `ledger::lease_reserve` (which itself re-checks the `LinkageAck`
-/// for a completion) and `tx::backstop::build_cpfp_bump`.
+/// this to `ledger::lease_reserve` (which re-checks the `LinkageAck` for a
+/// consented bump) and `tx::backstop::build_cpfp_bump`.
 ///
-/// `congested` is the "this contract tx cannot currently relay / is stalled
-/// below the fee floor" signal from the chain view. `reserve_available` is
-/// whether the ledger holds a leasable reserve coin.
+/// `congested` = "this tx cannot currently relay / is below the fee floor."
+/// `reserve_available` = the ledger holds a reserve coin big enough for the
+/// currently-required child fee (the caller computes sufficiency — finding #9).
 pub fn backstop_decision(
     kind: StalledTx,
     congested: bool,
     reserve_available: bool,
-    completion_consent: Option<&LinkageAck>,
+    consent: Option<&LinkageAck>,
 ) -> BackstopAction {
     if !congested {
         return BackstopAction::None;
     }
-    if !reserve_available {
-        return BackstopAction::NoReserveAvailable;
-    }
     match kind {
-        StalledTx::Refund => BackstopAction::BumpSilently,
-        StalledTx::Completion => {
-            if completion_consent.is_some() {
-                BackstopAction::BumpCompletion
+        StalledTx::Refund => {
+            if reserve_available {
+                BackstopAction::BumpSilently
             } else {
-                BackstopAction::NeedsCompletionConsent
+                BackstopAction::KeepWaiting
+            }
+        }
+        StalledTx::Setup => {
+            if !reserve_available {
+                BackstopAction::AbortBeforeLock
+            } else if consent.is_some() {
+                BackstopAction::BumpConsented
+            } else {
+                BackstopAction::NeedsConsent
+            }
+        }
+        StalledTx::CompletionUnbroadcast => {
+            if !reserve_available {
+                BackstopAction::FallbackToRefund
+            } else if consent.is_some() {
+                BackstopAction::BumpConsented
+            } else {
+                BackstopAction::NeedsConsent
+            }
+        }
+        StalledTx::CompletionInFlight => {
+            if !reserve_available {
+                BackstopAction::KeepFighting
+            } else if consent.is_some() {
+                BackstopAction::BumpConsented
+            } else {
+                BackstopAction::NeedsConsent
             }
         }
     }
 }
 
-/// The `BumpTarget` a `StalledTx` maps to, for `ledger::lease_reserve`
-/// (refund bumps are silent; completion bumps demand the linkage ack).
+/// The `BumpTarget` a `StalledTx` maps to for `ledger::lease_reserve`. A
+/// refund bump is silent; a Setup or completion bump links the reserve to the
+/// swap and so goes through the completion consent gate.
 pub fn bump_target(kind: StalledTx) -> BumpTarget {
     match kind {
         StalledTx::Refund => BumpTarget::Refund,
-        StalledTx::Completion => BumpTarget::Completion,
+        StalledTx::Setup | StalledTx::CompletionUnbroadcast | StalledTx::CompletionInFlight => {
+            BumpTarget::Completion
+        }
     }
 }
 
@@ -250,43 +323,85 @@ mod tests {
     }
 
     #[test]
-    fn backstop_refund_bumps_silently_completion_needs_consent() {
-        // Not congested: no bump.
-        assert_eq!(
-            backstop_decision(StalledTx::Refund, false, true, None),
-            BackstopAction::None
-        );
-        // Congested refund with reserve: silent auto-bump (no privacy to lose).
-        assert_eq!(
-            backstop_decision(StalledTx::Refund, true, true, None),
-            BackstopAction::BumpSilently
-        );
-        // Congested completion, no consent yet: surface the prompt.
-        assert_eq!(
-            backstop_decision(StalledTx::Completion, true, true, None),
-            BackstopAction::NeedsCompletionConsent
-        );
-        // With the typed consent: bump.
+    fn backstop_routing_is_reveal_and_role_aware() {
         let ack = acknowledge_linkage(LINKAGE_WARNING).unwrap();
+
+        // Not congested: no bump.
+        assert_eq!(backstop_decision(StalledTx::Refund, false, true, None), BackstopAction::None);
+
+        // Refund: silent with reserve; safe KEEP-WAITING without (CSV won't
+        // expire) — never a bare stall.
+        assert_eq!(backstop_decision(StalledTx::Refund, true, true, None), BackstopAction::BumpSilently);
+        assert_eq!(backstop_decision(StalledTx::Refund, true, false, None), BackstopAction::KeepWaiting);
+
+        // Consent gating for anything that links the reserve to the swap.
         assert_eq!(
-            backstop_decision(StalledTx::Completion, true, true, Some(&ack)),
-            BackstopAction::BumpCompletion
+            backstop_decision(StalledTx::CompletionUnbroadcast, true, true, None),
+            BackstopAction::NeedsConsent
         );
-        // Congested but no reserve: cannot bump (completion falls back to
-        // the pre-armed refund; never a stuck coin).
         assert_eq!(
-            backstop_decision(StalledTx::Completion, true, false, Some(&ack)),
-            BackstopAction::NoReserveAvailable
+            backstop_decision(StalledTx::CompletionUnbroadcast, true, true, Some(&ack)),
+            BackstopAction::BumpConsented
+        );
+
+        // THE finding-#5 fix: an UNBROADCAST completion with no reserve may
+        // abandon to its pre-armed refund (nothing revealed) — but an
+        // IN-FLIGHT completion / SL claim must NEVER abandon (no refund exists
+        // for a revealed leg); it keeps fighting.
+        assert_eq!(
+            backstop_decision(StalledTx::CompletionUnbroadcast, true, false, Some(&ack)),
+            BackstopAction::FallbackToRefund
         );
         assert_eq!(
-            backstop_decision(StalledTx::Refund, true, false, None),
-            BackstopAction::NoReserveAvailable
+            backstop_decision(StalledTx::CompletionInFlight, true, false, Some(&ack)),
+            BackstopAction::KeepFighting
+        );
+
+        // Setup: consent-gated; no reserve ⇒ abort before anything locks.
+        assert_eq!(
+            backstop_decision(StalledTx::Setup, true, false, None),
+            BackstopAction::AbortBeforeLock
+        );
+        assert_eq!(
+            backstop_decision(StalledTx::Setup, true, true, Some(&ack)),
+            BackstopAction::BumpConsented
         );
     }
 
     #[test]
     fn bump_target_maps_kind_to_ledger_consent() {
         assert_eq!(bump_target(StalledTx::Refund), BumpTarget::Refund);
-        assert_eq!(bump_target(StalledTx::Completion), BumpTarget::Completion);
+        assert_eq!(bump_target(StalledTx::Setup), BumpTarget::Completion);
+        assert_eq!(bump_target(StalledTx::CompletionUnbroadcast), BumpTarget::Completion);
+        assert_eq!(bump_target(StalledTx::CompletionInFlight), BumpTarget::Completion);
+    }
+
+    /// The G2 fee-floor fix (finding #2/#4): a matured refund that can't relay
+    /// under congestion surfaces as an actionable stall, not a bare error.
+    #[test]
+    fn matured_refund_below_fee_floor_surfaces_as_actionable_stall() {
+        let escrow = op(5);
+        let maturity = 600_144u32;
+        let chain = SimChain::new(600_000);
+        chain.fund_with_amount(escrow, 600_000, 1_000_000);
+        // A refund whose baked-in fee is small.
+        let refund =
+            PreArmedRefund::from_signed_tx(spend_of(escrow, 999_000, Some(144)), maturity).unwrap();
+        let receipt = confirm_watchtower_handoff(&refund, refund.fingerprint()).unwrap();
+        let driver = WatchtowerDriver::arm(refund, escrow, &receipt).unwrap();
+
+        while chain.tip_height() < maturity {
+            chain.mine();
+        }
+        // Congestion floor above the refund's fee: broadcast would be rejected.
+        chain.set_congestion(50_000);
+        assert_eq!(
+            driver.tick(&chain).unwrap(),
+            WatchtowerTick::RefundStalledBelowFeeFloor,
+            "a congested matured refund must be an actionable stall, not a bare Err"
+        );
+        // Congestion clears: it fires.
+        chain.set_congestion(0);
+        assert_eq!(driver.tick(&chain).unwrap(), WatchtowerTick::FiredRefund);
     }
 }

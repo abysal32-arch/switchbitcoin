@@ -29,6 +29,15 @@ use bitcoin::{absolute, Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn
 
 /// P2TR dust threshold (sats) for the child's change output.
 const DUST_SATS: u64 = 330;
+/// Absurd-fee ceiling for a single bump child (defense against a buggy fee
+/// estimate burning a whole reserve coin as fee — finding #12). Generous
+/// headroom over any realistic CPFP; a real bump is a few thousand sats.
+const MAX_BUMP_FEE_SATS: u64 = 200_000;
+
+/// Anchor-output invariant, shared with `tx::txbuild`: every contract tx
+/// carries its ephemeral anchor as its LAST output. The completion/refund/
+/// setup builders all place it at vout 1.
+pub const ANCHOR_VOUT: u32 = 1;
 
 /// An unsigned CPFP bump: the child tx plus the sighash to sign for its
 /// reserve input (input 1). Input 0 is the keyless anchor (empty witness).
@@ -43,30 +52,68 @@ impl CpfpBump {
     }
 }
 
+/// The child vsize a caller uses to size the fee: 2 inputs (a keyless P2A
+/// anchor with an empty witness, and one P2TR key-path input ≈ 57.5 vB) plus
+/// one P2TR output, TRUC v3. ≈ 111 vB; rounded up for the caller's headroom.
+pub const CHILD_VSIZE_VB: u64 = 120;
+
+/// The child fee a caller must pay so the PARENT+CHILD PACKAGE clears
+/// `target_feerate_sat_vb` — CPFP acceptance is on the package feerate, not
+/// the child's own (finding #8). `parent_fee_sats`/`parent_vsize_vb` describe
+/// the stalled parent. Total; saturates rather than under/overflowing.
+pub fn required_child_fee(
+    target_feerate_sat_vb: u64,
+    parent_fee_sats: u64,
+    parent_vsize_vb: u64,
+) -> u64 {
+    let package_vsize = parent_vsize_vb.saturating_add(CHILD_VSIZE_VB);
+    let needed_total = target_feerate_sat_vb.saturating_mul(package_vsize);
+    needed_total.saturating_sub(parent_fee_sats)
+}
+
 /// Build the anchor+reserve CPFP child that bumps `parent_anchor` (the
-/// parent's `(txid, anchor_vout)`), paying `child_fee_sats` of fee out of the
-/// reserve coin. Returns the unsigned child + the reserve-input sighash to
-/// sign. Total; refuses a fee that would leave a dust/negative change.
+/// parent's `(txid, ANCHOR_VOUT)`), paying `child_fee_sats` out of the reserve
+/// coin. `anchor_value_sats` MUST equal the parent anchor output's real value
+/// (0 under the current ephemeral-anchor stand-in; the future standard anchor
+/// carries a non-dust value — see the fee-model note in `tx::txbuild`) so the
+/// prevout the sighash commits to matches consensus (finding #6). The anchor
+/// value is added to the child's input total. Total; refuses an absurd fee, a
+/// non-anchor vout, or a fee that would leave dust/negative change.
 pub fn build_cpfp_bump(
     parent_anchor: OutPoint,
+    anchor_value_sats: u64,
     reserve_outpoint: OutPoint,
     reserve_amount_sats: u64,
     reserve_xonly: [u8; 32],
     child_fee_sats: u64,
     dest_spk: ScriptBuf,
 ) -> Result<CpfpBump> {
+    // The anchor is always the parent's LAST output; a wrong vout would
+    // reference a non-existent/other output and yield a consensus-invalid
+    // child that fails only at broadcast.
+    if parent_anchor.vout != ANCHOR_VOUT {
+        return Err(Error::Validation("cpfp: parent anchor must be the last (anchor) output"));
+    }
     if child_fee_sats == 0 {
         return Err(Error::Validation("bump fee must be positive"));
     }
-    let child_out = reserve_amount_sats
+    if child_fee_sats > MAX_BUMP_FEE_SATS {
+        return Err(Error::Validation("bump fee exceeds the absurd-fee ceiling"));
+    }
+    // Input total = anchor value + reserve; child pays the fee out of it.
+    let input_total = anchor_value_sats
+        .checked_add(reserve_amount_sats)
+        .ok_or(Error::Validation("cpfp: input total overflow"))?;
+    let child_out = input_total
         .checked_sub(child_fee_sats)
         .ok_or(Error::Validation("bump fee exceeds the reserve amount"))?;
     if child_out < DUST_SATS {
         return Err(Error::Validation("bump would leave a dust/empty change output"));
     }
 
-    // Prevouts, in input order: [P2A anchor (0 value), reserve (P2TR)].
-    let anchor_prevout = ephemeral_anchor();
+    // Prevouts, in input order: [P2A anchor (its real value), reserve (P2TR)].
+    let mut anchor_prevout = ephemeral_anchor();
+    anchor_prevout.value = Amount::from_sat(anchor_value_sats);
     let reserve_spk = pre_encumbrance_spk(reserve_xonly)?;
     let reserve_prevout = TxOut {
         value: Amount::from_sat(reserve_amount_sats),
@@ -140,8 +187,10 @@ mod tests {
         let child_fee = 8_000u64;
         let dest = pre_encumbrance_spk([2u8; 32]).unwrap();
 
+        let anchor_value = 330u64; // exercise a real (non-zero) anchor value
         let bump = build_cpfp_bump(
-            op(0xA0, 1), // parent anchor at vout 1
+            op(0xA0, ANCHOR_VOUT), // parent anchor at the last output
+            anchor_value,
             op(0xB0, 0), // reserve UTXO
             reserve_amount,
             reserve_xonly,
@@ -149,7 +198,7 @@ mod tests {
             dest,
         )
         .unwrap();
-        assert_eq!(bump.child_output_sats(), reserve_amount - child_fee);
+        assert_eq!(bump.child_output_sats(), reserve_amount + anchor_value - child_fee);
 
         // Sign the reserve input through the same tweaked-key path the wallet
         // uses, then verify bitcoin-side against the reserve OUTPUT key.
@@ -173,16 +222,29 @@ mod tests {
     }
 
     #[test]
-    fn rejects_dust_and_over_fee() {
+    fn rejects_dust_over_fee_absurd_fee_and_wrong_vout() {
         let mut rng = rand::rng();
         let xonly = (secp::Scalar::random(&mut rng) * secp::G).serialize_xonly();
         let dest = pre_encumbrance_spk((secp::Scalar::random(&mut rng) * secp::G).serialize_xonly())
             .unwrap();
-        // Fee exceeds reserve.
-        assert!(build_cpfp_bump(op(1, 1), op(2, 0), 1_000, xonly, 2_000, dest.clone()).is_err());
+        // Fee exceeds reserve (+anchor 0).
+        assert!(build_cpfp_bump(op(1, ANCHOR_VOUT), 0, op(2, 0), 1_000, xonly, 2_000, dest.clone()).is_err());
         // Fee leaves sub-dust change.
-        assert!(build_cpfp_bump(op(1, 1), op(2, 0), 1_000, xonly, 800, dest.clone()).is_err());
+        assert!(build_cpfp_bump(op(1, ANCHOR_VOUT), 0, op(2, 0), 1_000, xonly, 800, dest.clone()).is_err());
         // Zero fee.
-        assert!(build_cpfp_bump(op(1, 1), op(2, 0), 1_000, xonly, 0, dest).is_err());
+        assert!(build_cpfp_bump(op(1, ANCHOR_VOUT), 0, op(2, 0), 1_000, xonly, 0, dest.clone()).is_err());
+        // Absurd fee (over the ceiling), even with a huge reserve.
+        assert!(build_cpfp_bump(op(1, ANCHOR_VOUT), 0, op(2, 0), 10_000_000, xonly, 300_000, dest.clone()).is_err());
+        // Wrong vout (anchor is always the last output).
+        assert!(build_cpfp_bump(op(1, 0), 0, op(2, 0), 100_000, xonly, 5_000, dest).is_err());
+    }
+
+    #[test]
+    fn required_child_fee_covers_the_package_shortfall() {
+        // Parent 150 vB paid 300 sat (2 sat/vB); we want 10 sat/vB.
+        // package = 150 + 120 = 270 vB; needed = 2700; child pays 2700 - 300.
+        assert_eq!(required_child_fee(10, 300, 150), 2_400);
+        // Parent already over target → child pays nothing extra.
+        assert_eq!(required_child_fee(1, 10_000, 150), 0);
     }
 }

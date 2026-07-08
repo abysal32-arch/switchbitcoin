@@ -183,6 +183,52 @@ Req 1 mandates **libsecp256k1-zkp** (Blockstream fork, MuSig2+adaptor in one aud
 
 ---
 
+## 4.98 ⚠ THE #1 TESTNET BLOCKER — fee/anchor model is non-standard on real Core
+
+An adversarial review of the fee-backstop layer surfaced a **CONFIRMED
+CRITICAL** that the in-process sim structurally cannot catch, because `SimChain`
+models consensus *physics* (single-spend, CSV, RBF, a congestion min-fee) but
+has **no dust / standardness / package-relay policy** — which is precisely the
+layer this defect lives in.
+
+**The defect.** Every contract tx carries a **0-value P2A ephemeral anchor**
+(`OP_1 <0x4e73>`) as its last output, while `build_completion`/`build_refund`
+pay a **positive** baked fee. Under Bitcoin Core 28+, a 0-value (sub-dust)
+output only relays via the *ephemeral-dust* rule, which requires the parent to
+pay **zero** fee and be submitted in a **package** with a child that spends the
+dust. A positive-fee parent carrying a 0-value output is just **dust → rejected
+at submission**. So on a real node:
+
+- every **completion** and every **pre-armed refund** would be rejected before
+  fee evaluation — including the **G2 dead-device refund fire**, which is the
+  crash-safety guarantee the whole watchtower exists for;
+- the **Setup** is worse: spending the whole `D+Δ_fee` pre-encumbrance UTXO into
+  the escrow, it pays **zero** fee and so can never relay standalone at all —
+  it *requires* a mandatory CPFP child, not a congestion-only one.
+
+**Why it is not "fixed" in code.** Two coherent schemes resolve it; both keep
+escrows equal across a tier (the privacy linchpin). Scheme **(a)** — a non-dust
+anchor (≥ ~240 sats) plus `escrow_amount = D + Δ_fee − setup_cost` so every
+parent (Setup included) carries a real positive fee and relays standalone, CPFP
+truly congestion-only. Scheme **(b)** — LN-style 0-fee parents with a mandatory
+1P1C package on every broadcast. **The exact values (anchor size, the
+setup/completion fee split, target package feerate) are testnet-tuned, and the
+structure cannot be validated against real Core policy in-process.** Rewriting
+the fee model now would change the escrow amount and cascade through onboarding,
+funding, and the drivers while giving *false confidence* — "changed" but still
+unproven against the one thing (a real node) that decides it. So it is left as a
+**loudly-flagged known-defect** (`tx::txbuild::ephemeral_anchor` doc) rather than
+a hasty rewrite. **This must be resolved and validated on the first testnet
+broadcast, before any real funds.** Recommendation: scheme (a).
+
+The nine *other* review findings (bump-construction robustness, reveal/role-aware
+backstop routing, the dead-device fee-floor stall → actionable
+`RefundStalledBelowFeeFloor`, absurd-fee ceiling, anchor-value plumbing,
+package-feerate helper) were **fixed and regression-tested** — they are correct
+regardless of which fee scheme is chosen.
+
+---
+
 ## 4.99 Cross-cutting invariant audit (forward-or-refund)
 
 Beyond the per-module adversarial reviews, the whole built system was audited
