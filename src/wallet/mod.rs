@@ -54,8 +54,15 @@
 //!     refund fire) + the congestion fee-backstop routing (silent for
 //!     refunds, consent-gated for completions), rank 6.
 
+//!
+//!   * `engine` — the swap engine (rank 7): the wallet's core loop that
+//!     composes every rank into one driven, crash-recoverable swap lifecycle
+//!     (funded → exchange → settle), persisting the SwapRecord through every
+//!     phase and reconciling the ledger. The integration layer over the parts.
+
 pub mod abort_hygiene;
 pub mod claim_scheduler;
+pub mod engine;
 pub mod keys;
 pub mod watchtower_driver;
 pub mod ledger;
