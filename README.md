@@ -1,4 +1,4 @@
-# New Key Protocol — Settlement-Core Scaffold (v3.16)
+# Swap Key Protocol — Settlement-Core Scaffold (v3.16)
 
 This is the **step-1/step-2 reference scaffold** from the v3.16 build sequence:
 pinned crypto + validation gate + nonce invariants + settlement core, with

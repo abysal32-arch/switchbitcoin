@@ -13,16 +13,16 @@
 //!            (zero change), confirmed on the sim.
 
 use bitcoin::OutPoint;
-use newkey::chain::{ChainView, SimChain, SpendStatus};
-use newkey::settlement::params::Params;
-use newkey::tx::escrow::Escrow;
-use newkey::tx::setup::build_setup;
-use newkey::wallet::keys::{KeyPurpose, KeySource, ModeledKeySource};
-use newkey::wallet::ledger::{
+use swapkey::chain::{ChainView, SimChain, SpendStatus};
+use swapkey::settlement::params::Params;
+use swapkey::tx::escrow::Escrow;
+use swapkey::tx::setup::build_setup;
+use swapkey::wallet::keys::{KeyPurpose, KeySource, ModeledKeySource};
+use swapkey::wallet::ledger::{
     acknowledge_phase0, CoinClass, CoinState, Ledger, WalletClock, PHASE0_WARNING,
 };
-use newkey::wallet::ModeledEnclave;
-use newkey::Error;
+use swapkey::wallet::ModeledEnclave;
+use swapkey::Error;
 
 struct FixedClock(u64);
 impl WalletClock for FixedClock {
@@ -121,7 +121,7 @@ fn deposit_split_bump_delay_setup_escrow_end_to_end() {
     let funder_sk = keys.derive_seckey(coin.key_purpose, coin.key_index).unwrap();
     let mut rng = rand::rng();
     let peer_sk = secp::Scalar::random(&mut rng);
-    let internal = newkey::settlement::state_machine::canonical_internal_key(
+    let internal = swapkey::settlement::state_machine::canonical_internal_key(
         funder_sk * secp::G,
         peer_sk * secp::G,
     )

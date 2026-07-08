@@ -1,5 +1,5 @@
 [package]
-name = "newkey-fuzz"
+name = "swapkey-fuzz"
 version = "0.0.0"
 edition = "2021"
 publish = false
@@ -14,7 +14,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 
-[dependencies.newkey]
+[dependencies.swapkey]
 path = ".."
 
 [[bin]]

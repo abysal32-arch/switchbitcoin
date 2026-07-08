@@ -1,8 +1,8 @@
 [package]
-name = "newkey"
+name = "swapkey"
 version = "0.0.1"
 edition = "2021"
-description = "New Key Protocol — settlement-core reference scaffold (v3.16). NOT production. Fill against real libsecp256k1-zkp."
+description = "Swap Key Protocol — settlement-core reference scaffold (v3.16). NOT production. Fill against real libsecp256k1-zkp."
 license = "MIT OR Apache-2.0"
 publish = false
 

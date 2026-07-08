@@ -5,19 +5,19 @@
 //! late refund matures.
 
 use bitcoin::OutPoint;
-use newkey::chain::{ChainView, SimChain, SpendStatus};
-use newkey::crypto::adaptor::AdaptorSecret;
-use newkey::crypto::ValidatedPoint;
-use newkey::settlement::params::Params;
-use newkey::settlement::refund::{confirm_watchtower_handoff, PreArmedRefund};
-use newkey::settlement::state_machine::{
+use swapkey::chain::{ChainView, SimChain, SpendStatus};
+use swapkey::crypto::adaptor::AdaptorSecret;
+use swapkey::crypto::ValidatedPoint;
+use swapkey::settlement::params::Params;
+use swapkey::settlement::refund::{confirm_watchtower_handoff, PreArmedRefund};
+use swapkey::settlement::state_machine::{
     ExchangeInputs, Funding, PeerSession, Role, Transport,
 };
-use newkey::tx::escrow::Escrow;
-use newkey::tx::txbuild::{build_completion, finalize_key_spend};
-use newkey::wallet::claim_scheduler::{ClaimBroadcast, ClaimScheduler};
-use newkey::wallet::manifest::{ClaimDelayPosture, SignedManifest};
-use newkey::{Error, Result};
+use swapkey::tx::escrow::Escrow;
+use swapkey::tx::txbuild::{build_completion, finalize_key_spend};
+use swapkey::wallet::claim_scheduler::{ClaimBroadcast, ClaimScheduler};
+use swapkey::wallet::manifest::{ClaimDelayPosture, SignedManifest};
+use swapkey::{Error, Result};
 use secp::{Point, Scalar};
 use std::sync::mpsc;
 
@@ -77,7 +77,7 @@ fn sl_claim_is_posture_delayed_reveal_observed_and_bound_holds() {
     let sh = keypair();
     let sl = keypair();
     let internal =
-        newkey::settlement::state_machine::canonical_internal_key(sh.pk, sl.pk).unwrap();
+        swapkey::settlement::state_machine::canonical_internal_key(sh.pk, sl.pk).unwrap();
     let escrow_comp_sh = Escrow::new(&internal, &sl.pk, params.delta_early).unwrap(); // E_sl
     let escrow_comp_sl = Escrow::new(&internal, &sh.pk, delta_late).unwrap(); // E_sh
     let op_comp_sh = OutPoint::new(txid_from(2), 0); // E_sl (SH sweeps)

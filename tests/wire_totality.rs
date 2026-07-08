@@ -5,9 +5,9 @@
 //!
 //! Raise PROPTEST_CASES in CI to hammer harder (e.g. PROPTEST_CASES=1000000).
 
-use newkey::wire::{parse_message, serialize_message, Message};
-use newkey::crypto::{ValidatedPartial, ValidatedPoint, ValidatedPubNonce};
-use newkey::crypto::adaptor::AdaptorPoint;
+use swapkey::wire::{parse_message, serialize_message, Message};
+use swapkey::crypto::{ValidatedPartial, ValidatedPoint, ValidatedPubNonce};
+use swapkey::crypto::adaptor::AdaptorPoint;
 use proptest::prelude::*;
 use secp::{Scalar, G};
 

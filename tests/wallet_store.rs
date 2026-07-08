@@ -19,18 +19,18 @@
 //! put(Completing) before broadcast.
 
 use bitcoin::{OutPoint, Txid};
-use newkey::chain::{ChainView, SimChain, SpendStatus};
-use newkey::crypto::adaptor::AdaptorSecret;
-use newkey::crypto::{ValidatedFinalSig, ValidatedPoint};
-use newkey::settlement::params::Params;
-use newkey::settlement::refund::{confirm_watchtower_handoff, PreArmedRefund};
-use newkey::settlement::state_machine::{
+use swapkey::chain::{ChainView, SimChain, SpendStatus};
+use swapkey::crypto::adaptor::AdaptorSecret;
+use swapkey::crypto::{ValidatedFinalSig, ValidatedPoint};
+use swapkey::settlement::params::Params;
+use swapkey::settlement::refund::{confirm_watchtower_handoff, PreArmedRefund};
+use swapkey::settlement::state_machine::{
     swap_session_id, ExchangeInputs, Funding, PeerSession, Possessing, Role, Transport,
 };
-use newkey::tx::escrow::Escrow;
-use newkey::tx::txbuild::{build_completion, finalize_key_spend};
-use newkey::wallet::{ModeledEnclave, RecoveryAction, SwapPhase, SwapRecord, SwapStore};
-use newkey::{Error, Result};
+use swapkey::tx::escrow::Escrow;
+use swapkey::tx::txbuild::{build_completion, finalize_key_spend};
+use swapkey::wallet::{ModeledEnclave, RecoveryAction, SwapPhase, SwapRecord, SwapStore};
+use swapkey::{Error, Result};
 use secp::{Point, Scalar};
 use std::sync::mpsc;
 
@@ -95,7 +95,7 @@ fn sl_crash_in_g1_window_recovers_from_store_and_claims() {
     let delta_late = u32::try_from(params.delta_late()).unwrap();
 
     let internal =
-        newkey::settlement::state_machine::canonical_internal_key(sh.pk, sl.pk).unwrap();
+        swapkey::settlement::state_machine::canonical_internal_key(sh.pk, sl.pk).unwrap();
     let escrow_comp_sh = Escrow::new(&internal, &sl.pk, params.delta_early).expect("E_sl");
     let escrow_comp_sl = Escrow::new(&internal, &sh.pk, delta_late).expect("E_sh");
     let op_comp_sh = OutPoint::new(txid_from(2), 0); // SL-funded
@@ -282,7 +282,7 @@ fn crash_mid_signing_reclaims_via_persisted_refund() {
     let d = params.tier_d_sats;
 
     let internal =
-        newkey::settlement::state_machine::canonical_internal_key(sh.pk, sl.pk).unwrap();
+        swapkey::settlement::state_machine::canonical_internal_key(sh.pk, sl.pk).unwrap();
     // SL's escrow (E_sl): early refund leaf keyed to SL.
     let escrow = Escrow::new(&internal, &sl.pk, params.delta_early).expect("E_sl");
     let op = OutPoint::new(txid_from(9), 0);

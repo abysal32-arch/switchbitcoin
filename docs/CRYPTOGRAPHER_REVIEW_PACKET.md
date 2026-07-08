@@ -1,4 +1,4 @@
-# New Key Protocol — External Cryptographer Review Packet
+# Swap Key Protocol — External Cryptographer Review Packet
 
 **Artifact:** settlement-core reference scaffold (Rust crate `newkey` v0.0.1), spec baseline v3.13–v3.16
 **Path:** `C:\Users\Joe\Desktop\swap key\newkey-scaffold`
@@ -9,7 +9,7 @@
 
 ## 1. Purpose — why this is the hard gate
 
-The New Key Protocol settles a two-party coin swap through a **novel composition** of four primitives that individually are well-understood but whose *interaction* is load-bearing and unaudited:
+The Swap Key Protocol settles a two-party coin swap through a **novel composition** of four primitives that individually are well-understood but whose *interaction* is load-bearing and unaudited:
 
 1. **Adaptor-signature settlement** — a MuSig2 pre-signature adaptor-shifted by `T = t·G`; broadcasting the completion reveals `s_final`, from which the counterparty extracts `t` and claims.
 2. **Possession gating (G1)** — the Secret-Learner (SL) releases its single enabling partial *only after* it holds a verified complete pre-signature for the transaction it must later extract from, so "the other party can broadcast" and "I can already extract" become simultaneous.

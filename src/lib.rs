@@ -1,6 +1,6 @@
-//! New Key Protocol — settlement-core reference scaffold.
+//! Swap Key Protocol — settlement-core reference scaffold.
 //!
-//! Corresponds to New Key Protocol Specification **v3.16**, build sequence step 1–2:
+//! Corresponds to Swap Key Protocol Specification **v3.16**, build sequence step 1–2:
 //! pinned crypto + validation gate + nonce-lifecycle invariants + settlement core,
 //! with discovery STUBBED (peers fed to each other manually — Requirement 5).
 //!

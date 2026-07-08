@@ -12,16 +12,16 @@
 //!   * Comp->SL spends the SH-funded escrow (refund CSV = delta_late).
 
 use bitcoin::OutPoint;
-use newkey::crypto::adaptor::AdaptorSecret;
-use newkey::crypto::{ValidatedFinalSig, ValidatedPoint};
-use newkey::settlement::params::Params;
-use newkey::settlement::refund::{confirm_watchtower_handoff, PreArmedRefund};
-use newkey::settlement::state_machine::{
+use swapkey::crypto::adaptor::AdaptorSecret;
+use swapkey::crypto::{ValidatedFinalSig, ValidatedPoint};
+use swapkey::settlement::params::Params;
+use swapkey::settlement::refund::{confirm_watchtower_handoff, PreArmedRefund};
+use swapkey::settlement::state_machine::{
     ExchangeInputs, Funding, PeerSession, Possessing, Role, Transport,
 };
-use newkey::tx::escrow::Escrow;
-use newkey::tx::txbuild::{build_completion, verify_taproot_key_spend};
-use newkey::{Error, Result};
+use swapkey::tx::escrow::Escrow;
+use swapkey::tx::txbuild::{build_completion, verify_taproot_key_spend};
+use swapkey::{Error, Result};
 use secp::{Point, Scalar};
 use std::sync::mpsc;
 
@@ -52,7 +52,7 @@ fn keypair() -> (Scalar, Point) {
 /// The 2-of-2 aggregate internal key under the canonical (sorted) key order —
 /// The single canonical ordering — the shared crate helper.
 fn aggregate_internal(sh_pub: Point, sl_pub: Point) -> Point {
-    newkey::settlement::state_machine::canonical_internal_key(sh_pub, sl_pub).expect("keys")
+    swapkey::settlement::state_machine::canonical_internal_key(sh_pub, sl_pub).expect("keys")
 }
 
 #[test]

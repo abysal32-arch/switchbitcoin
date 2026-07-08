@@ -13,12 +13,12 @@
 //!      funding / fund-and-run row, driven by the wallet loop).
 
 use bitcoin::OutPoint;
-use newkey::chain::{ChainView, DualSourceChainView, SimChain, Source};
-use newkey::settlement::refund::PreArmedRefund;
-use newkey::tx::escrow::Escrow;
-use newkey::tx::setup::build_setup;
-use newkey::wallet::manifest::SignedManifest;
-use newkey::wallet::orchestrator::{
+use swapkey::chain::{ChainView, DualSourceChainView, SimChain, Source};
+use swapkey::settlement::refund::PreArmedRefund;
+use swapkey::tx::escrow::Escrow;
+use swapkey::tx::setup::build_setup;
+use swapkey::wallet::manifest::SignedManifest;
+use swapkey::wallet::orchestrator::{
     AbortAction, AbortDriver, FundingAction, FundingCoordinator, FundingOrder,
 };
 
@@ -49,8 +49,8 @@ fn coordinator_drives_canonical_first_funding_to_proceed() {
     // Two parties with real pre-encumbrance keys.
     let (sk_a, pk_a) = keypair();
     let (sk_b, pk_b) = keypair();
-    let va = newkey::crypto::ValidatedPoint::from_bytes(&pk_a.serialize()).unwrap();
-    let vb = newkey::crypto::ValidatedPoint::from_bytes(&pk_b.serialize()).unwrap();
+    let va = swapkey::crypto::ValidatedPoint::from_bytes(&pk_a.serialize()).unwrap();
+    let vb = swapkey::crypto::ValidatedPoint::from_bytes(&pk_b.serialize()).unwrap();
 
     // We play canonical User A; determine our order.
     let our_order = FundingCoordinator::funding_order(&va, &vb).unwrap();
@@ -62,7 +62,7 @@ fn coordinator_drives_canonical_first_funding_to_proceed() {
 
     // Build both escrows (both orderings' leaves; here one each for the test).
     let internal =
-        newkey::settlement::state_machine::canonical_internal_key(our_pk, their_pk).unwrap();
+        swapkey::settlement::state_machine::canonical_internal_key(our_pk, their_pk).unwrap();
     let our_escrow = Escrow::new(&internal, &our_pk, params.delta_early).unwrap();
     let their_escrow = Escrow::new(&internal, &their_pk, params.delta_early).unwrap();
 
@@ -147,7 +147,7 @@ fn fund_and_run_reclaims_via_abort_driver() {
     let (our_sk, our_pk) = keypair();
     let (_their_sk, their_pk) = keypair();
     let internal =
-        newkey::settlement::state_machine::canonical_internal_key(our_pk, their_pk).unwrap();
+        swapkey::settlement::state_machine::canonical_internal_key(our_pk, their_pk).unwrap();
     // Our escrow with an early refund leaf keyed to us.
     let our_escrow = Escrow::new(&internal, &our_pk, params.delta_early).unwrap();
     let our_escrow_op = OutPoint::new(txid(1), 0);
