@@ -62,7 +62,7 @@ fn taproot_swap_both_legs_are_spendable_on_the_bitcoin_side() {
     let params = Params::testnet_provisional();
     assert!(params.validate().is_ok());
     let s_height = 800_000u32;
-    let escrow_amount = params.tier_d_sats + params.delta_fee_sats; // funds D + fee
+    let escrow_amount = params.escrow_amount_sats(); // D + Δ_fee − setup_cost (scheme (a))
     let d = params.tier_d_sats; // completion output is exactly D
 
     // Shared 2-of-2 internal key.
@@ -83,8 +83,12 @@ fn taproot_swap_both_legs_are_spendable_on_the_bitcoin_side() {
     // of scope — what we prove is the ESCROW spend is valid).
     let dest_sh = escrow_comp_sh.funding_script_pubkey().clone();
     let dest_sl = escrow_comp_sl.funding_script_pubkey().clone();
-    let comp_sh_tx = build_completion(&escrow_comp_sh, op_sh, escrow_amount, dest_sh, d).unwrap();
-    let comp_sl_tx = build_completion(&escrow_comp_sl, op_sl, escrow_amount, dest_sl, d).unwrap();
+    let comp_sh_tx =
+        build_completion(&escrow_comp_sh, op_sh, escrow_amount, dest_sh, d, params.anchor_sats)
+            .unwrap();
+    let comp_sl_tx =
+        build_completion(&escrow_comp_sl, op_sl, escrow_amount, dest_sl, d, params.anchor_sats)
+            .unwrap();
     let msg_comp_sh = comp_sh_tx.sighash;
     let msg_comp_sl = comp_sl_tx.sighash;
     let root_sh = escrow_comp_sh.merkle_root();

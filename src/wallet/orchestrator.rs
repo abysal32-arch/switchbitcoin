@@ -11,7 +11,7 @@
 //!     funding ORDER by canonical session-pubkey sort (coordinator-free
 //!     agreement — the SAME sort KeyAgg/role_seed use), gates the second
 //!     funder on DEFERRED ENCUMBRANCE VERIFICATION of the first escrow
-//!     (confirmed AND holding exactly D+Δ_fee, read through the dual-source
+//!     (confirmed AND holding exactly the tier escrow amount, read through the dual-source
 //!     `verified_funding` rule), enforces the co-funding window and the
 //!     Block-X wallet-policy deadline, and applies per-party funding jitter.
 //!
@@ -60,7 +60,7 @@ pub enum FundingAction {
     /// (second funder) the counterparty escrow not yet verified.
     Wait,
     /// Both escrows confirmed, within the window, before Block X, and the
-    /// counterparty escrow holds exactly D+Δ_fee: proceed to `await_funded`
+    /// counterparty escrow holds exactly the tier escrow amount: proceed to `await_funded`
     /// and the exchange.
     Proceed { our_height: u32, their_height: u32, s_height: u32 },
     /// Abort to refunds and discard session state: Block-X deadline passed,
@@ -103,13 +103,19 @@ impl FundingCoordinator {
         Ok(if o < t { FundingOrder::First } else { FundingOrder::Second })
     }
 
-    /// The escrow amount every tier participant funds: exactly D+Δ_fee. The
-    /// encumbrance check compares the counterparty escrow against THIS.
+    /// The escrow amount every tier participant funds: exactly
+    /// D + Δ_fee − setup_cost (scheme (a) — the Setup pays its baked fee and
+    /// anchor out of the pre-encumbrance coin). The encumbrance check
+    /// compares the counterparty escrow against THIS. Checked arithmetic:
+    /// hostile params get Err, never a wrapped amount.
     pub fn expected_escrow_amount(&self) -> Result<u64> {
-        self.params
+        let pre = self
+            .params
             .tier_d_sats
             .checked_add(self.params.delta_fee_sats)
-            .ok_or(Error::Validation("tier overflow"))
+            .ok_or(Error::Validation("tier overflow"))?;
+        pre.checked_sub(self.params.setup_cost_sats())
+            .ok_or(Error::Validation("setup cost exceeds the funding unit"))
     }
 
     /// Poll: decide the next funding action. Pure — all mutable state
@@ -146,7 +152,7 @@ impl FundingCoordinator {
         }
 
         // Tri-state encumbrance read of the counterparty escrow. Only a
-        // GENUINE wrong amount (both sources agree it is != D+Δ_fee) is a
+        // GENUINE wrong amount (both sources agree it is != the tier escrow amount) is a
         // hostile escrow that warrants a terminal Abort. A mere source
         // DISAGREEMENT (`Unverifiable`) or an un-reportable amount must NOT
         // abort — the self-verifying source holds the truth and we re-poll.
@@ -154,7 +160,7 @@ impl FundingCoordinator {
         if let FundingReading::Confirmed { amount: Some(a), .. } = their_reading {
             if a != expected {
                 return Ok(FundingAction::Abort(
-                    "counterparty escrow is not exactly D+delta_fee; abort",
+                    "counterparty escrow is not exactly the tier escrow amount; abort",
                 ));
             }
         }
@@ -322,8 +328,8 @@ mod tests {
     }
 
     fn unit() -> u64 {
-        let p = Params::testnet_provisional();
-        p.tier_d_sats + p.delta_fee_sats
+        // The ESCROW amount the encumbrance gate expects (scheme (a)).
+        Params::testnet_provisional().escrow_amount_sats()
     }
 
     #[test]
@@ -373,7 +379,7 @@ mod tests {
         assert_eq!(
             c.next_funding_action(&chain, FundingOrder::Second, op(1), op(2), false, true, 2_000)
                 .unwrap(),
-            FundingAction::Abort("counterparty escrow is not exactly D+delta_fee; abort")
+            FundingAction::Abort("counterparty escrow is not exactly the tier escrow amount; abort")
         );
     }
 
@@ -518,8 +524,16 @@ mod tests {
         );
     }
 
+    /// A standard P2TR-shaped scriptPubKey (`OP_1 <32 bytes>`). The relay-policy
+    /// gate rejects an empty (non-standard) spk, so fixtures must look real.
+    fn std_p2tr_spk() -> bitcoin::ScriptBuf {
+        let mut v = vec![0x51u8, 0x20];
+        v.extend_from_slice(&[0x77u8; 32]);
+        bitcoin::ScriptBuf::from_bytes(v)
+    }
+
     // Build a minimal signed spend of `outpoint` paying `out` sats to a
-    // dummy scriptpubkey, so the SimChain sees a spend with a real txid.
+    // standard scriptpubkey, so the SimChain sees a spend with a real txid.
     fn spend_of(outpoint: OutPoint, out: u64) -> Vec<u8> {
         use bitcoin::{absolute, transaction::Version, Amount, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
         let tx = Transaction {
@@ -531,7 +545,7 @@ mod tests {
                 sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 witness: Witness::new(),
             }],
-            output: vec![TxOut { value: Amount::from_sat(out), script_pubkey: ScriptBuf::new() }],
+            output: vec![TxOut { value: Amount::from_sat(out), script_pubkey: std_p2tr_spk() }],
         };
         bitcoin::consensus::encode::serialize(&tx)
     }

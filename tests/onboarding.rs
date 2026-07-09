@@ -35,7 +35,7 @@ impl WalletClock for FixedClock {
 fn deposit_split_bump_delay_setup_escrow_end_to_end() {
     let dir = tempfile::tempdir().unwrap();
     let params = Params::testnet_provisional();
-    let unit = params.tier_d_sats + params.delta_fee_sats;
+    let unit = params.pre_encumbrance_sats(); // the pre-encumbrance coin: D + Δ_fee
     let t0 = 1_700_000_000u64;
     let chain = SimChain::new(800_000);
     let lessee = [0x5C; 32];
@@ -127,10 +127,17 @@ fn deposit_split_bump_delay_setup_escrow_end_to_end() {
     )
     .unwrap();
     let escrow = Escrow::new(&internal, &(funder_sk * secp::G), params.delta_early).unwrap();
-    let (setup_bytes, escrow_op) =
-        build_setup(coin.outpoint, coin.amount_sats, &escrow, &funder_sk).unwrap();
+    let (setup_bytes, escrow_op) = build_setup(
+        coin.outpoint,
+        coin.amount_sats,
+        params.escrow_amount_sats(),
+        params.anchor_sats,
+        &escrow,
+        &funder_sk,
+    )
+    .unwrap();
 
-    chain.set_congestion(0); // setup pays via anchor CPFP only under spikes
+    chain.set_congestion(0); // scheme (a): the Setup pays its own baked fee
     chain.broadcast(&setup_bytes).expect("setup accepted");
     chain.mine();
     assert!(

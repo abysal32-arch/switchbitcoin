@@ -67,8 +67,10 @@ impl WalletClock for FixedClock {
 }
 
 /// Onboard one mature, leasable pre-encumbrance coin into the SL wallet's
-/// ledger, and return its outpoint (the swap's funding coin).
-fn onboard_one_coin(dir: &std::path::Path, unit: u64, lessee: [u8; 32]) -> OutPoint {
+/// ledger, and return its outpoint (the swap's funding coin). `pre_enc` is the
+/// FULL pre-encumbrance amount (D + Δ_fee) the ledger splits into and the Setup
+/// tx consumes — NOT the escrow amount (which is pre_enc − setup_cost).
+fn onboard_one_coin(dir: &std::path::Path, pre_enc: u64, lessee: [u8; 32]) -> OutPoint {
     // Create the ledger (onboarding) then release it so the engine can reopen.
     let ack = acknowledge_phase0(PHASE0_WARNING).unwrap();
     let mut ledger = Ledger::create(dir, &ModeledEnclave, ack).unwrap();
@@ -79,7 +81,7 @@ fn onboard_one_coin(dir: &std::path::Path, unit: u64, lessee: [u8; 32]) -> OutPo
     ledger
         .register_deposit(
             dep,
-            unit + 2_000,
+            pre_enc + 2_000,
             100,
             idx,
             &spk,
@@ -91,7 +93,7 @@ fn onboard_one_coin(dir: &std::path::Path, unit: u64, lessee: [u8; 32]) -> OutPo
     ledger.confirm_split(plan.txid, 150, &FixedClock(1_000)).unwrap();
     // Lease the (now-mature) coin far in the future so both delay anchors pass.
     let coin = ledger
-        .lease_pre_encumbrance(unit, &FixedClock(u64::MAX), u32::MAX, lessee)
+        .lease_pre_encumbrance(pre_enc, &FixedClock(u64::MAX), u32::MAX, lessee)
         .unwrap()
         .expect("a mature pre-encumbrance coin");
     coin.outpoint
@@ -100,7 +102,7 @@ fn onboard_one_coin(dir: &std::path::Path, unit: u64, lessee: [u8; 32]) -> OutPo
 #[test]
 fn full_swap_driven_through_the_engine() {
     let params = Params::testnet_provisional();
-    let unit = params.tier_d_sats + params.delta_fee_sats;
+    let unit = params.escrow_amount_sats(); // the ESCROW amount (scheme (a))
     let d = params.tier_d_sats;
     let s_height = 700_000u32;
     let delta_late = u32::try_from(params.delta_late()).unwrap();
@@ -120,8 +122,8 @@ fn full_swap_driven_through_the_engine() {
 
     let dest = escrow_comp_sh.funding_script_pubkey().clone();
     let comp_sh_spend =
-        build_completion(&escrow_comp_sh, op_comp_sh, unit, dest.clone(), d).unwrap();
-    let comp_sl_spend = build_completion(&escrow_comp_sl, op_comp_sl, unit, dest, d).unwrap();
+        build_completion(&escrow_comp_sh, op_comp_sh, unit, dest.clone(), d, params.anchor_sats).unwrap();
+    let comp_sl_spend = build_completion(&escrow_comp_sl, op_comp_sl, unit, dest, d, params.anchor_sats).unwrap();
     let msg_sh = comp_sh_spend.sighash;
     let msg_sl = comp_sl_spend.sighash;
     let root_sh = escrow_comp_sh.merkle_root();
@@ -139,7 +141,7 @@ fn full_swap_driven_through_the_engine() {
 
     // Onboard SL's funding coin, then open the engine (reopens the ledger +
     // the swap store + the manifest store, and reconciles leases).
-    let funding_coin = onboard_one_coin(wallet_dir.path(), unit, sid);
+    let funding_coin = onboard_one_coin(wallet_dir.path(), params.pre_encumbrance_sats(), sid);
     let (mut engine, actions) = SwapEngine::open(
         wallet_dir.path(),
         &ModeledEnclave,
@@ -152,7 +154,7 @@ fn full_swap_driven_through_the_engine() {
     // SL's REAL pre-armed refund of its own escrow (E_sl, early leaf).
     let dest2 = escrow_comp_sh.funding_script_pubkey().clone();
     let sl_refund =
-        PreArmedRefund::arm(&escrow_comp_sh, op_comp_sh, unit, &sl.sk, dest2, d, s_height).unwrap();
+        PreArmedRefund::arm(&escrow_comp_sh, op_comp_sh, unit, &sl.sk, dest2, d, params.anchor_sats, s_height).unwrap();
     let sl_receipt = confirm_watchtower_handoff(&sl_refund, sl_refund.fingerprint()).unwrap();
 
     // SH runs the exchange raw + broadcasts Comp→SH to the mempool.
@@ -258,7 +260,7 @@ fn full_swap_driven_through_the_engine() {
 #[test]
 fn engine_open_recovers_a_crashed_signing_swap() {
     let params = Params::testnet_provisional();
-    let unit = params.tier_d_sats + params.delta_fee_sats;
+    let unit = params.escrow_amount_sats(); // the ESCROW amount (scheme (a))
     let d = params.tier_d_sats;
     let s_height = 500_000u32;
     let wallet_dir = tempfile::tempdir().unwrap();
@@ -272,12 +274,12 @@ fn engine_open_recovers_a_crashed_signing_swap() {
     let escrow = Escrow::new(&internal, &sl.pk, params.delta_early).unwrap();
     let op = OutPoint::new(txid_from(7), 0);
     let dest = escrow.funding_script_pubkey().clone();
-    let refund = PreArmedRefund::arm(&escrow, op, unit, &sl.sk, dest, d, s_height).unwrap();
+    let refund = PreArmedRefund::arm(&escrow, op, unit, &sl.sk, dest, d, params.anchor_sats, s_height).unwrap();
     let poss = tempfile::tempdir().unwrap();
     let poss_path = poss.path().join(format!("{}.possession", hex(&sid)));
 
     // Onboard + lease a coin to this swap, then leave a Signing record (crash).
-    let funding_coin = onboard_one_coin(wallet_dir.path(), unit, sid);
+    let funding_coin = onboard_one_coin(wallet_dir.path(), params.pre_encumbrance_sats(), sid);
 
     {
         let (engine, _) = SwapEngine::open(

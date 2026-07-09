@@ -43,7 +43,7 @@ fn coordinator_drives_canonical_first_funding_to_proceed() {
     let manifest = SignedManifest::provisional();
     let params = manifest.params().clone();
     let coord = FundingCoordinator::from_manifest(&manifest);
-    let unit = params.tier_d_sats + params.delta_fee_sats;
+    let unit = params.pre_encumbrance_sats(); // the pre-encumbrance coin: D + Δ_fee
     let block_x = 900_500u32;
 
     // Two parties with real pre-encumbrance keys.
@@ -72,9 +72,24 @@ fn coordinator_drives_canonical_first_funding_to_proceed() {
     let their_pre = OutPoint::new(txid(0xB0), 0);
     chain.fund_with_amount(our_pre, 900_000, unit);
     chain.fund_with_amount(their_pre, 900_000, unit);
-    let (our_setup, our_escrow_op) = build_setup(our_pre, unit, &our_escrow, &our_sk).unwrap();
-    let (their_setup, their_escrow_op) =
-        build_setup(their_pre, unit, &their_escrow, &their_sk).unwrap();
+    let (our_setup, our_escrow_op) = build_setup(
+        our_pre,
+        unit,
+        params.escrow_amount_sats(),
+        params.anchor_sats,
+        &our_escrow,
+        &our_sk,
+    )
+    .unwrap();
+    let (their_setup, their_escrow_op) = build_setup(
+        their_pre,
+        unit,
+        params.escrow_amount_sats(),
+        params.anchor_sats,
+        &their_escrow,
+        &their_sk,
+    )
+    .unwrap();
 
     let view = dual(&chain);
 
@@ -139,7 +154,7 @@ fn fund_and_run_reclaims_via_abort_driver() {
     let manifest = SignedManifest::provisional();
     let params = manifest.params().clone();
     let coord = FundingCoordinator::from_manifest(&manifest);
-    let unit = params.tier_d_sats + params.delta_fee_sats;
+    let unit = params.escrow_amount_sats(); // the ESCROW amount (scheme (a))
     let d = params.tier_d_sats;
     let s_height = 900_000u32;
     let block_x = s_height + 50;
@@ -187,6 +202,7 @@ fn fund_and_run_reclaims_via_abort_driver() {
         &our_sk,
         dest,
         d,
+        params.anchor_sats,
         s_height,
     )
     .unwrap();
@@ -222,7 +238,7 @@ fn lying_explorer_delays_but_cannot_force_abort() {
     let manifest = SignedManifest::provisional();
     let params = manifest.params().clone();
     let coord = FundingCoordinator::from_manifest(&manifest);
-    let unit = params.tier_d_sats + params.delta_fee_sats;
+    let unit = params.escrow_amount_sats(); // the ESCROW amount (scheme (a))
     let s = 900_000u32;
     let block_x = s + 100;
 
@@ -293,7 +309,7 @@ fn lying_explorer_delays_but_cannot_force_abort() {
         coord
             .next_funding_action(&view2, FundingOrder::First, our_escrow, their_escrow, true, true, block_x)
             .unwrap(),
-        FundingAction::Abort("counterparty escrow is not exactly D+delta_fee; abort")
+        FundingAction::Abort("counterparty escrow is not exactly the tier escrow amount; abort")
     );
 }
 

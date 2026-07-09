@@ -27,41 +27,28 @@ pub struct SpendTx {
 /// Completion, Refund) is version 3 for its RBF-pinning protection (v3.13).
 pub(crate) const TRUC_VERSION: Version = Version(3);
 
-/// The ephemeral anchor output (P2A, BIP336): `OP_1 <0x4e73>`, 0 value. Every
-/// contract tx carries one so a CPFP child can bump it under a fee spike
-/// beyond the baked-in Δ_fee. On the happy path it is left unspent.
+/// The P2A anchor output (BIP433): `OP_1 <0x4e73>`, carrying the manifest-
+/// signed `anchor_sats` value. Every contract tx carries one so a CPFP child
+/// can bump it under a fee spike beyond the baked-in Δ_fee. On the happy
+/// path it is left unspent (keyless anyone-can-spend; losing the 240 sats to
+/// a sweeper is the design, per Core's P2A intent).
 ///
-/// ⚠ KNOWN-NON-STANDARD — THE #1 TESTNET BLOCKER (adversarial review, CONFIRMED
-/// critical). This 0-value anchor is consistent with the SimChain (which has
-/// no dust/standardness/package-relay policy) but is REJECTED by real Bitcoin
-/// Core 28+: a 0-value output only relays via the ephemeral-dust rule, which
-/// requires the PARENT to pay ZERO fee and be submitted in a package with a
-/// child spending the dust — yet `build_completion`/`build_refund` pay a
-/// POSITIVE baked fee, and the Setup (spending the whole D+Δ_fee into the
-/// escrow) pays ZERO and so can never relay standalone at all. So on a real
-/// node every completion, pre-armed refund, and Setup would be rejected at
-/// submission. Exactly the class of defect the sim cannot surface and the
-/// first testnet broadcast will.
-///
-/// TWO COHERENT FIXES (a fee-model decision to make + testnet-validate; see the
-/// review packet §4.98). Both keep escrows EQUAL across a tier (the privacy
-/// linchpin) since every party uses the same formula:
-///   (a) NON-DUST ANCHOR + FEE SPLIT — give the anchor a standard value
-///       (≥ ~240 sats, the P2A dust floor) and set `escrow_amount = D + Δ_fee
-///       − setup_cost` so the Setup carries a real positive fee. Positive-fee
-///       parents then relay standalone and the CPFP is truly congestion-only.
-///       `build_cpfp_bump` already accepts the real `anchor_value_sats`.
-///   (b) 0-FEE PARENTS + MANDATORY 1P1C — drop the positive-fee guards, keep
-///       the 0-value ephemeral anchor, and ALWAYS submit parent+child as a
-///       package. Then the bump is part of every broadcast, not a backstop.
-/// Scheme (a) matches the spec's "baked-in Δ_fee, congestion-only anchor"
-/// intent. It is left unimplemented here deliberately: the exact values
-/// (anchor size, setup/completion fee split) are testnet-tuned and the
-/// structure cannot be validated against real Core policy in-process, so
-/// hacking it now would give false confidence without testnet.
-pub(crate) fn ephemeral_anchor() -> TxOut {
+/// §4.98 RESOLVED — SCHEME (a), NON-DUST ANCHOR + FEE SPLIT. Previously this
+/// was a 0-VALUE ephemeral anchor on POSITIVE-fee parents — rejected as dust
+/// by every real Core (28–31): a below-dust output only relays via the
+/// ephemeral-dust rule (Core 29+), which demands the parent pay EXACTLY ZERO
+/// fee inside a package whose child sweeps the dust. Now the anchor carries
+/// `Params::anchor_sats >= 240` (the P2A dust floor, enforced by
+/// `Params::validate`), the Setup pays a real `setup_fee`, the escrow is
+/// `D + Δ_fee − setup_cost`, and the settlement fee is derived so the
+/// destination still receives exactly D — every contract tx relays
+/// STANDALONE and the anchor CPFP stays truly congestion-only. The shape is
+/// validated in-process against `chain::policy` (the modeled Core relay
+/// policy, facts pinned against Core 28–31 sources); exact VALUES remain
+/// testnet-tuned and must be confirmed on the first real broadcast.
+pub(crate) fn anchor_output(anchor_sats: u64) -> TxOut {
     TxOut {
-        value: Amount::ZERO,
+        value: Amount::from_sat(anchor_sats),
         script_pubkey: ScriptBuf::from_bytes(vec![0x51, 0x02, 0x4e, 0x73]),
     }
 }
@@ -75,7 +62,8 @@ fn escrow_prevout(escrow: &Escrow, escrow_amount_sats: u64) -> TxOut {
 
 /// Build a COMPLETION transaction (key-path spend of the escrow) and its
 /// BIP341 key-spend sighash. `dest_spk` receives exactly `out_amount_sats`
-/// (the swap output D); the fee is `escrow_amount - out_amount`.
+/// (the swap output D); `anchor_sats` rides on the P2A anchor; the fee is
+/// `escrow_amount − out_amount − anchor` (the baked settlement fee).
 ///
 /// The completion input is RBF-enabled with no relative timelock (it must be
 /// spendable as soon as the escrow confirms).
@@ -85,11 +73,15 @@ pub fn build_completion(
     escrow_amount_sats: u64,
     dest_spk: ScriptBuf,
     out_amount_sats: u64,
+    anchor_sats: u64,
 ) -> Result<SpendTx> {
-    // Must leave a positive fee (the anchor carries no value); reject a footgun
+    // Output + anchor must leave a strictly positive fee; reject a footgun
     // that would produce a 0-/negative-fee, un-relayable transaction.
-    if out_amount_sats >= escrow_amount_sats {
-        return Err(Error::Validation("completion output must leave a positive fee"));
+    if out_amount_sats
+        .checked_add(anchor_sats)
+        .is_none_or(|t| t >= escrow_amount_sats)
+    {
+        return Err(Error::Validation("completion output + anchor must leave a positive fee"));
     }
     let tx = Transaction {
         version: TRUC_VERSION,
@@ -101,10 +93,10 @@ pub fn build_completion(
             witness: Witness::new(),
         }],
         // Output 0 is exactly D to the fresh destination; output 1 is the
-        // 0-value ephemeral anchor (congestion-only backstop). No change output.
+        // non-dust P2A anchor (congestion-only backstop). No change output.
         output: vec![
             TxOut { value: Amount::from_sat(out_amount_sats), script_pubkey: dest_spk },
-            ephemeral_anchor(),
+            anchor_output(anchor_sats),
         ],
     };
     let prevout = escrow_prevout(escrow, escrow_amount_sats);
@@ -126,9 +118,13 @@ pub fn build_refund(
     escrow_amount_sats: u64,
     dest_spk: ScriptBuf,
     out_amount_sats: u64,
+    anchor_sats: u64,
 ) -> Result<SpendTx> {
-    if out_amount_sats >= escrow_amount_sats {
-        return Err(Error::Validation("refund output must leave a positive fee"));
+    if out_amount_sats
+        .checked_add(anchor_sats)
+        .is_none_or(|t| t >= escrow_amount_sats)
+    {
+        return Err(Error::Validation("refund output + anchor must leave a positive fee"));
     }
     let tx = Transaction {
         version: TRUC_VERSION,
@@ -141,7 +137,7 @@ pub fn build_refund(
         }],
         output: vec![
             TxOut { value: Amount::from_sat(out_amount_sats), script_pubkey: dest_spk },
-            ephemeral_anchor(),
+            anchor_output(anchor_sats),
         ],
     };
     let prevout = escrow_prevout(escrow, escrow_amount_sats);
@@ -237,20 +233,39 @@ mod tests {
         .unwrap();
         let escrow = Escrow::new(&internal, &(sk_a * secp::G), 216).unwrap();
 
+        // Scheme-(a) amounts: escrow = D + Δ_fee − setup_cost; settlement
+        // delivers exactly D plus a non-dust anchor.
+        let p = crate::settlement::params::Params::testnet_provisional();
+        let (escrow_amt, d, anchor) = (p.escrow_amount_sats(), p.tier_d_sats, p.anchor_sats);
         let dest = escrow.funding_script_pubkey().clone(); // any spk
-        let c = build_completion(&escrow, dummy_outpoint(), 1_005_000, dest.clone(), 1_000_000).unwrap();
-        let r = build_refund(&escrow, dummy_outpoint(), 1_005_000, dest, 1_000_000).unwrap();
+        let c = build_completion(&escrow, dummy_outpoint(), escrow_amt, dest.clone(), d, anchor)
+            .unwrap();
+        let r = build_refund(&escrow, dummy_outpoint(), escrow_amt, dest, d, anchor).unwrap();
 
         // Key-path and script-path sighashes over the same spend must differ.
         assert_ne!(c.sighash, r.sighash);
         // Deterministic: same inputs, same sighash.
         let c2 = build_completion(
-            &escrow, dummy_outpoint(), 1_005_000,
-            escrow.funding_script_pubkey().clone(), 1_000_000,
+            &escrow, dummy_outpoint(), escrow_amt,
+            escrow.funding_script_pubkey().clone(), d, anchor,
         )
         .unwrap();
         assert_eq!(c.sighash, c2.sighash);
         // Refund input carries the CSV relative-timelock.
         assert!(r.tx.input[0].sequence.is_relative_lock_time());
+        // Both carry the valued P2A anchor as the LAST output and pay the
+        // baked settlement fee.
+        for tx in [&c.tx, &r.tx] {
+            assert_eq!(tx.output[1].value.to_sat(), anchor);
+            let fee = escrow_amt - tx.output.iter().map(|o| o.value.to_sat()).sum::<u64>();
+            assert_eq!(fee, p.settlement_fee_sats());
+        }
+        // The old §4.98 footgun (output + anchor consuming the whole escrow —
+        // a 0-fee unrelayable settlement) is rejected at construction.
+        assert!(build_completion(
+            &escrow, dummy_outpoint(), escrow_amt,
+            escrow.funding_script_pubkey().clone(), escrow_amt - anchor, anchor,
+        )
+        .is_err());
     }
 }

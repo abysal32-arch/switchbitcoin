@@ -33,6 +33,7 @@ impl PreArmedRefund {
     /// witness, and store the fully-signed bytes. The stored tx is broadcastable
     /// by the watchtower the moment `S + csv_blocks` is reached — this is what
     /// makes gate G2 crash-safe.
+    #[allow(clippy::too_many_arguments)]
     pub fn arm(
         escrow: &crate::tx::escrow::Escrow,
         funding_outpoint: bitcoin::OutPoint,
@@ -40,6 +41,7 @@ impl PreArmedRefund {
         funder_seckey: &secp::Scalar,
         dest_spk: bitcoin::ScriptBuf,
         out_amount_sats: u64,
+        anchor_sats: u64,
         s_height: u32,
     ) -> Result<Self> {
         let spend = crate::tx::txbuild::build_refund(
@@ -48,6 +50,7 @@ impl PreArmedRefund {
             escrow_amount_sats,
             dest_spk,
             out_amount_sats,
+            anchor_sats,
         )?;
         let sig = crate::tx::txbuild::sign_schnorr_single(funder_seckey.serialize(), spend.sighash)?;
         let signed = crate::tx::txbuild::finalize_refund(spend, escrow, sig)?;
@@ -265,19 +268,31 @@ mod tests {
             bitcoin::OutPoint::new(bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::all_zeros()), 0);
         let dest = escrow.funding_script_pubkey().clone();
 
-        let refund =
-            PreArmedRefund::arm(&escrow, outpoint, 1_005_000, &sk, dest, 1_000_000, 800_000).unwrap();
+        let p = crate::settlement::params::Params::testnet_provisional();
+        let refund = PreArmedRefund::arm(
+            &escrow,
+            outpoint,
+            p.escrow_amount_sats(),
+            &sk,
+            dest,
+            p.tier_d_sats,
+            p.anchor_sats,
+            800_000,
+        )
+        .unwrap();
         assert_eq!(refund.csv_maturity_height(), 800_000 + 144);
 
-        // The stored bytes are a real, version-2 tx with the CSV relative lock
+        // The stored bytes are a real TRUC/v3 tx with the CSV relative lock
         // and a complete 3-element script-path witness.
         let tx: bitcoin::Transaction =
             bitcoin::consensus::encode::deserialize(refund.tx_bytes()).unwrap();
         assert_eq!(tx.version, bitcoin::transaction::Version(3), "contract txs are TRUC/v3");
         assert!(tx.input[0].sequence.is_relative_lock_time());
         assert_eq!(tx.input[0].witness.len(), 3);
-        // Carries the ephemeral anchor (output 1) alongside the D+Δ_fee−fee refund.
-        assert_eq!(tx.output.len(), 2, "refund carries an ephemeral anchor");
+        // Carries the non-dust P2A anchor (output 1) alongside the exactly-D
+        // refund; the difference is the baked settlement fee (scheme (a)).
+        assert_eq!(tx.output.len(), 2, "refund carries the P2A anchor");
+        assert_eq!(tx.output[1].value.to_sat(), p.anchor_sats);
     }
 
     #[test]

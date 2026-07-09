@@ -113,7 +113,7 @@ fn run_onchain_exchange() -> Swap {
     let sl = keypair();
     let params = Params::testnet_provisional();
     let s_height = 700_000u32;
-    let escrow_amount = params.tier_d_sats + params.delta_fee_sats;
+    let escrow_amount = params.escrow_amount_sats(); // scheme (a)
     let d = params.tier_d_sats;
     let delta_late = u32::try_from(params.delta_late()).unwrap();
 
@@ -129,9 +129,9 @@ fn run_onchain_exchange() -> Swap {
 
     let dest = escrow_comp_sh.funding_script_pubkey().clone();
     let comp_sh_spend =
-        build_completion(&escrow_comp_sh, op_comp_sh, escrow_amount, dest.clone(), d).unwrap();
+        build_completion(&escrow_comp_sh, op_comp_sh, escrow_amount, dest.clone(), d, params.anchor_sats).unwrap();
     let comp_sl_spend =
-        build_completion(&escrow_comp_sl, op_comp_sl, escrow_amount, dest, d).unwrap();
+        build_completion(&escrow_comp_sl, op_comp_sl, escrow_amount, dest, d, params.anchor_sats).unwrap();
     let msg_comp_sh = comp_sh_spend.sighash;
     let msg_comp_sl = comp_sl_spend.sighash;
     let root_sh = escrow_comp_sh.merkle_root();
@@ -311,6 +311,7 @@ fn sh_offline_after_broadcast_watchtower_covers() {
         &swap.sh.sk,
         swap.escrow_comp_sl.funding_script_pubkey().clone(),
         swap.d,
+        swap.params.anchor_sats,
         swap.s_height,
     )
     .expect("arm SH refund of E_sh");
@@ -342,6 +343,7 @@ fn watchtower_waits_through_mempool_completion_then_fires_on_eviction() {
         &swap.sh.sk,
         swap.escrow_comp_sl.funding_script_pubkey().clone(),
         swap.d,
+        swap.params.anchor_sats,
         swap.s_height,
     )
     .unwrap();
@@ -378,6 +380,7 @@ fn refund_completion_race_resolves_deterministically() {
         &swap.sl.sk,
         swap.escrow_comp_sh.funding_script_pubkey().clone(),
         swap.d,
+        swap.params.anchor_sats,
         swap.s_height,
     )
     .expect("arm SL refund of E_sl");
@@ -542,7 +545,7 @@ fn partial_funding_funded_side_reclaims() {
     let sh = keypair();
     let params = Params::testnet_provisional();
     let s_height = 500_000u32;
-    let escrow_amount = params.tier_d_sats + params.delta_fee_sats;
+    let escrow_amount = params.escrow_amount_sats(); // scheme (a)
 
     let internal = aggregate_internal(sh.pk, sl.pk);
     let escrow = Escrow::new(&internal, &sl.pk, params.delta_early).expect("E_sl");
@@ -568,6 +571,7 @@ fn partial_funding_funded_side_reclaims() {
         &sl.sk,
         escrow.funding_script_pubkey().clone(),
         params.tier_d_sats,
+        params.anchor_sats,
         s_height,
     )
     .expect("arm SL refund");
@@ -582,36 +586,52 @@ fn partial_funding_funded_side_reclaims() {
     // Nothing broadcastable against it: a DIFFERENT tx (e.g. a would-be
     // completion) spending the now-confirmed refund output is rejected.
     let competing = finalize_key_spend(
-        build_completion(&escrow, op, escrow_amount, escrow.funding_script_pubkey().clone(), params.tier_d_sats)
-            .unwrap(),
+        build_completion(
+            &escrow,
+            op,
+            escrow_amount,
+            escrow.funding_script_pubkey().clone(),
+            params.tier_d_sats,
+            params.anchor_sats,
+        )
+        .unwrap(),
         [0u8; 64],
     );
     assert!(chain.broadcast(&competing).is_err(), "a competing spend of the reclaimed escrow was accepted");
 }
 
-// ---- 8. Congestion beyond delta_fee ---------------------------------------
+// ---- 8. Congestion beyond the baked settlement fee ------------------------
+// Scheme (a): a completion/refund pays the baked settlement fee. A spike
+// beyond it stalls the tx; the REAL anchor+reserve CPFP child (tx::backstop)
+// is then submitted as a 1P1C PACKAGE — the extra fee comes from OUTSIDE the
+// swap, so the swapped output stays EXACTLY D (the unlinkability invariant).
+// The SimChain now models package relay + policy, so this exercises the true
+// bump path end to end, not a lowered-floor stand-in.
 #[test]
 fn congestion_backstop_behaves() {
+    use swapkey::tx::backstop::{build_cpfp_bump, finalize_cpfp_bump, ANCHOR_VOUT};
+    use swapkey::tx::setup::pre_encumbrance_spk;
+
     let params = Params::testnet_provisional();
     let sh = keypair();
     let sl = keypair();
     let internal = aggregate_internal(sh.pk, sl.pk);
     let s = 700_000u32;
-    let escrow_amount = params.tier_d_sats + params.delta_fee_sats; // funds D + fee margin
+    let escrow_amount = params.escrow_amount_sats(); // scheme (a)
+    let settlement_fee = params.settlement_fee_sats();
     let delta_late = u32::try_from(params.delta_late()).unwrap();
 
     let chain = SimChain::new(s);
-    // A fee spike BEYOND the baked delta_fee margin.
-    chain.set_congestion(params.delta_fee_sats + 1);
+    // A fee spike BEYOND the baked settlement fee.
+    chain.set_congestion(settlement_fee + 1);
 
-    // (A) COMPLETION under congestion: the swap output stays EXACTLY D (the
-    //     unlinkability invariant — the completion is NEVER shrunk). It pays the
-    //     baked delta_fee, so under a spike it STALLS. The opt-in bump is a
-    //     reserve-funded CPFP child that raises the PACKAGE feerate; the extra
-    //     fee comes from OUTSIDE the swap, so the swapped output is untouched.
-    //     The SimChain has no package relay, so we model the bump's EFFECT — the
-    //     effective feerate then clearing the threshold — while asserting the
-    //     completion output remains exactly D.
+    // A reserve coin (class-pure, non-swap) to fund the bumps.
+    let reserve_key = keypair();
+    let reserve_xonly = (reserve_key.sk * secp::G).serialize_xonly();
+    let reserve_spk = pre_encumbrance_spk(reserve_xonly).unwrap();
+    let child_fee = 2_000u64;
+
+    // (A) COMPLETION under congestion → consent-gated reserve CPFP package.
     let escrow_a = Escrow::new(&internal, &sh.pk, delta_late).unwrap();
     let op_a = OutPoint::new(txid_from(1), 0);
     chain.fund_with_amount(op_a, s, escrow_amount);
@@ -619,48 +639,90 @@ fn congestion_backstop_behaves() {
 
     // The completion pays exactly D; verify the exact-D invariant on the tx.
     let comp = finalize_key_spend(
-        build_completion(&escrow_a, op_a, escrow_amount, dest_a, params.tier_d_sats).unwrap(),
+        build_completion(&escrow_a, op_a, escrow_amount, dest_a, params.tier_d_sats, params.anchor_sats)
+            .unwrap(),
         [0u8; 64],
     );
     let (in_a, out_a) = tx_input_count_and_output_value(&comp);
     assert_eq!(out_a, params.tier_d_sats, "completion output must stay exactly D");
     assert_eq!(in_a, 1, "completion must have no external input");
 
-    // Under the spike it stalls (fee == delta_fee < threshold).
+    // Under the spike it stalls standalone (fee == settlement_fee < threshold).
     assert!(
         matches!(chain.broadcast(&comp), Err(Error::Deadline(_))),
-        "a completion paying only the baked margin should stall under congestion"
+        "a completion paying only the baked settlement fee should stall under congestion"
     );
-    // Opt-in reserve CPFP bump: the package feerate now clears the threshold
-    // (modeled here as the effective min-fee dropping to delta_fee). The SAME
-    // exact-D completion then confirms — nothing about the swap output changed.
-    chain.set_congestion(params.delta_fee_sats);
-    chain.broadcast(&comp).expect("opt-in reserve CPFP bump clears congestion");
+
+    // The REAL bump: a TRUC child spending [parent anchor, reserve coin],
+    // submitted as a 1P1C package. Package fee clears the spike; the swapped
+    // output is untouched. (Witness sigs are placeholders — the sim checks
+    // physics + policy, not Script; the reserve sig is proven bitcoin-side in
+    // tx::backstop's unit tests.)
+    let comp_tx: bitcoin::Transaction = bitcoin::consensus::encode::deserialize(&comp).unwrap();
+    let reserve_a = OutPoint::new(txid_from(0xA1), 0);
+    chain.fund_with_amount(reserve_a, s, 100_000);
+    let bump_a = build_cpfp_bump(
+        OutPoint::new(comp_tx.compute_txid(), ANCHOR_VOUT),
+        params.anchor_sats,
+        reserve_a,
+        100_000,
+        reserve_xonly,
+        child_fee,
+        reserve_spk.clone(),
+    )
+    .unwrap();
+    let bump_a_bytes = finalize_cpfp_bump(bump_a, [0u8; 64]);
+    chain.submit_package(&comp, &bump_a_bytes).expect("CPFP package clears the spike");
     chain.mine();
     assert!(matches!(chain.spend_status(op_a), SpendStatus::Confirmed(_)));
-    // Re-raise the spike for the refund backstop demonstration below.
-    chain.set_congestion(params.delta_fee_sats + 1);
+    let (_, out_confirmed) = tx_input_count_and_output_value(&comp);
+    assert_eq!(out_confirmed, params.tier_d_sats, "the bump never shrinks the swap output");
 
-    // (B) REFUND under the SAME congestion uses a SILENT backstop: it is
-    //     pre-armed with a reserve fee that already clears the threshold, so it
-    //     needs no interactive bump — the watchtower can fire it unattended.
+    // (B) REFUND under the SAME congestion: the pre-armed refund also pays
+    //     the baked settlement fee, so it stalls too — surfaced as an
+    //     actionable fee-floor stall — and the SILENT (no-consent) anchor
+    //     CPFP package fires it. Coin recovery does not depend on the spike
+    //     clearing.
     let escrow_b = Escrow::new(&internal, &sh.pk, delta_late).unwrap();
     let op_b = OutPoint::new(txid_from(2), 0);
     chain.fund_with_amount(op_b, s, escrow_amount);
-    let reserve_output = params.tier_d_sats - 10; // fee = delta_fee + 10 (reserve)
     let refund = PreArmedRefund::arm(
         &escrow_b,
         op_b,
         escrow_amount,
         &sh.sk,
         escrow_b.funding_script_pubkey().clone(),
-        reserve_output,
+        params.tier_d_sats,
+        params.anchor_sats,
         s,
     )
     .unwrap();
     chain.advance(delta_late); // CSV matured
-    swapkey::settlement::refund::run(&refund, &chain, op_b)
-        .expect("pre-armed refund clears congestion silently via its reserve fee");
+    assert!(
+        matches!(
+            swapkey::settlement::refund::run(&refund, &chain, op_b),
+            Err(Error::Deadline(_))
+        ),
+        "the baked-fee refund must surface the stall, not vanish"
+    );
+    let refund_tx: bitcoin::Transaction =
+        bitcoin::consensus::encode::deserialize(refund.tx_bytes()).unwrap();
+    let reserve_b = OutPoint::new(txid_from(0xB1), 0);
+    chain.fund_with_amount(reserve_b, chain.tip_height(), 100_000);
+    let bump_b = build_cpfp_bump(
+        OutPoint::new(refund_tx.compute_txid(), ANCHOR_VOUT),
+        params.anchor_sats,
+        reserve_b,
+        100_000,
+        reserve_xonly,
+        child_fee,
+        reserve_spk,
+    )
+    .unwrap();
+    let bump_b_bytes = finalize_cpfp_bump(bump_b, [0u8; 64]);
+    chain
+        .submit_package(refund.tx_bytes(), &bump_b_bytes)
+        .expect("silent refund CPFP package clears the spike");
     chain.mine();
     assert!(matches!(chain.spend_status(op_b), SpendStatus::Confirmed(_)));
 }
@@ -879,7 +941,7 @@ fn full_swap_under_cofunding_skew() {
     let cw = params.cofunding_window;
     let f_sh = 900_000u32; // SH-funded escrow (E_sh) confirms FIRST
     let f_sl = f_sh + cw; // SL-funded escrow (E_sl) later; S = f_sl (max skew)
-    let escrow_amount = params.tier_d_sats + params.delta_fee_sats;
+    let escrow_amount = params.escrow_amount_sats(); // scheme (a)
     let d = params.tier_d_sats;
 
     let sh = keypair();
@@ -922,9 +984,9 @@ fn full_swap_under_cofunding_skew() {
     // Real completion sighashes + roots + output keys.
     let dest = escrow_comp_sh.funding_script_pubkey().clone();
     let comp_sh_spend =
-        build_completion(&escrow_comp_sh, op_sl_funded, escrow_amount, dest.clone(), d).unwrap();
+        build_completion(&escrow_comp_sh, op_sl_funded, escrow_amount, dest.clone(), d, params.anchor_sats).unwrap();
     let comp_sl_spend =
-        build_completion(&escrow_comp_sl, op_sh_funded, escrow_amount, dest, d).unwrap();
+        build_completion(&escrow_comp_sl, op_sh_funded, escrow_amount, dest, d, params.anchor_sats).unwrap();
     let (msg_sh, msg_sl) = (comp_sh_spend.sighash, comp_sl_spend.sighash);
     let (root_sh, root_sl) = (escrow_comp_sh.merkle_root(), escrow_comp_sl.merkle_root());
     let (ok_sh, ok_sl) = (escrow_comp_sh.output_key_xonly(), escrow_comp_sl.output_key_xonly());
@@ -1036,7 +1098,8 @@ fn full_swap_from_real_setup_funding() {
     let params = Params::testnet_provisional();
     let delta_late = u32::try_from(params.delta_late()).unwrap();
     let s = 800_000u32;
-    let amount = params.tier_d_sats + params.delta_fee_sats; // D + Δ_fee (whole pre-enc)
+    let amount = params.pre_encumbrance_sats(); // D + Δ_fee (whole pre-enc)
+    let escrow_amount = params.escrow_amount_sats(); // what the Setup leaves in escrow
     let d = params.tier_d_sats;
 
     let sh = keypair();
@@ -1053,25 +1116,44 @@ fn full_swap_from_real_setup_funding() {
     chain.fund_with_amount(pre_sh, s, amount);
 
     // SL-first funding: build + broadcast SL's Setup, then SH's; confirm both.
-    let (setup_sl, op_e_sl) = build_setup(pre_sl, amount, &escrow_comp_sh, &sl.sk).unwrap();
+    // Under scheme (a) each Setup pays its baked fee and relays STANDALONE —
+    // this broadcast now runs under the modeled Core relay policy (§4.98).
+    let (setup_sl, op_e_sl) = build_setup(
+        pre_sl, amount, escrow_amount, params.anchor_sats, &escrow_comp_sh, &sl.sk,
+    )
+    .unwrap();
     chain.broadcast(&setup_sl).expect("SL Setup accepted");
-    let (setup_sh, op_e_sh) = build_setup(pre_sh, amount, &escrow_comp_sl, &sh.sk).unwrap();
+    let (setup_sh, op_e_sh) = build_setup(
+        pre_sh, amount, escrow_amount, params.anchor_sats, &escrow_comp_sl, &sh.sk,
+    )
+    .unwrap();
     chain.broadcast(&setup_sh).expect("SH Setup accepted");
     chain.mine(); // both Setups confirm; the escrow outputs become real outpoints
     let s_conf = chain.tip_height();
 
-    // Zero-change: each Setup has exactly [escrow, anchor], no change output, and
-    // the escrow now holds the whole D + Δ_fee as a real, spendable outpoint.
+    // Zero-change: each Setup has exactly [escrow, anchor], no change output;
+    // the escrow holds exactly D + Δ_fee − setup_cost and the Setup paid its
+    // baked fee.
     let setup_tx: bitcoin::Transaction = bitcoin::consensus::encode::deserialize(&setup_sl).unwrap();
     assert_eq!(setup_tx.output.len(), 2, "Setup has no change output");
-    assert_eq!(setup_tx.output[0].value.to_sat(), amount);
+    assert_eq!(setup_tx.output[0].value.to_sat(), escrow_amount);
+    assert_eq!(setup_tx.output[1].value.to_sat(), params.anchor_sats, "non-dust anchor");
+    assert_eq!(
+        amount - setup_tx.output.iter().map(|o| o.value.to_sat()).sum::<u64>(),
+        params.setup_fee_sats,
+        "the Setup pays exactly its baked fee"
+    );
     assert_eq!(chain.funding_height(op_e_sl), Some(s_conf), "E_sl is a real confirmed escrow");
     assert_eq!(chain.funding_height(op_e_sh), Some(s_conf), "E_sh is a real confirmed escrow");
 
     // Real completion sighashes on the REAL escrow outpoints created by the Setups.
     let dest = escrow_comp_sh.funding_script_pubkey().clone();
-    let comp_sh = build_completion(&escrow_comp_sh, op_e_sl, amount, dest.clone(), d).unwrap();
-    let comp_sl = build_completion(&escrow_comp_sl, op_e_sh, amount, dest, d).unwrap();
+    let comp_sh =
+        build_completion(&escrow_comp_sh, op_e_sl, escrow_amount, dest.clone(), d, params.anchor_sats)
+            .unwrap();
+    let comp_sl =
+        build_completion(&escrow_comp_sl, op_e_sh, escrow_amount, dest, d, params.anchor_sats)
+            .unwrap();
     let (msg_sh, msg_sl) = (comp_sh.sighash, comp_sl.sighash);
     let (root_sh, root_sl) = (escrow_comp_sh.merkle_root(), escrow_comp_sl.merkle_root());
     let (ok_sh, ok_sl) = (escrow_comp_sh.output_key_xonly(), escrow_comp_sl.output_key_xonly());

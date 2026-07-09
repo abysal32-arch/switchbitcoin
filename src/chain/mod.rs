@@ -8,15 +8,37 @@
 //!   * a relative-timelock (CSV) spend is rejected until the input has matured;
 //!   * confirmations advance only when a block is mined.
 //!
-//! It is deliberately minimal — no fees, no full script validation — but the
+//! It is deliberately minimal — no full script validation — but the
 //! ordering/timelock/double-spend rules are exactly the ones the settlement
-//! safety argument rests on.
+//! safety argument rests on. The `policy` submodule adds the relay-POLICY
+//! model (dust / ephemeral dust / TRUC / package relay / min-relay fee) a
+//! real Core node applies before consensus ever sees a tx — the layer the
+//! review packet's §4.98 fee-model critical lives in.
+
+pub mod policy;
 
 use crate::{Error, Result};
 use bitcoin::relative::LockTime;
 use bitcoin::{OutPoint, Transaction, Txid};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+
+/// Map a policy rejection to the crate error type (static messages, mirroring
+/// the reject-reason class a real node returns from `testmempoolaccept`).
+fn policy_reject(v: policy::PolicyViolation) -> Error {
+    use policy::PolicyViolation as V;
+    match v {
+        V::Dust { .. } => Error::Validation("policy: dust output"),
+        V::FeeBelowMinRelay { .. } => Error::Deadline("policy: min relay fee not met"),
+        V::NonStandardScript { .. } => Error::Validation("policy: non-standard scriptPubKey"),
+        V::TrucTooLarge { .. } => Error::Validation("policy: TRUC tx too large"),
+        V::TrucChildTooLarge { .. } => Error::Validation("policy: TRUC child too large"),
+        V::TrucVersionMix => Error::Validation("policy: v3/non-v3 unconfirmed spend mix"),
+        V::TrucTopology => Error::Validation("policy: TRUC 1-parent-1-child violated"),
+        V::EphemeralDust(_) => Error::Validation("policy: ephemeral-dust conditions violated"),
+        V::Package(_) => Error::Validation("policy: package shape invalid"),
+    }
+}
 
 /// Status of an escrow output with respect to the tx that spends it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,11 +121,19 @@ pub trait ChainView {
         None
     }
     /// Broadcast a fully-signed tx to the mempool. Enforces funding existence,
-    /// relative-timelock maturity, and no-double-spend. Idempotent for a tx
-    /// already accepted.
+    /// relative-timelock maturity, no-double-spend, and (on views that model
+    /// it) real-node relay POLICY. Idempotent for a tx already accepted.
     fn broadcast(&self, tx_bytes: &[u8]) -> Result<Txid>;
+    /// Submit a 1P1C package (stalled parent + fee-bringing CPFP child),
+    /// judged on the PACKAGE feerate/fee — the congestion-backstop path.
+    /// Default: unsupported (views that cannot package-submit must say so
+    /// loudly rather than silently broadcasting the parent alone).
+    fn submit_package(&self, _parent_bytes: &[u8], _child_bytes: &[u8]) -> Result<(Txid, Txid)> {
+        Err(Error::Unimplemented("package submission not supported by this chain view"))
+    }
 }
 
+#[derive(Clone)]
 struct Inner {
     height: u32,
     /// funding outpoint -> (confirmation height, output amount in sats)
@@ -111,10 +141,188 @@ struct Inner {
     /// escrow outpoint -> (spending txid, confirmed height | None = mempool, fee)
     spends: HashMap<OutPoint, (Txid, Option<u32>, u64)>,
     /// Broadcast transactions, so a CONFIRMED tx's outputs become spendable
-    /// outpoints (models real UTXO creation: Setup -> escrow -> completion).
+    /// outpoints (models real UTXO creation: Setup -> escrow -> completion),
+    /// and an UNCONFIRMED tx's outputs are package/CPFP-spendable.
     txs: HashMap<Txid, Transaction>,
     /// Minimum fee (sats) a tx must pay to be relayed — the congestion knob.
+    /// For a 1P1C package the PACKAGE total is compared against it (CPFP).
     congestion_min_fee: u64,
+}
+
+/// Outcome of the conflict/RBF check.
+enum Acceptance {
+    /// This exact txid is already known (mempool or confirmed) — idempotent
+    /// no-op. (Notably, re-broadcasting a CONFIRMED tx must NOT demote it
+    /// back to the mempool.)
+    AlreadyKnown,
+    /// Accept; evict these mempool incumbents first (RBF replacements).
+    New(Vec<Txid>),
+}
+
+impl Inner {
+    /// True iff `txid` is in the mempool (some spend entry not yet confirmed).
+    fn is_unconfirmed(&self, txid: &Txid) -> bool {
+        self.spends.values().any(|(t, conf, _)| t == txid && conf.is_none())
+    }
+
+    /// TRUC descendant probe: does the unconfirmed `parent` already have an
+    /// in-mempool child other than `spender`? A child that conflicts with
+    /// `spender` on some outpoint (i.e. is about to be RBF-evicted by it)
+    /// does not count.
+    fn has_other_unconfirmed_child(
+        &self,
+        parent: &Txid,
+        spender: &Txid,
+        spender_inputs: &[OutPoint],
+    ) -> bool {
+        self.spends.iter().any(|(op, (child, conf, _))| {
+            op.txid == *parent
+                && conf.is_none()
+                && child != spender
+                && !spender_inputs.iter().any(|si| {
+                    self.spends
+                        .get(si)
+                        .map(|(t, c, _)| t == child && c.is_none())
+                        .unwrap_or(false)
+                })
+        })
+    }
+
+    /// Resolve every input: total input value, CSV maturity, and the policy
+    /// context (confirmed funding vs unconfirmed mempool parent). An input
+    /// may spend a registered funding outpoint OR an output of an
+    /// UNCONFIRMED broadcast tx (a mempool chain / package child).
+    fn resolve_inputs(
+        &self,
+        tx: &Transaction,
+        txid: &Txid,
+    ) -> Result<(u64, Vec<policy::PrevoutCtx>)> {
+        let tip = self.height;
+        let spender_inputs: Vec<OutPoint> =
+            tx.input.iter().map(|i| i.previous_output).collect();
+        let mut total_in: u64 = 0;
+        let mut ctxs = Vec::with_capacity(tx.input.len());
+        for input in &tx.input {
+            let op = input.previous_output;
+            let (value, conf_height, ctx) = if let Some((h, amount)) = self.funded.get(&op) {
+                (
+                    *amount,
+                    Some(*h),
+                    policy::PrevoutCtx {
+                        unconfirmed_parent: false,
+                        parent_is_v3: false,
+                        parent_has_other_child: false,
+                    },
+                )
+            } else if let Some(parent) = self.txs.get(&op.txid) {
+                if !self.is_unconfirmed(&op.txid) {
+                    return Err(Error::Validation("broadcast: input spends an unfunded output"));
+                }
+                let out = parent
+                    .output
+                    .get(op.vout as usize)
+                    .ok_or(Error::Validation("broadcast: input references a missing output"))?;
+                (
+                    out.value.to_sat(),
+                    None,
+                    policy::PrevoutCtx {
+                        unconfirmed_parent: true,
+                        parent_is_v3: parent.version.0 == 3,
+                        parent_has_other_child: self.has_other_unconfirmed_child(
+                            &op.txid,
+                            txid,
+                            &spender_inputs,
+                        ),
+                    },
+                )
+            } else {
+                return Err(Error::Validation("broadcast: input spends an unfunded output"));
+            };
+            total_in = total_in.saturating_add(value);
+
+            // Relative-timelock (CSV) maturity. An unconfirmed prevout has no
+            // confirmation to measure from, so a CSV spend of it is immature.
+            if let Some(lock) = input.sequence.to_relative_lock_time() {
+                match lock {
+                    LockTime::Blocks(h) => {
+                        let matured = match conf_height {
+                            Some(fh) => tip.saturating_sub(fh) >= h.value() as u32,
+                            None => false,
+                        };
+                        if !matured {
+                            return Err(Error::Deadline("broadcast: relative timelock not matured"));
+                        }
+                    }
+                    LockTime::Time(_) => {
+                        return Err(Error::Validation(
+                            "broadcast: time-based locks unsupported in sim",
+                        ));
+                    }
+                }
+            }
+            ctxs.push(ctx);
+        }
+        Ok((total_in, ctxs))
+    }
+
+    /// Conflict / double-spend handling with fee-based replacement (RBF): a
+    /// strictly higher-fee replacement of an unconfirmed spend evicts the
+    /// incumbent (and, transitively, the incumbent's descendants);
+    /// equal-or-lower is refused; a confirmed spend is final.
+    fn check_conflicts(&self, tx: &Transaction, txid: &Txid, fee: u64) -> Result<Acceptance> {
+        if self.txs.contains_key(txid) {
+            return Ok(Acceptance::AlreadyKnown);
+        }
+        let mut evict: Vec<Txid> = Vec::new();
+        for input in &tx.input {
+            match self.spends.get(&input.previous_output) {
+                Some((_, Some(_), _)) => {
+                    return Err(Error::Abort("broadcast: output already spent (confirmed)"))
+                }
+                Some((incumbent, None, old_fee)) => {
+                    if fee <= *old_fee {
+                        return Err(Error::Abort(
+                            "broadcast: output already in mempool (fee too low to replace)",
+                        ));
+                    }
+                    if !evict.contains(incumbent) {
+                        evict.push(*incumbent);
+                    }
+                }
+                None => {}
+            }
+        }
+        Ok(Acceptance::New(evict))
+    }
+
+    /// Remove an UNCONFIRMED tx from the mempool: its spend entries, its
+    /// body, and (transitively) any mempool descendants — a replaced or
+    /// evicted parent must not leave orphaned children behind.
+    fn remove_mempool_tx(&mut self, txid: &Txid) {
+        if !self.is_unconfirmed(txid) {
+            return; // confirmed (keep) or already gone
+        }
+        self.spends.retain(|_, v| !(v.0 == *txid && v.1.is_none()));
+        if let Some(tx) = self.txs.remove(txid) {
+            for vout in 0..tx.output.len() {
+                let op = OutPoint::new(*txid, vout as u32);
+                if let Some((child, None, _)) = self.spends.get(&op).copied() {
+                    self.remove_mempool_tx(&child);
+                }
+            }
+        }
+    }
+
+    /// Evict RBF incumbents, then insert the accepted tx into the mempool.
+    fn insert_tx(&mut self, tx: Transaction, txid: Txid, fee: u64, evict: Vec<Txid>) {
+        for e in evict {
+            self.remove_mempool_tx(&e);
+        }
+        for input in &tx.input {
+            self.spends.insert(input.previous_output, (txid, None, fee));
+        }
+        self.txs.insert(txid, tx);
+    }
 }
 
 /// A shareable in-process chain (Send + Sync via Arc<Mutex<_>>).
@@ -182,12 +390,72 @@ impl SimChain {
     }
 
     /// Evict an UNCONFIRMED (mempool) spend of `outpoint`, if any — models a
-    /// low-fee tx dropping out of the mempool. Confirmed spends are untouched.
+    /// low-fee tx dropping out of the mempool. The whole tx is evicted (all
+    /// its spend entries) together with any mempool descendants. Confirmed
+    /// spends are untouched.
     pub fn evict(&self, outpoint: OutPoint) {
         let mut g = self.0.lock().unwrap();
-        if let Some((_txid, None, _fee)) = g.spends.get(&outpoint) {
-            g.spends.remove(&outpoint);
+        if let Some((txid, None, _fee)) = g.spends.get(&outpoint).copied() {
+            g.remove_mempool_tx(&txid);
         }
+    }
+
+    /// Submit a 1P1C package (`submitpackage` / opportunistic package relay):
+    /// the parent may be below min-relay (even 0-fee, TRUC) or carry ONE
+    /// ephemeral-dust output the child sweeps; acceptance is judged on the
+    /// PACKAGE feerate (min-relay) and the package TOTAL fee (the congestion
+    /// knob — CPFP). Atomic: either both txs enter the mempool or neither.
+    pub fn submit_package(&self, parent_bytes: &[u8], child_bytes: &[u8]) -> Result<(Txid, Txid)> {
+        let parent: Transaction = bitcoin::consensus::encode::deserialize(parent_bytes)
+            .map_err(|_| Error::Validation("package: undecodable parent"))?;
+        let child: Transaction = bitcoin::consensus::encode::deserialize(child_bytes)
+            .map_err(|_| Error::Validation("package: undecodable child"))?;
+        let parent_txid = parent.compute_txid();
+        let child_txid = child.compute_txid();
+
+        let mut g = self.0.lock().unwrap();
+        // Work on a clone; commit only if the WHOLE package is accepted.
+        let mut work = g.clone();
+
+        let shape = policy::check_package_shape(&parent, &child).map_err(policy_reject)?;
+
+        // --- Parent: policy (with package leniency) + physics ---------------
+        let (p_in, p_ctx) = work.resolve_inputs(&parent, &parent_txid)?;
+        let p_out: u64 = parent.output.iter().map(|o| o.value.to_sat()).sum();
+        let p_fee = p_in.saturating_sub(p_out);
+        policy::check_tx(&parent, p_fee, &p_ctx, Some(shape)).map_err(policy_reject)?;
+        match work.check_conflicts(&parent, &parent_txid, p_fee)? {
+            Acceptance::New(evict) => work.insert_tx(parent.clone(), parent_txid, p_fee, evict),
+            Acceptance::AlreadyKnown => {} // deduplicated, Core-style
+        }
+
+        // --- Child: resolves against the parent's outputs; no leniency ------
+        let (c_in, c_ctx) = work.resolve_inputs(&child, &child_txid)?;
+        let c_out: u64 = child.output.iter().map(|o| o.value.to_sat()).sum();
+        let c_fee = c_in.saturating_sub(c_out);
+        policy::check_tx(&child, c_fee, &c_ctx, None).map_err(policy_reject)?;
+
+        // --- Package feerate + congestion (CPFP is judged on the package) ---
+        if !policy::package_meets_feerate(
+            &parent,
+            p_fee,
+            &child,
+            c_fee,
+            policy::MIN_RELAY_FEERATE_SAT_VB,
+        ) {
+            return Err(Error::Deadline("package: below min relay feerate"));
+        }
+        if p_fee.saturating_add(c_fee) < work.congestion_min_fee {
+            return Err(Error::Deadline("package: fee below the current relay threshold"));
+        }
+
+        match work.check_conflicts(&child, &child_txid, c_fee)? {
+            Acceptance::New(evict) => work.insert_tx(child, child_txid, c_fee, evict),
+            Acceptance::AlreadyKnown => {}
+        }
+
+        *g = work;
+        Ok((parent_txid, child_txid))
     }
 }
 
@@ -232,68 +500,37 @@ impl ChainView for SimChain {
             .map_err(|_| Error::Validation("broadcast: undecodable transaction"))?;
         let txid = tx.compute_txid();
         let mut g = self.0.lock().unwrap();
-        let tip = g.height;
 
-        // Compute the fee (sum of input amounts − sum of outputs). Saturating so
-        // an unconstrained (u64::MAX) funding input never overflows.
-        let mut total_in: u64 = 0;
-        for input in &tx.input {
-            let op = input.previous_output;
-            let (funding_height, amount) = *g
-                .funded
-                .get(&op)
-                .ok_or(Error::Validation("broadcast: input spends an unfunded output"))?;
-            total_in = total_in.saturating_add(amount);
-
-            // Relative-timelock (CSV) maturity.
-            if let Some(lock) = input.sequence.to_relative_lock_time() {
-                match lock {
-                    LockTime::Blocks(h) => {
-                        let matured = tip.saturating_sub(funding_height) >= h.value() as u32;
-                        if !matured {
-                            return Err(Error::Deadline("broadcast: relative timelock not matured"));
-                        }
-                    }
-                    LockTime::Time(_) => {
-                        return Err(Error::Validation("broadcast: time-based locks unsupported in sim"));
-                    }
-                }
-            }
-        }
+        // Physics: resolve inputs (funded or mempool-parent), CSV maturity,
+        // fee (saturating so an unconstrained u64::MAX funding never
+        // overflows). Also yields the policy context for each prevout.
+        let (total_in, prevout_ctx) = g.resolve_inputs(&tx, &txid)?;
         let total_out: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
         let fee = total_in.saturating_sub(total_out);
 
-        // Congestion: a tx paying below the minimum relay fee will not be
-        // accepted (it stalls until fee-bumped or congestion clears).
-        if fee < g.congestion_min_fee {
-            return Err(Error::Deadline("broadcast: fee below the current relay threshold"));
-        }
+        match g.check_conflicts(&tx, &txid, fee)? {
+            // Idempotent: already in the mempool or CONFIRMED (a rebroadcast
+            // must never demote a confirmed tx back to the mempool).
+            Acceptance::AlreadyKnown => Ok(txid),
+            Acceptance::New(evict) => {
+                // Relay policy — the gate a real Core node applies before
+                // consensus ever sees the tx (dust / ephemeral dust / TRUC /
+                // min-relay). Standalone submission: no package leniency.
+                policy::check_tx(&tx, fee, &prevout_ctx, None).map_err(policy_reject)?;
 
-        // Conflict / double-spend handling, with fee-based replacement (RBF).
-        for input in &tx.input {
-            let op = input.previous_output;
-            // Replace-by-fee: a strictly higher-fee replacement of an unconfirmed
-            // spend evicts the incumbent; equal-or-lower is refused.
-            match g.spends.get(&op) {
-                Some((existing, _, _)) if *existing == txid => {} // idempotent
-                Some((_, Some(_), _)) => {
-                    return Err(Error::Abort("broadcast: output already spent (confirmed)"))
+                // Congestion: a tx paying below the minimum relay fee will not
+                // be accepted (it stalls until fee-bumped or congestion clears).
+                if fee < g.congestion_min_fee {
+                    return Err(Error::Deadline("broadcast: fee below the current relay threshold"));
                 }
-                Some((_, None, old_fee)) if fee <= *old_fee => {
-                    return Err(Error::Abort(
-                        "broadcast: output already in mempool (fee too low to replace)",
-                    ))
-                }
-                Some((_, None, _)) => {} // higher fee: replace on insert below
-                None => {}
+                g.insert_tx(tx, txid, fee, evict);
+                Ok(txid)
             }
         }
+    }
 
-        for input in &tx.input {
-            g.spends.insert(input.previous_output, (txid, None, fee));
-        }
-        g.txs.insert(txid, tx);
-        Ok(txid)
+    fn submit_package(&self, parent_bytes: &[u8], child_bytes: &[u8]) -> Result<(Txid, Txid)> {
+        SimChain::submit_package(self, parent_bytes, child_bytes)
     }
 }
 
@@ -323,6 +560,10 @@ pub trait ChainSource {
         None
     }
     fn broadcast(&self, tx_bytes: &[u8]) -> Result<Txid>;
+    /// 1P1C package submission (see `ChainView::submit_package`).
+    fn submit_package(&self, _parent_bytes: &[u8], _child_bytes: &[u8]) -> Result<(Txid, Txid)> {
+        Err(Error::Unimplemented("package submission not supported by this chain source"))
+    }
     /// True iff this source validates compact-block filters against
     /// independently-obtained PoW headers — i.e. it cannot be made to lie about
     /// confirmation by an eclipse. At least one source of a pair must be this.
@@ -363,6 +604,9 @@ impl<C: ChainView> ChainSource for Source<C> {
     }
     fn broadcast(&self, tx_bytes: &[u8]) -> Result<Txid> {
         self.view.broadcast(tx_bytes)
+    }
+    fn submit_package(&self, parent_bytes: &[u8], child_bytes: &[u8]) -> Result<(Txid, Txid)> {
+        self.view.submit_package(parent_bytes, child_bytes)
     }
     fn is_self_verifying(&self) -> bool {
         self.self_verifying
@@ -408,6 +652,19 @@ impl<A: ChainSource, B: ChainSource> DualSourceChainView<A, B> {
         let txid = primary.broadcast(tx_bytes)?;
         let _ = secondary.broadcast(tx_bytes); // best-effort; may be the same backing
         Ok(txid)
+    }
+
+    /// 1P1C package submission with the same primary/secondary fan-out as
+    /// `broadcast` — packages must not silently bypass the dual view.
+    pub fn submit_package(&self, parent_bytes: &[u8], child_bytes: &[u8]) -> Result<(Txid, Txid)> {
+        let (primary, secondary) = if self.a.is_self_verifying() {
+            (&self.a as &dyn ChainSource, &self.b as &dyn ChainSource)
+        } else {
+            (&self.b as &dyn ChainSource, &self.a as &dyn ChainSource)
+        };
+        let ids = primary.submit_package(parent_bytes, child_bytes)?;
+        let _ = secondary.submit_package(parent_bytes, child_bytes); // best-effort
+        Ok(ids)
     }
 
     /// Tip height, only if both sources agree. Disagreement => wait-or-abort.
@@ -541,6 +798,9 @@ impl<A: ChainSource, B: ChainSource> ChainView for DualSourceChainView<A, B> {
     fn broadcast(&self, tx_bytes: &[u8]) -> Result<Txid> {
         DualSourceChainView::broadcast(self, tx_bytes)
     }
+    fn submit_package(&self, parent_bytes: &[u8], child_bytes: &[u8]) -> Result<(Txid, Txid)> {
+        DualSourceChainView::submit_package(self, parent_bytes, child_bytes)
+    }
 }
 
 #[cfg(test)]
@@ -550,6 +810,15 @@ mod tests {
 
     fn op(vout: u32) -> OutPoint {
         OutPoint::new(Txid::from_raw_hash(bitcoin::hashes::Hash::all_zeros()), vout)
+    }
+
+    /// A standard P2TR-shaped scriptPubKey (OP_1 <32 bytes>) — policy-valid
+    /// fixture output. An EMPTY spk is non-standard on a real node and is now
+    /// rejected here too, so fixtures must look like real outputs.
+    fn p2tr_spk(seed: u8) -> ScriptBuf {
+        let mut v = vec![0x51, 0x20];
+        v.extend_from_slice(&[seed; 32]);
+        ScriptBuf::from_bytes(v)
     }
 
     fn spend_tx(prev: OutPoint, sequence: Sequence) -> Vec<u8> {
@@ -562,7 +831,7 @@ mod tests {
                 sequence,
                 witness: Witness::new(),
             }],
-            output: vec![TxOut { value: Amount::from_sat(1000), script_pubkey: ScriptBuf::new() }],
+            output: vec![TxOut { value: Amount::from_sat(1000), script_pubkey: p2tr_spk(0x51) }],
         };
         bitcoin::consensus::encode::serialize(&tx)
     }
@@ -609,7 +878,7 @@ mod tests {
                 sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 witness: Witness::new(),
             }],
-            output: vec![TxOut { value: Amount::from_sat(out), script_pubkey: ScriptBuf::new() }],
+            output: vec![TxOut { value: Amount::from_sat(out), script_pubkey: p2tr_spk(0x52) }],
         };
         bitcoin::consensus::encode::serialize(&tx)
     }
@@ -733,5 +1002,256 @@ mod tests {
         );
         // The proceed-to-sign gate still sees the disagreement (funding path).
         assert!(dual.verified_spend_status(op(0)).is_err());
+    }
+
+    // ===== Relay-policy model (§4.98) =======================================
+
+    fn p2a_out(value: u64) -> TxOut {
+        TxOut {
+            value: Amount::from_sat(value),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51, 0x02, 0x4e, 0x73]),
+        }
+    }
+
+    fn tx_bytes_of(version: Version, ins: &[(OutPoint, Sequence)], outs: Vec<TxOut>) -> Vec<u8> {
+        let tx = Transaction {
+            version,
+            lock_time: absolute::LockTime::ZERO,
+            input: ins
+                .iter()
+                .map(|(prev, seq)| TxIn {
+                    previous_output: *prev,
+                    script_sig: ScriptBuf::new(),
+                    sequence: *seq,
+                    witness: Witness::new(),
+                })
+                .collect(),
+            output: outs,
+        };
+        bitcoin::consensus::encode::serialize(&tx)
+    }
+
+    /// THE §4.98 regression: the OLD contract shape — a POSITIVE-fee parent
+    /// carrying a 0-VALUE P2A anchor — is rejected as dust, exactly as real
+    /// Core 28–31 rejects it. This is the defect the sim could not previously
+    /// surface; it must never relay again.
+    #[test]
+    fn old_shape_positive_fee_with_zero_value_anchor_is_rejected() {
+        let chain = SimChain::new(100);
+        chain.fund_with_amount(op(0), 100, 1_005_000);
+        let rbf = Sequence::ENABLE_RBF_NO_LOCKTIME;
+        let old_shape = tx_bytes_of(
+            Version(3),
+            &[(op(0), rbf)],
+            vec![
+                TxOut { value: Amount::from_sat(1_000_000), script_pubkey: p2tr_spk(1) },
+                p2a_out(0), // the 0-value ephemeral anchor on a positive-fee parent
+            ],
+        );
+        assert!(
+            matches!(chain.broadcast(&old_shape), Err(Error::Validation(_))),
+            "the pre-scheme-(a) contract shape must be dust-rejected"
+        );
+
+        // The scheme-(a) shape — non-dust anchor, positive fee — relays.
+        let new_shape = tx_bytes_of(
+            Version(3),
+            &[(op(0), rbf)],
+            vec![
+                TxOut { value: Amount::from_sat(1_000_000), script_pubkey: p2tr_spk(1) },
+                p2a_out(policy::DUST_P2A_SATS),
+            ],
+        );
+        chain.broadcast(&new_shape).expect("scheme-(a) contract shape must relay standalone");
+    }
+
+    /// The other §4.98 half: a ZERO-fee Setup (whole coin into the escrow)
+    /// can never relay standalone — 0-fee with ephemeral dust demands the
+    /// package path, and without the dust it fails min-relay outright.
+    #[test]
+    fn zero_fee_parent_cannot_relay_standalone() {
+        let chain = SimChain::new(100);
+        chain.fund_with_amount(op(0), 100, 1_005_000);
+        let rbf = Sequence::ENABLE_RBF_NO_LOCKTIME;
+        // Old-shape Setup: whole amount to the escrow + 0-value anchor, fee 0.
+        let setup = tx_bytes_of(
+            Version(3),
+            &[(op(0), rbf)],
+            vec![
+                TxOut { value: Amount::from_sat(1_005_000), script_pubkey: p2tr_spk(2) },
+                p2a_out(0),
+            ],
+        );
+        assert!(chain.broadcast(&setup).is_err(), "a 0-fee Setup must not relay standalone");
+        // Without the anchor it fails min-relay instead.
+        let no_anchor = tx_bytes_of(
+            Version(3),
+            &[(op(0), rbf)],
+            vec![TxOut { value: Amount::from_sat(1_005_000), script_pubkey: p2tr_spk(2) }],
+        );
+        assert!(
+            matches!(chain.broadcast(&no_anchor), Err(Error::Deadline(_))),
+            "a 0-fee tx fails min-relay"
+        );
+    }
+
+    /// Ephemeral dust (Core 29+): a 0-fee parent with ONE 0-value anchor is
+    /// accepted ONLY inside a 1P1C package whose child sweeps the dust — the
+    /// scheme-(b) shape works on the package path, proving the policy model
+    /// distinguishes the two §4.98 fixes rather than blanket-rejecting.
+    #[test]
+    fn zero_fee_ephemeral_dust_parent_relays_only_in_package() {
+        let chain = SimChain::new(100);
+        chain.fund_with_amount(op(0), 100, 1_005_000);
+        chain.fund_with_amount(op(9), 100, 50_000); // the fee reserve
+        let rbf = Sequence::ENABLE_RBF_NO_LOCKTIME;
+        let parent = tx_bytes_of(
+            Version(3),
+            &[(op(0), rbf)],
+            vec![
+                TxOut { value: Amount::from_sat(1_005_000), script_pubkey: p2tr_spk(3) },
+                p2a_out(0),
+            ],
+        );
+        let parent_txid: Txid = {
+            let t: Transaction = bitcoin::consensus::encode::deserialize(&parent).unwrap();
+            t.compute_txid()
+        };
+        // Standalone: refused.
+        assert!(chain.broadcast(&parent).is_err());
+        // Child sweeps the dust anchor + brings the fee from the reserve.
+        let child = tx_bytes_of(
+            Version(3), // TRUC: a v3 parent's child must be v3
+            &[(OutPoint::new(parent_txid, 1), rbf), (op(9), rbf)],
+            vec![TxOut { value: Amount::from_sat(48_000), script_pubkey: p2tr_spk(4) }],
+        );
+        let (p, c) = chain.submit_package(&parent, &child).expect("1P1C package accepted");
+        assert_eq!(p, parent_txid);
+        chain.mine();
+        assert!(matches!(chain.spend_status(op(0)), SpendStatus::Confirmed(_)));
+        assert!(matches!(chain.spend_status(OutPoint::new(p, 1)), SpendStatus::Confirmed(_)));
+        let _ = c;
+    }
+
+    /// TRUC topology: a NON-v3 child of an unconfirmed v3 parent is rejected
+    /// (version mix), and a CSV spend of an UNCONFIRMED output is immature.
+    #[test]
+    fn truc_version_mix_and_unconfirmed_csv_are_rejected() {
+        let chain = SimChain::new(100);
+        chain.fund_with_amount(op(0), 100, 1_000_000);
+        let rbf = Sequence::ENABLE_RBF_NO_LOCKTIME;
+        // A v3 parent in the mempool (positive fee, non-dust anchor).
+        let parent = tx_bytes_of(
+            Version(3),
+            &[(op(0), rbf)],
+            vec![
+                TxOut { value: Amount::from_sat(990_000), script_pubkey: p2tr_spk(5) },
+                p2a_out(policy::DUST_P2A_SATS),
+            ],
+        );
+        let parent_txid = chain.broadcast(&parent).unwrap();
+        // v2 child of the unconfirmed v3 parent: version mix — rejected.
+        let bad_child = tx_bytes_of(
+            Version::TWO,
+            &[(OutPoint::new(parent_txid, 0), rbf)],
+            vec![TxOut { value: Amount::from_sat(980_000), script_pubkey: p2tr_spk(6) }],
+        );
+        assert!(matches!(chain.broadcast(&bad_child), Err(Error::Validation(_))));
+        // CSV spend of an unconfirmed output: immature.
+        let csv_child = tx_bytes_of(
+            Version(3),
+            &[(OutPoint::new(parent_txid, 0), Sequence::from_height(1))],
+            vec![TxOut { value: Amount::from_sat(980_000), script_pubkey: p2tr_spk(6) }],
+        );
+        assert!(matches!(chain.broadcast(&csv_child), Err(Error::Deadline(_))));
+    }
+
+    /// RBF-replacing a mempool parent evicts its descendants too — no
+    /// orphaned children left behind; and re-broadcasting a CONFIRMED tx
+    /// stays confirmed (idempotency must not demote it to the mempool).
+    #[test]
+    fn rbf_eviction_cascades_and_confirmed_rebroadcast_is_idempotent() {
+        let chain = SimChain::new(100);
+        chain.fund_with_amount(op(0), 100, 1_000_000);
+        let rbf = Sequence::ENABLE_RBF_NO_LOCKTIME;
+        let parent = tx_bytes_of(
+            Version(3),
+            &[(op(0), rbf)],
+            vec![
+                TxOut { value: Amount::from_sat(990_000), script_pubkey: p2tr_spk(7) },
+                p2a_out(policy::DUST_P2A_SATS),
+            ],
+        );
+        let parent_txid = chain.broadcast(&parent).unwrap();
+        // A v3 child rides on the parent's output.
+        let child = tx_bytes_of(
+            Version(3),
+            &[(OutPoint::new(parent_txid, 0), rbf)],
+            vec![TxOut { value: Amount::from_sat(980_000), script_pubkey: p2tr_spk(8) }],
+        );
+        chain.broadcast(&child).unwrap();
+        assert!(matches!(
+            chain.spend_status(OutPoint::new(parent_txid, 0)),
+            SpendStatus::InMempool
+        ));
+        // Replace the parent (higher fee): the child must be evicted with it.
+        let replacement = tx_bytes_of(
+            Version(3),
+            &[(op(0), rbf)],
+            vec![
+                TxOut { value: Amount::from_sat(985_000), script_pubkey: p2tr_spk(9) },
+                p2a_out(policy::DUST_P2A_SATS),
+            ],
+        );
+        let replacement_txid = chain.broadcast(&replacement).unwrap();
+        assert_eq!(
+            chain.spend_status(OutPoint::new(parent_txid, 0)),
+            SpendStatus::Unspent,
+            "the evicted parent's output no longer exists to be spent"
+        );
+        chain.mine();
+        // Re-broadcasting the CONFIRMED replacement is a no-op, not a demote.
+        assert!(matches!(chain.spend_status(op(0)), SpendStatus::Confirmed(_)));
+        assert_eq!(chain.broadcast(&replacement).unwrap(), replacement_txid);
+        assert!(
+            matches!(chain.spend_status(op(0)), SpendStatus::Confirmed(_)),
+            "rebroadcast must not demote a confirmed tx to the mempool"
+        );
+    }
+
+    /// Pure-policy unit checks: dust thresholds by SPK type and the exact
+    /// old-shape rejection reason.
+    #[test]
+    fn policy_dust_thresholds_and_reasons() {
+        use policy::*;
+        assert_eq!(dust_threshold(p2a_out(0).script_pubkey.as_script()), DUST_P2A_SATS);
+        assert_eq!(dust_threshold(p2tr_spk(1).as_script()), DUST_P2TR_SATS);
+        assert!(is_p2a(p2a_out(0).script_pubkey.as_script()));
+        assert!(is_standard_spk(p2tr_spk(1).as_script()));
+        assert!(!is_standard_spk(ScriptBuf::new().as_script()));
+
+        // Old shape, checked at the policy layer directly: Dust.
+        let tx: Transaction = bitcoin::consensus::encode::deserialize(&tx_bytes_of(
+            Version(3),
+            &[(op(0), Sequence::ENABLE_RBF_NO_LOCKTIME)],
+            vec![
+                TxOut { value: Amount::from_sat(1_000_000), script_pubkey: p2tr_spk(1) },
+                p2a_out(0),
+            ],
+        ))
+        .unwrap();
+        let ctx = [PrevoutCtx {
+            unconfirmed_parent: false,
+            parent_is_v3: false,
+            parent_has_other_child: false,
+        }];
+        assert!(matches!(
+            check_tx(&tx, 5_000, &ctx, None),
+            Err(PolicyViolation::Dust { vout: 1, value: 0, threshold: DUST_P2A_SATS })
+        ));
+        // Same tx with a 240-sat anchor: clean.
+        let mut fixed = tx.clone();
+        fixed.output[1].value = Amount::from_sat(DUST_P2A_SATS);
+        assert!(check_tx(&fixed, 5_000, &ctx, None).is_ok());
     }
 }

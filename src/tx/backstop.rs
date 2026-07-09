@@ -1,7 +1,8 @@
 //! Congestion-only CPFP fee backstop (v3.13).
 //!
-//! Every contract tx (Setup/Completion/Refund) carries a 0-value ephemeral
-//! P2A anchor. On the happy path it is left unspent (no external link). ONLY
+//! Every contract tx (Setup/Completion/Refund) carries a non-dust P2A anchor
+//! (`Params::anchor_sats`, scheme (a) — see `tx::txbuild::anchor_output`).
+//! On the happy path it is left unspent (no external link). ONLY
 //! under a genuine fee spike beyond the baked-in Δ_fee does a wallet spend
 //! the anchor with a CPFP child that pulls the parent up to a relayable
 //! feerate — funded from a RESERVE coin so no swap-path coin is touched.
@@ -21,7 +22,7 @@
 //! behind an explicit consent (`LinkageAck`) and records the taint.
 
 use crate::tx::setup::pre_encumbrance_spk;
-use crate::tx::txbuild::{ephemeral_anchor, TRUC_VERSION};
+use crate::tx::txbuild::{anchor_output, TRUC_VERSION};
 use crate::{Error, Result};
 use bitcoin::hashes::Hash as _;
 use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
@@ -74,11 +75,10 @@ pub fn required_child_fee(
 /// Build the anchor+reserve CPFP child that bumps `parent_anchor` (the
 /// parent's `(txid, ANCHOR_VOUT)`), paying `child_fee_sats` out of the reserve
 /// coin. `anchor_value_sats` MUST equal the parent anchor output's real value
-/// (0 under the current ephemeral-anchor stand-in; the future standard anchor
-/// carries a non-dust value — see the fee-model note in `tx::txbuild`) so the
-/// prevout the sighash commits to matches consensus (finding #6). The anchor
-/// value is added to the child's input total. Total; refuses an absurd fee, a
-/// non-anchor vout, or a fee that would leave dust/negative change.
+/// (`Params::anchor_sats` under the scheme-(a) fee model — see `tx::txbuild`)
+/// so the prevout the sighash commits to matches consensus (finding #6). The
+/// anchor value is added to the child's input total. Total; refuses an absurd
+/// fee, a non-anchor vout, or a fee that would leave dust/negative change.
 pub fn build_cpfp_bump(
     parent_anchor: OutPoint,
     anchor_value_sats: u64,
@@ -112,8 +112,7 @@ pub fn build_cpfp_bump(
     }
 
     // Prevouts, in input order: [P2A anchor (its real value), reserve (P2TR)].
-    let mut anchor_prevout = ephemeral_anchor();
-    anchor_prevout.value = Amount::from_sat(anchor_value_sats);
+    let anchor_prevout = anchor_output(anchor_value_sats);
     let reserve_spk = pre_encumbrance_spk(reserve_xonly)?;
     let reserve_prevout = TxOut {
         value: Amount::from_sat(reserve_amount_sats),

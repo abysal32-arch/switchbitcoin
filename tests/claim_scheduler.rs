@@ -70,7 +70,7 @@ fn sl_claim_is_posture_delayed_reveal_observed_and_bound_holds() {
     let params = manifest.params().clone();
     let scheduler = ClaimScheduler::from_manifest(&manifest);
     let s_height = 800_000u32;
-    let escrow_amount = params.tier_d_sats + params.delta_fee_sats;
+    let escrow_amount = params.escrow_amount_sats(); // scheme (a)
     let d = params.tier_d_sats;
     let delta_late = u32::try_from(params.delta_late()).unwrap();
 
@@ -89,9 +89,9 @@ fn sl_claim_is_posture_delayed_reveal_observed_and_bound_holds() {
 
     let dest = escrow_comp_sh.funding_script_pubkey().clone();
     let comp_sh_spend =
-        build_completion(&escrow_comp_sh, op_comp_sh, escrow_amount, dest.clone(), d).unwrap();
+        build_completion(&escrow_comp_sh, op_comp_sh, escrow_amount, dest.clone(), d, params.anchor_sats).unwrap();
     let comp_sl_spend =
-        build_completion(&escrow_comp_sl, op_comp_sl, escrow_amount, dest, d).unwrap();
+        build_completion(&escrow_comp_sl, op_comp_sl, escrow_amount, dest, d, params.anchor_sats).unwrap();
     let msg_sh = comp_sh_spend.sighash;
     let msg_sl = comp_sl_spend.sighash;
     let root_sh = escrow_comp_sh.merkle_root();

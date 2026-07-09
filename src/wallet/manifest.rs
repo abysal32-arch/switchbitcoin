@@ -49,11 +49,11 @@ use std::path::{Path, PathBuf};
 
 /// Body-layout format byte (layout versioning, distinct from the manifest's
 /// monotonic `version`).
-const FMT: u8 = 1;
+const FMT: u8 = 2; // v2: +16 bytes scheme-(a) fee components (anchor, setup_fee)
 /// Network binding: a testnet manifest must not take effect on a mainnet
 /// wallet (cross-network replay). The prototype is testnet-only.
 const NETWORK_TESTNET: u8 = 0;
-const BODY_LEN: usize = 1 + 1 + 4 + 44 + 1 + 24 + 4 + 2; // 81
+const BODY_LEN: usize = 1 + 1 + 4 + 60 + 1 + 24 + 4 + 2; // 97
 const ENVELOPE_LEN: usize = BODY_LEN + 64;
 
 /// The pinned manifest-signing key seam. In production this is the network
@@ -254,8 +254,10 @@ impl SignedManifest {
     }
 
     // ---- canonical body (all integers LE) ----
-    // [1 fmt=1][1 network][4 version][44 params][1 posture]
-    // [(4 min)(4 max) x3][4 jitter][2 q]     = 81 bytes
+    // [1 fmt=2][1 network][4 version][60 params: tier(8) fee(8) anchor(8)
+    // setup_fee(8) early(4) margin(4) buffer(4) allowance(4) cofund(4)
+    // onboard_lo(4) onboard_hi(4)][1 posture]
+    // [(4 min)(4 max) x3][4 jitter][2 q]     = 97 bytes
 
     fn body_bytes(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(BODY_LEN);
@@ -264,6 +266,8 @@ impl SignedManifest {
         v.extend_from_slice(&self.version.to_le_bytes());
         v.extend_from_slice(&self.params.tier_d_sats.to_le_bytes());
         v.extend_from_slice(&self.params.delta_fee_sats.to_le_bytes());
+        v.extend_from_slice(&self.params.anchor_sats.to_le_bytes());
+        v.extend_from_slice(&self.params.setup_fee_sats.to_le_bytes());
         v.extend_from_slice(&self.params.delta_early.to_le_bytes());
         v.extend_from_slice(&self.params.margin.to_le_bytes());
         v.extend_from_slice(&self.params.delta_buffer.to_le_bytes());
@@ -298,6 +302,8 @@ impl SignedManifest {
         let params = Params {
             tier_d_sats: take_le_u64(b, &mut at)?,
             delta_fee_sats: take_le_u64(b, &mut at)?,
+            anchor_sats: take_le_u64(b, &mut at)?,
+            setup_fee_sats: take_le_u64(b, &mut at)?,
             delta_early: take_le_u32(b, &mut at)?,
             margin: take_le_u32(b, &mut at)?,
             delta_buffer: take_le_u32(b, &mut at)?,

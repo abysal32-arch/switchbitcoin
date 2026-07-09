@@ -183,43 +183,71 @@ Req 1 mandates **libsecp256k1-zkp** (Blockstream fork, MuSig2+adaptor in one aud
 
 ---
 
-## 4.98 ⚠ THE #1 TESTNET BLOCKER — fee/anchor model is non-standard on real Core
+## 4.98 ✅ RESOLVED IN-MODEL (scheme a) — fee/anchor model now standalone-relayable; real-node confirmation is the remaining gate
 
 An adversarial review of the fee-backstop layer surfaced a **CONFIRMED
-CRITICAL** that the in-process sim structurally cannot catch, because `SimChain`
-models consensus *physics* (single-spend, CSV, RBF, a congestion min-fee) but
-has **no dust / standardness / package-relay policy** — which is precisely the
-layer this defect lives in.
+CRITICAL** that the original in-process sim structurally could not catch, because
+`SimChain` modelled consensus *physics* (single-spend, CSV, RBF, a congestion
+min-fee) but had **no dust / standardness / package-relay policy** — the layer
+the defect lived in. **Both halves have since been addressed:** scheme (a) is
+implemented, and the sim now models the relevant Core relay policy and enforces
+it on broadcast, so the defect class is caught in-process. What remains is
+confirmation against a *real* node (the model is not Core).
 
-**The defect.** Every contract tx carries a **0-value P2A ephemeral anchor**
-(`OP_1 <0x4e73>`) as its last output, while `build_completion`/`build_refund`
-pay a **positive** baked fee. Under Bitcoin Core 28+, a 0-value (sub-dust)
-output only relays via the *ephemeral-dust* rule, which requires the parent to
-pay **zero** fee and be submitted in a **package** with a child that spends the
-dust. A positive-fee parent carrying a 0-value output is just **dust → rejected
-at submission**. So on a real node:
+**The original defect.** Every contract tx carried a **0-value P2A ephemeral
+anchor** (`OP_1 <0x4e73>`) as its last output while `build_completion` /
+`build_refund` paid a **positive** baked fee. Under Bitcoin Core 28+, a 0-value
+(sub-dust) output only relays via the *ephemeral-dust* rule, which requires the
+parent to pay **zero** fee and be submitted in a **package** whose child spends
+the dust; a positive-fee parent carrying a 0-value output is just **dust →
+rejected at submission**. So on a real node every completion and pre-armed refund
+(including the **G2 dead-device refund fire**) would have been rejected before
+fee evaluation, and the **Setup** — spending the whole `D+Δ_fee` pre-encumbrance
+UTXO — paid zero fee and could never relay standalone at all.
 
-- every **completion** and every **pre-armed refund** would be rejected before
-  fee evaluation — including the **G2 dead-device refund fire**, which is the
-  crash-safety guarantee the whole watchtower exists for;
-- the **Setup** is worse: spending the whole `D+Δ_fee` pre-encumbrance UTXO into
-  the escrow, it pays **zero** fee and so can never relay standalone at all —
-  it *requires* a mandatory CPFP child, not a congestion-only one.
+**The fix (scheme a), now in code.** `Params` carries an explicit fee-component
+budget, validated on every parse (`params.rs` `validate()`):
+`setup_fee + 2·anchor + settlement_fee == delta_fee`, all strictly positive.
+Concretely: `anchor_sats ≥ 240` (the P2A dust floor, Core 28+), `setup_fee_sats`
+is positive so the **Setup relays standalone** and its anchor CPFP stays truly
+congestion-only, and `escrow_amount_sats() = pre_encumbrance − setup_cost` (=
+`D + Δ_fee − (setup_fee + anchor)`). Every contract tx (Setup, completion,
+refund) therefore carries a real positive fee and a **non-dust** anchor, and
+relays standalone. Escrows stay equal across a tier (the privacy linchpin): the
+escrow amount is a pure function of the manifest params, identical for every
+participant. This cascaded through onboarding, funding, and the drivers (the
+ledger's pre-encumbrance unit stays `D + Δ_fee`; only the escrow *output* is
+reduced by `setup_cost`).
 
-**Why it is not "fixed" in code.** Two coherent schemes resolve it; both keep
-escrows equal across a tier (the privacy linchpin). Scheme **(a)** — a non-dust
-anchor (≥ ~240 sats) plus `escrow_amount = D + Δ_fee − setup_cost` so every
-parent (Setup included) carries a real positive fee and relays standalone, CPFP
-truly congestion-only. Scheme **(b)** — LN-style 0-fee parents with a mandatory
-1P1C package on every broadcast. **The exact values (anchor size, the
-setup/completion fee split, target package feerate) are testnet-tuned, and the
-structure cannot be validated against real Core policy in-process.** Rewriting
-the fee model now would change the escrow amount and cascade through onboarding,
-funding, and the drivers while giving *false confidence* — "changed" but still
-unproven against the one thing (a real node) that decides it. So it is left as a
-**loudly-flagged known-defect** (`tx::txbuild::ephemeral_anchor` doc) rather than
-a hasty rewrite. **This must be resolved and validated on the first testnet
-broadcast, before any real funds.** Recommendation: scheme (a).
+**The sim now enforces relay policy** (`src/chain/policy.rs`). It models Core
+29.x's dust thresholds (per-SPK-type), min-relay feerate (kept at the stricter
+1 sat/vB), output-script standardness, TRUC/BIP431 topology (v3-only unconfirmed
+chains, 1-parent-1-child, child-size cap), the ephemeral-dust conditions, and
+1P1C package feerate. `SimChain::broadcast` and `submit_package` run this gate
+before physics and map rejections to `PolicyViolation`. This is what makes the
+defect visible in-process: a non-standard, dust-bearing, or below-min-relay tx
+is now **rejected**, not silently accepted. **Proven end-to-end:** the engine
+integration test (`tests/engine.rs`) broadcasts a real `build_completion` tx
+(positive fee, 240-sat non-dust anchor, `D` output) through the gate and it is
+accepted; the dead-device refund fires and relays at maturity; and the
+congestion path surfaces `RefundStalledBelowFeeFloor`, with the CPFP child
+clearing via `submit_package` on the package feerate.
+
+**Honest residual — why the testnet broadcast is still the gate.**
+`chain/policy.rs` is a **model** of Core policy, not Core. Its fidelity note
+documents what it omits: sigops-adjusted vsize, mempool eviction dynamics, TRUC
+sibling *eviction* (a second child of a TRUC parent is rejected here where Core
+28+ would consider evicting the incumbent — strictly stricter, the safe
+direction), and Script execution (signature validity is proven separately,
+bitcoin-side, in `tests/taproot_swap.rs`). The exact numbers (anchor size, the
+setup/settlement fee split, target package feerate) remain **testnet-tuning
+parameters** — `delta_fee_sats` is a flagged placeholder. So the model now
+catches the *class* of defect that was previously invisible and the recommended
+scheme (a) is the one implemented, but the **first real testnet broadcast
+remains the final validation gate before any real funds.** The policy facts were
+verified against Core release notes 28.0–31.0 and `policy.cpp` /
+`ephemeral_policy.cpp` / `truc_policy.h` (see the module header); re-confirm on
+that first broadcast.
 
 The nine *other* review findings (bump-construction robustness, reveal/role-aware
 backstop routing, the dead-device fee-floor stall → actionable

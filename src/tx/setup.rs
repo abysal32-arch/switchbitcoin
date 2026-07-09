@@ -2,15 +2,19 @@
 //!
 //! Onboarding pre-sizes each pre-encumbrance UTXO to exactly D + Δ_fee in a
 //! Taproot single-sig address the depositor controls alone. The Setup spends
-//! that UTXO WHOLE into the 2-of-2 MuSig2 escrow — single input, single escrow
-//! output, NO change — so swap funding needs no change output and the escrow is
-//! exactly equal for everyone in the tier (the on-chain privacy linchpin). The
-//! Setup is TRUC/v3 and carries the ephemeral anchor; it pays no baked fee (the
-//! whole D + Δ_fee lands in the escrow), so its fee is a congestion-only CPFP
-//! from the anchor, exactly like a completion/refund.
+//! that UTXO WHOLE into the 2-of-2 MuSig2 escrow — single input, escrow
+//! output + P2A anchor, NO change — so swap funding needs no change output
+//! and the escrow is exactly equal for everyone in the tier (the on-chain
+//! privacy linchpin). The Setup is TRUC/v3; under the scheme-(a) fee model
+//! (§4.98 resolution) it pays a real baked `setup_fee` (so it relays
+//! STANDALONE on real Core policy — a 0-fee tx cannot), the anchor carries a
+//! standard non-dust value, and the escrow receives
+//! `D + Δ_fee − setup_fee − anchor = Params::escrow_amount_sats()`. The
+//! anchor CPFP remains a congestion-only backstop, exactly like a
+//! completion/refund.
 
 use crate::tx::escrow::Escrow;
-use crate::tx::txbuild::{ephemeral_anchor, finalize_key_spend, SpendTx, TRUC_VERSION};
+use crate::tx::txbuild::{anchor_output, finalize_key_spend, SpendTx, TRUC_VERSION};
 use crate::{Error, Result};
 use bitcoin::hashes::Hash as _;
 use bitcoin::key::TapTweak;
@@ -46,16 +50,30 @@ pub(crate) fn sign_key_path_tweaked(seckey_bytes: [u8; 32], sighash: [u8; 32]) -
     Ok(out)
 }
 
-/// Build and sign the Setup: spend the whole D + Δ_fee pre-encumbrance UTXO into
-/// the escrow with NO change (single input, escrow output + ephemeral anchor),
-/// TRUC/v3. Returns the fully-signed tx bytes and the escrow OUTPOINT it creates
-/// (setup_txid:0). `pre_amount_sats` must equal the escrow amount (D + Δ_fee).
+/// Build and sign the Setup: spend the whole D + Δ_fee pre-encumbrance UTXO
+/// into the escrow with NO change (single input, escrow output + P2A anchor),
+/// TRUC/v3, paying `pre_amount − escrow_amount − anchor = setup_fee` as a
+/// real standalone-relayable fee. Returns the fully-signed tx bytes and the
+/// escrow OUTPOINT it creates (setup_txid:0). Callers pass
+/// `Params::escrow_amount_sats()` / `Params::anchor_sats`; the conservation
+/// guard refuses any split that pays no (or negative) fee.
 pub fn build_setup(
     pre_outpoint: OutPoint,
     pre_amount_sats: u64,
+    escrow_amount_sats: u64,
+    anchor_sats: u64,
     escrow: &Escrow,
     funder_seckey: &secp::Scalar,
 ) -> Result<(Vec<u8>, OutPoint)> {
+    // Conservation: escrow + anchor strictly below the pre-encumbrance coin,
+    // the remainder being the Setup's baked fee (§4.98 scheme (a) — a 0-fee
+    // Setup cannot relay standalone on real Core policy).
+    if escrow_amount_sats
+        .checked_add(anchor_sats)
+        .is_none_or(|t| t >= pre_amount_sats)
+    {
+        return Err(Error::Validation("setup: escrow + anchor must leave a positive fee"));
+    }
     let funder_xonly = (*funder_seckey * secp::G).serialize_xonly();
     let pre_spk = pre_encumbrance_spk(funder_xonly)?;
 
@@ -68,13 +86,13 @@ pub fn build_setup(
             sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
             witness: Witness::new(),
         }],
-        // Whole-UTXO into the escrow (no change) + the 0-value ephemeral anchor.
+        // Whole-UTXO spend, no change: escrow output + the non-dust anchor.
         output: vec![
             TxOut {
-                value: Amount::from_sat(pre_amount_sats),
+                value: Amount::from_sat(escrow_amount_sats),
                 script_pubkey: escrow.funding_script_pubkey().clone(),
             },
-            ephemeral_anchor(),
+            anchor_output(anchor_sats),
         ],
     };
 
@@ -207,20 +225,38 @@ mod tests {
                 .unwrap();
         let escrow = Escrow::new(&internal, &(sk_funder * secp::G), 216).unwrap();
 
-        let d_plus_fee = 1_005_000u64; // D + Δ_fee
+        let p = crate::settlement::params::Params::testnet_provisional();
+        let d_plus_fee = p.pre_encumbrance_sats(); // D + Δ_fee
         let pre_outpoint =
             OutPoint::new(bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::all_zeros()), 0);
-        let (signed, escrow_op) =
-            build_setup(pre_outpoint, d_plus_fee, &escrow, &sk_funder).unwrap();
+        let (signed, escrow_op) = build_setup(
+            pre_outpoint,
+            d_plus_fee,
+            p.escrow_amount_sats(),
+            p.anchor_sats,
+            &escrow,
+            &sk_funder,
+        )
+        .unwrap();
 
         let tx: Transaction = bitcoin::consensus::encode::deserialize(&signed).unwrap();
         // TRUC/v3, single input, escrow output + anchor, NO change.
         assert_eq!(tx.version, TRUC_VERSION);
         assert_eq!(tx.input.len(), 1, "whole-UTXO spend, single input");
-        assert_eq!(tx.output.len(), 2, "escrow output + ephemeral anchor, no change");
-        assert_eq!(tx.output[0].value.to_sat(), d_plus_fee, "escrow gets the whole D + Δ_fee");
+        assert_eq!(tx.output.len(), 2, "escrow output + P2A anchor, no change");
+        assert_eq!(
+            tx.output[0].value.to_sat(),
+            p.escrow_amount_sats(),
+            "escrow gets D + Δ_fee − setup_cost (scheme (a))"
+        );
+        assert_eq!(tx.output[1].value.to_sat(), p.anchor_sats, "non-dust anchor");
+        // The Setup pays its baked fee — standalone-relayable (§4.98).
+        let fee = d_plus_fee - tx.output.iter().map(|o| o.value.to_sat()).sum::<u64>();
+        assert_eq!(fee, p.setup_fee_sats);
         assert!(escrow.funding_script_pubkey() == &tx.output[0].script_pubkey);
         assert_eq!(escrow_op, OutPoint::new(tx.compute_txid(), 0));
+        // A 0-fee split (the old shape) is rejected at construction.
+        assert!(build_setup(pre_outpoint, d_plus_fee, d_plus_fee, 0, &escrow, &sk_funder).is_err());
 
         // The key-path signature verifies against the pre-encumbrance OUTPUT key
         // (funder key tweaked by the empty merkle root) — proven bitcoin-side.

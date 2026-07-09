@@ -90,7 +90,7 @@ fn sl_crash_in_g1_window_recovers_from_store_and_claims() {
     let sl = keypair();
     let params = Params::testnet_provisional();
     let s_height = 700_000u32;
-    let escrow_amount = params.tier_d_sats + params.delta_fee_sats;
+    let escrow_amount = params.escrow_amount_sats(); // scheme (a)
     let d = params.tier_d_sats;
     let delta_late = u32::try_from(params.delta_late()).unwrap();
 
@@ -103,9 +103,9 @@ fn sl_crash_in_g1_window_recovers_from_store_and_claims() {
 
     let dest = escrow_comp_sh.funding_script_pubkey().clone();
     let comp_sh_spend =
-        build_completion(&escrow_comp_sh, op_comp_sh, escrow_amount, dest.clone(), d).unwrap();
+        build_completion(&escrow_comp_sh, op_comp_sh, escrow_amount, dest.clone(), d, params.anchor_sats).unwrap();
     let comp_sl_spend =
-        build_completion(&escrow_comp_sl, op_comp_sl, escrow_amount, dest.clone(), d).unwrap();
+        build_completion(&escrow_comp_sl, op_comp_sl, escrow_amount, dest.clone(), d, params.anchor_sats).unwrap();
     let msg_comp_sh = comp_sh_spend.sighash;
     let msg_comp_sl = comp_sl_spend.sighash;
     let root_sh = escrow_comp_sh.merkle_root();
@@ -121,6 +121,7 @@ fn sl_crash_in_g1_window_recovers_from_store_and_claims() {
         &sl.sk,
         dest.clone(),
         d,
+        params.anchor_sats,
         s_height,
     )
     .expect("arm SL refund");
@@ -278,7 +279,7 @@ fn crash_mid_signing_reclaims_via_persisted_refund() {
     let sl = keypair();
     let params = Params::testnet_provisional();
     let s_height = 500_000u32;
-    let escrow_amount = params.tier_d_sats + params.delta_fee_sats;
+    let escrow_amount = params.escrow_amount_sats(); // scheme (a)
     let d = params.tier_d_sats;
 
     let internal =
@@ -290,7 +291,7 @@ fn crash_mid_signing_reclaims_via_persisted_refund() {
 
     let dest = escrow.funding_script_pubkey().clone();
     let refund =
-        PreArmedRefund::arm(&escrow, op, escrow_amount, &sl.sk, dest, d, s_height).expect("arm");
+        PreArmedRefund::arm(&escrow, op, escrow_amount, &sl.sk, dest, d, params.anchor_sats, s_height).expect("arm");
     let maturity = refund.csv_maturity_height();
 
     let sid = swap_session_id(sl.pk, sh.pk).expect("sid");

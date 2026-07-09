@@ -16,12 +16,35 @@
 
 use crate::{Error, Result};
 
+/// Floor for the Setup's baked fee: a Setup is ~125 vB (one taproot key-path
+/// input, P2TR escrow output + P2A anchor), so 200 sats keeps it strictly
+/// above the 1 sat/vB min-relay with headroom. Testnet-tunable.
+pub const MIN_SETUP_FEE_SATS: u64 = 200;
+
+/// Floor for the derived settlement fee: the refund (the larger settlement
+/// tx, ~205 vB with its script-path witness) must clear min-relay with
+/// headroom. Testnet-tunable.
+pub const MIN_SETTLEMENT_FEE_SATS: u64 = 300;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Params {
     /// Exactly-equal swapped output per tier (satoshis). Testnet: 0.01 tBTC.
     pub tier_d_sats: u64,
-    /// Baked-in fee margin (satoshis). Sized to worse of completion/refund + headroom.
+    /// Baked-in fee margin (satoshis). Under the scheme-(a) fee model
+    /// (§4.98 resolution) it is CONSUMED EXACTLY by the four components:
+    /// `setup_fee + anchor + settlement_fee + anchor == delta_fee`, where
+    /// `settlement_fee` is derived (`settlement_fee_sats()`), so the
+    /// completion/refund destination still receives exactly D.
     pub delta_fee_sats: u64,
+    /// Value of the P2A anchor output every contract tx (Setup, Completion,
+    /// Refund) carries. Must be at least the 240-sat P2A dust floor so a
+    /// POSITIVE-fee parent relays standalone on real Core (the ephemeral
+    /// 0-value anchor is only relayable on 0-fee package parents). Manifest-
+    /// signed like every fee component: equal anchors across the tier.
+    pub anchor_sats: u64,
+    /// The Setup's baked fee. Positive, so the Setup relays STANDALONE and
+    /// the anchor CPFP stays truly congestion-only.
+    pub setup_fee_sats: u64,
     /// SL refund maturity, relative blocks from S.
     pub delta_early: u32,
     /// Extra margin so SH refund matures later. delta_late = delta_early + margin.
@@ -43,6 +66,8 @@ impl Params {
         Params {
             tier_d_sats: 1_000_000,      // 0.01 tBTC
             delta_fee_sats: 5_000,       // placeholder; TUNE on testnet
+            anchor_sats: 240,            // the P2A dust floor (Core 28+)
+            setup_fee_sats: 1_200,       // Setup ~125 vB; TUNE on testnet
             delta_early: 144,            // ~24 h
             margin: 72,                  // ~12 h -> delta_late ~ 216
             delta_buffer: 24,            // ~4 h
@@ -55,6 +80,41 @@ impl Params {
     /// delta_late = delta_early + margin, computed in u64: total for any inputs.
     pub fn delta_late(&self) -> u64 {
         self.delta_early as u64 + self.margin as u64
+    }
+
+    // ---- Fee-model arithmetic (scheme (a), §4.98 resolution) ----------------
+    // The pre-encumbrance coin is exactly D + Δ_fee (onboarding split target,
+    // unchanged). The Setup consumes setup_cost = setup_fee + anchor from it,
+    // so the escrow is D + Δ_fee − setup_cost; the settlement (completion or
+    // refund) delivers exactly D, carries its own anchor, and pays the
+    // remainder: settlement_fee = Δ_fee − setup_fee − 2·anchor. All four
+    // components are manifest-signed, so escrows stay EQUAL across a tier
+    // (the privacy linchpin). All accessors are total (saturating); on
+    // `validate()`-accepted params they are exact.
+
+    /// The onboarding split target / pre-encumbrance coin size: exactly D + Δ_fee.
+    pub fn pre_encumbrance_sats(&self) -> u64 {
+        self.tier_d_sats.saturating_add(self.delta_fee_sats)
+    }
+
+    /// What the Setup consumes from Δ_fee: its baked fee plus its anchor.
+    pub fn setup_cost_sats(&self) -> u64 {
+        self.setup_fee_sats.saturating_add(self.anchor_sats)
+    }
+
+    /// The escrow amount every tier participant funds: D + Δ_fee − setup_cost.
+    /// THE encumbrance-verification amount (the funding gate compares the
+    /// counterparty escrow against exactly this).
+    pub fn escrow_amount_sats(&self) -> u64 {
+        self.pre_encumbrance_sats().saturating_sub(self.setup_cost_sats())
+    }
+
+    /// The baked settlement fee a completion/refund pays:
+    /// escrow − D − anchor = Δ_fee − setup_fee − 2·anchor.
+    pub fn settlement_fee_sats(&self) -> u64 {
+        self.escrow_amount_sats()
+            .saturating_sub(self.tier_d_sats)
+            .saturating_sub(self.anchor_sats)
     }
 
     /// THE ordering invariant. Cryptographer review item #5 depends on this holding.
@@ -98,6 +158,32 @@ impl Params {
         }
         if self.delta_fee_sats >= self.tier_d_sats {
             return Err(Error::Deadline("delta_fee must be smaller than tier D"));
+        }
+        // --- Fee-model components (scheme (a)): every contract tx must be
+        // STANDALONE-relayable on real Core policy, or the G2 dead-device
+        // refund fire is dead on arrival. The anchor must clear the P2A dust
+        // floor (a below-dust anchor on a positive-fee parent is rejected as
+        // dust); the setup fee and the DERIVED settlement fee must clear
+        // real min-relay floors with headroom. Checked arithmetic: hostile
+        // params get Err, never an underflowed escrow amount.
+        if self.anchor_sats < crate::chain::policy::DUST_P2A_SATS {
+            return Err(Error::Deadline("anchor must be at least the P2A dust floor (240 sats)"));
+        }
+        if self.setup_fee_sats < MIN_SETUP_FEE_SATS {
+            return Err(Error::Deadline("setup fee below the standalone-relay floor"));
+        }
+        let committed = self
+            .setup_fee_sats
+            .checked_add(self.anchor_sats.checked_mul(2).ok_or(Error::Deadline("anchor overflow"))?)
+            .ok_or(Error::Deadline("fee component overflow"))?;
+        let settlement_fee = self
+            .delta_fee_sats
+            .checked_sub(committed)
+            .ok_or(Error::Deadline("delta_fee cannot cover setup fee + two anchors"))?;
+        if settlement_fee < MIN_SETTLEMENT_FEE_SATS {
+            return Err(Error::Deadline(
+                "derived settlement fee below the standalone-relay floor",
+            ));
         }
         // Onboarding delay: zero lower bound would defeat the withdrawal<->
         // encumbrance timing decorrelation entirely; inverted bounds are
@@ -159,6 +245,54 @@ mod tests {
     #[test]
     fn provisional_defaults_validate() {
         assert!(Params::testnet_provisional().validate().is_ok());
+    }
+
+    #[test]
+    fn fee_components_conserve_delta_fee_and_output_stays_d() {
+        let p = Params::testnet_provisional();
+        // setup_fee + anchor + settlement_fee + anchor == delta_fee, exactly.
+        assert_eq!(
+            p.setup_fee_sats + p.anchor_sats + p.settlement_fee_sats() + p.anchor_sats,
+            p.delta_fee_sats
+        );
+        // Escrow = pre-encumbrance − setup_cost; settlement delivers exactly D.
+        assert_eq!(p.escrow_amount_sats(), p.pre_encumbrance_sats() - p.setup_cost_sats());
+        assert_eq!(
+            p.escrow_amount_sats() - p.settlement_fee_sats() - p.anchor_sats,
+            p.tier_d_sats
+        );
+    }
+
+    #[test]
+    fn fee_component_violations_are_rejected() {
+        let base = Params::testnet_provisional();
+
+        // Sub-dust anchor: the §4.98 defect shape (0-value anchor) must be
+        // unrepresentable in validated params.
+        let mut p = base.clone();
+        p.anchor_sats = 0;
+        assert!(p.validate().is_err());
+        let mut p = base.clone();
+        p.anchor_sats = 239;
+        assert!(p.validate().is_err());
+
+        // Zero/dusty setup fee: the Setup could not relay standalone.
+        let mut p = base.clone();
+        p.setup_fee_sats = 0;
+        assert!(p.validate().is_err());
+
+        // delta_fee too small to cover the components: rejected, not underflowed.
+        let mut p = base.clone();
+        p.delta_fee_sats = p.setup_fee_sats + 2 * p.anchor_sats; // settlement fee would be 0
+        assert!(p.validate().is_err());
+
+        // Hostile extremes: total, never a panic.
+        let mut p = base.clone();
+        p.anchor_sats = u64::MAX;
+        p.setup_fee_sats = u64::MAX;
+        assert!(p.validate().is_err());
+        let _ = p.escrow_amount_sats();
+        let _ = p.settlement_fee_sats();
     }
 
     #[test]

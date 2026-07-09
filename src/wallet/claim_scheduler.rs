@@ -253,6 +253,14 @@ mod tests {
         OutPoint::new(bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::from_byte_array(b)), 0)
     }
 
+    /// A standard P2TR-shaped scriptPubKey (`OP_1 <32 bytes>`). The relay-policy
+    /// gate rejects an empty (non-standard) spk, so fixtures must look real.
+    fn std_p2tr_spk() -> bitcoin::ScriptBuf {
+        let mut v = vec![0x51u8, 0x20];
+        v.extend_from_slice(&[0x77u8; 32]);
+        bitcoin::ScriptBuf::from_bytes(v)
+    }
+
     /// A real spend of `outpoint` paying `out` sats, so the sim gives it a txid.
     fn spend_of(outpoint: OutPoint, out: u64) -> Vec<u8> {
         use bitcoin::{absolute, transaction::Version, Amount, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
@@ -265,7 +273,7 @@ mod tests {
                 sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 witness: Witness::new(),
             }],
-            output: vec![TxOut { value: Amount::from_sat(out), script_pubkey: ScriptBuf::new() }],
+            output: vec![TxOut { value: Amount::from_sat(out), script_pubkey: std_p2tr_spk() }],
         };
         bitcoin::consensus::encode::serialize(&tx)
     }
