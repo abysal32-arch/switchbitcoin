@@ -31,6 +31,7 @@ fn policy_reject(v: policy::PolicyViolation) -> Error {
         V::Dust { .. } => Error::Validation("policy: dust output"),
         V::FeeBelowMinRelay { .. } => Error::Deadline("policy: min relay fee not met"),
         V::NonStandardScript { .. } => Error::Validation("policy: non-standard scriptPubKey"),
+        V::NonStandardVersion { .. } => Error::Validation("policy: non-standard tx version"),
         V::TrucTooLarge { .. } => Error::Validation("policy: TRUC tx too large"),
         V::TrucChildTooLarge { .. } => Error::Validation("policy: TRUC child too large"),
         V::TrucVersionMix => Error::Validation("policy: v3/non-v3 unconfirmed spend mix"),
@@ -186,6 +187,24 @@ impl Inner {
                         .unwrap_or(false)
                 })
         })
+    }
+
+    /// The number of DISTINCT unconfirmed ANCESTOR transactions of `tx`
+    /// (transitive over inputs), for the TRUC ancestor-limit check. Counts
+    /// ancestor TXS, not inputs: a tx spending two outputs of one unconfirmed
+    /// parent has ONE ancestor, and a G→P→C chain has two. Confirmed prevouts
+    /// (funding outputs or confirmed txs) end the walk.
+    fn unconfirmed_ancestor_count(&self, tx: &Transaction) -> usize {
+        let mut seen: std::collections::BTreeSet<Txid> = std::collections::BTreeSet::new();
+        let mut stack: Vec<Txid> = tx.input.iter().map(|i| i.previous_output.txid).collect();
+        while let Some(txid) = stack.pop() {
+            if self.is_unconfirmed(&txid) && seen.insert(txid) {
+                if let Some(parent) = self.txs.get(&txid) {
+                    stack.extend(parent.input.iter().map(|i| i.previous_output.txid));
+                }
+            }
+        }
+        seen.len()
     }
 
     /// Resolve every input: total input value, CSV maturity, and the policy
@@ -421,9 +440,10 @@ impl SimChain {
 
         // --- Parent: policy (with package leniency) + physics ---------------
         let (p_in, p_ctx) = work.resolve_inputs(&parent, &parent_txid)?;
-        let p_out: u64 = parent.output.iter().map(|o| o.value.to_sat()).sum();
+        let p_out: u64 = parent.output.iter().fold(0u64, |acc, o| acc.saturating_add(o.value.to_sat()));
         let p_fee = p_in.saturating_sub(p_out);
-        policy::check_tx(&parent, p_fee, &p_ctx, Some(shape)).map_err(policy_reject)?;
+        let p_anc = work.unconfirmed_ancestor_count(&parent);
+        policy::check_tx(&parent, p_fee, &p_ctx, p_anc, Some(shape)).map_err(policy_reject)?;
         match work.check_conflicts(&parent, &parent_txid, p_fee)? {
             Acceptance::New(evict) => work.insert_tx(parent.clone(), parent_txid, p_fee, evict),
             Acceptance::AlreadyKnown => {} // deduplicated, Core-style
@@ -431,9 +451,12 @@ impl SimChain {
 
         // --- Child: resolves against the parent's outputs; no leniency ------
         let (c_in, c_ctx) = work.resolve_inputs(&child, &child_txid)?;
-        let c_out: u64 = child.output.iter().map(|o| o.value.to_sat()).sum();
+        let c_out: u64 = child.output.iter().fold(0u64, |acc, o| acc.saturating_add(o.value.to_sat()));
         let c_fee = c_in.saturating_sub(c_out);
-        policy::check_tx(&child, c_fee, &c_ctx, None).map_err(policy_reject)?;
+        // The parent is already in `work`, so the child's ancestor set includes
+        // it — a 1P1C child sees exactly 1 ancestor; a deeper chain, more.
+        let c_anc = work.unconfirmed_ancestor_count(&child);
+        policy::check_tx(&child, c_fee, &c_ctx, c_anc, None).map_err(policy_reject)?;
 
         // --- Package feerate + congestion (CPFP is judged on the package) ---
         if !policy::package_meets_feerate(
@@ -505,7 +528,7 @@ impl ChainView for SimChain {
         // fee (saturating so an unconstrained u64::MAX funding never
         // overflows). Also yields the policy context for each prevout.
         let (total_in, prevout_ctx) = g.resolve_inputs(&tx, &txid)?;
-        let total_out: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
+        let total_out: u64 = tx.output.iter().fold(0u64, |acc, o| acc.saturating_add(o.value.to_sat()));
         let fee = total_in.saturating_sub(total_out);
 
         match g.check_conflicts(&tx, &txid, fee)? {
@@ -516,7 +539,8 @@ impl ChainView for SimChain {
                 // Relay policy — the gate a real Core node applies before
                 // consensus ever sees the tx (dust / ephemeral dust / TRUC /
                 // min-relay). Standalone submission: no package leniency.
-                policy::check_tx(&tx, fee, &prevout_ctx, None).map_err(policy_reject)?;
+                let anc = g.unconfirmed_ancestor_count(&tx);
+                policy::check_tx(&tx, fee, &prevout_ctx, anc, None).map_err(policy_reject)?;
 
                 // Congestion: a tx paying below the minimum relay fee will not
                 // be accepted (it stalls until fee-bumped or congestion clears).
@@ -1166,6 +1190,84 @@ mod tests {
         assert!(matches!(chain.broadcast(&csv_child), Err(Error::Deadline(_))));
     }
 
+    /// TRUC ancestor limit counts DISTINCT unconfirmed ancestor TXS, not
+    /// inputs (review finding). (a) A v3 child spending TWO outputs of ONE
+    /// unconfirmed parent has a single ancestor and must be ACCEPTED — the old
+    /// per-input count wrongly saw two parents and rejected it. (b) A 3-deep
+    /// v3 chain G→P→C has two ancestors at C and must be REJECTED — the old
+    /// per-input count saw only the direct parent and wrongly accepted it.
+    #[test]
+    fn truc_ancestor_count_is_transitive_not_per_input() {
+        let rbf = Sequence::ENABLE_RBF_NO_LOCKTIME;
+
+        // (a) child spends two outputs of one unconfirmed v3 parent → accepted.
+        let chain = SimChain::new(100);
+        chain.fund_with_amount(op(0), 100, 1_000_000);
+        let parent = tx_bytes_of(
+            Version(3),
+            &[(op(0), rbf)],
+            vec![
+                TxOut { value: Amount::from_sat(400_000), script_pubkey: p2tr_spk(10) },
+                TxOut { value: Amount::from_sat(400_000), script_pubkey: p2tr_spk(11) },
+            ],
+        );
+        let parent_txid = chain.broadcast(&parent).unwrap();
+        let two_output_child = tx_bytes_of(
+            Version(3),
+            &[(OutPoint::new(parent_txid, 0), rbf), (OutPoint::new(parent_txid, 1), rbf)],
+            vec![TxOut { value: Amount::from_sat(750_000), script_pubkey: p2tr_spk(12) }],
+        );
+        chain
+            .broadcast(&two_output_child)
+            .expect("a child spending two outputs of one parent is ONE ancestor, not two");
+
+        // (b) 3-deep unconfirmed v3 chain: C has two ancestors → rejected.
+        let chain = SimChain::new(100);
+        chain.fund_with_amount(op(0), 100, 1_000_000);
+        let g = tx_bytes_of(
+            Version(3),
+            &[(op(0), rbf)],
+            vec![TxOut { value: Amount::from_sat(950_000), script_pubkey: p2tr_spk(13) }],
+        );
+        let g_txid = chain.broadcast(&g).unwrap();
+        let p = tx_bytes_of(
+            Version(3),
+            &[(OutPoint::new(g_txid, 0), rbf)],
+            vec![TxOut { value: Amount::from_sat(900_000), script_pubkey: p2tr_spk(14) }],
+        );
+        let p_txid = chain.broadcast(&p).expect("a 2-tx v3 chain (one ancestor) is allowed");
+        let c = tx_bytes_of(
+            Version(3),
+            &[(OutPoint::new(p_txid, 0), rbf)],
+            vec![TxOut { value: Amount::from_sat(850_000), script_pubkey: p2tr_spk(15) }],
+        );
+        assert!(
+            matches!(chain.broadcast(&c), Err(Error::Validation(_))),
+            "a 3-deep v3 chain (two ancestors) must be rejected as TRUC topology"
+        );
+    }
+
+    /// Output standardness: Core's IsStandardTx rejects any nVersion outside
+    /// 1..=3. A version-0 or version-4 tx never relays, regardless of fee.
+    #[test]
+    fn nonstandard_tx_version_is_rejected() {
+        let rbf = Sequence::ENABLE_RBF_NO_LOCKTIME;
+        for bad in [Version(0), Version(4)] {
+            let chain = SimChain::new(100);
+            chain.fund_with_amount(op(0), 100, 1_000_000);
+            let tx = tx_bytes_of(
+                bad,
+                &[(op(0), rbf)],
+                vec![TxOut { value: Amount::from_sat(900_000), script_pubkey: p2tr_spk(1) }],
+            );
+            assert!(
+                matches!(chain.broadcast(&tx), Err(Error::Validation(_))),
+                "tx version {} must be non-standard",
+                bad.0
+            );
+        }
+    }
+
     /// RBF-replacing a mempool parent evicts its descendants too — no
     /// orphaned children left behind; and re-broadcasting a CONFIRMED tx
     /// stays confirmed (idempotency must not demote it to the mempool).
@@ -1246,12 +1348,12 @@ mod tests {
             parent_has_other_child: false,
         }];
         assert!(matches!(
-            check_tx(&tx, 5_000, &ctx, None),
+            check_tx(&tx, 5_000, &ctx, 0, None),
             Err(PolicyViolation::Dust { vout: 1, value: 0, threshold: DUST_P2A_SATS })
         ));
         // Same tx with a 240-sat anchor: clean.
         let mut fixed = tx.clone();
         fixed.output[1].value = Amount::from_sat(DUST_P2A_SATS);
-        assert!(check_tx(&fixed, 5_000, &ctx, None).is_ok());
+        assert!(check_tx(&fixed, 5_000, &ctx, 0, None).is_ok());
     }
 }

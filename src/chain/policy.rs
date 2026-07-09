@@ -13,14 +13,31 @@
 //!
 //! FIDELITY NOTE (honest limits, for the review packet): this is a MODEL of
 //! Core's policy, not Core. It checks dust thresholds, min-relay feerate,
-//! output-script standardness (for the SPK types the protocol uses), TRUC
-//! topology (v3-only unconfirmed chains, 1-parent-1-child, child-size cap),
-//! the ephemeral-dust conditions, and package feerate. It does NOT model:
-//! sigops-adjusted vsize, mempool eviction dynamics, TRUC sibling EVICTION
-//! (a second child of a TRUC parent is rejected here where Core 28+ would
-//! consider evicting the incumbent — strictly stricter, the safe direction),
-//! or Script execution (signature validity is proven separately,
-//! bitcoin-side, in tests/taproot_swap.rs).
+//! output-script standardness (for the SPK types the protocol uses), tx-version
+//! standardness (nVersion 1..=3), TRUC topology (v3-only unconfirmed chains,
+//! 1-parent-1-child, child-size cap, and a transitive distinct-unconfirmed-
+//! ANCESTOR count ≤ 1 — so a child spending two outputs of one parent is not
+//! falsely rejected and a 3-deep v3 chain is correctly rejected), the
+//! ephemeral-dust conditions, and package feerate.
+//!
+//! It does NOT model, and these are the review-surfaced deviations:
+//! * (unmodeled) sigops-adjusted vsize, mempool eviction dynamics, TRUC sibling
+//!   EVICTION (a second child of a TRUC parent is rejected here where Core 28+
+//!   would consider evicting the incumbent — strictly stricter, the safe
+//!   direction), and Script execution (signature validity is proven separately,
+//!   bitcoin-side, in tests/taproot_swap.rs);
+//! * (unmodeled, protocol never emits these) OP_RETURN datacarrier limits
+//!   (size > 83 B / multi-push), MAX_STANDARD_TX_WEIGHT for non-v3 txs, and the
+//!   generic 25-ancestor / 101-kvB mempool chain limits for non-TRUC txs — a
+//!   tx of these shapes could FALSE-ACCEPT here, but the protocol builds none;
+//! * (safe / stricter than Core, protocol never emits these) P2SH dust uses the
+//!   546-sat legacy figure where Core computes 540; bare multisig, P2PK, and
+//!   unknown-witness-version outputs are treated non-standard; and a non-v3
+//!   0-fee package parent is not granted the package min-relay leniency.
+//!
+//! The protocol's own contract txs (Setup/Completion/Refund/CPFP bump) are all
+//! v3, P2TR/P2A/P2WPKH, positive-fee, 1P1C — none of the deviations above are
+//! reachable by them; re-confirm on the first real testnet broadcast.
 //!
 //! VERSION STANCE: the rules model Bitcoin Core 29.x and are conservative
 //! for 28–31 with two documented deltas: (a) the ephemeral-dust acceptance
@@ -77,6 +94,9 @@ pub enum PolicyViolation {
     FeeBelowMinRelay { fee: u64, vsize: u64 },
     /// An output's scriptPubKey is not a standard type. Core: "scriptpubkey".
     NonStandardScript { vout: usize },
+    /// The transaction nVersion is outside Core's standard range 1..=3.
+    /// Core: "version".
+    NonStandardVersion { version: i32 },
     /// A v3 tx exceeds 10,000 vB. Core: "v3-rule-violation".
     TrucTooLarge { vsize: u64 },
     /// A v3 tx spending an unconfirmed v3 parent exceeds 1,000 vB.
@@ -107,6 +127,9 @@ impl std::fmt::Display for PolicyViolation {
             }
             PolicyViolation::NonStandardScript { vout } => {
                 write!(f, "policy: output {vout} has a non-standard scriptPubKey")
+            }
+            PolicyViolation::NonStandardVersion { version } => {
+                write!(f, "policy: non-standard tx version {version}")
             }
             PolicyViolation::TrucTooLarge { vsize } => {
                 write!(f, "policy: TRUC tx too large ({vsize} vB > 10000)")
@@ -184,15 +207,25 @@ pub struct PackageCtx {
 
 /// The single-tx policy gate, run before physics. `fee` is sum(inputs) −
 /// sum(outputs), already computed by the chain from resolved prevouts.
-/// `package` is `Some` only for the parent on the package path.
+/// `unconfirmed_ancestor_count` is the number of DISTINCT unconfirmed ancestor
+/// transactions (transitive), computed by the chain from its mempool graph —
+/// counting ancestor TXS, not inputs (see the TRUC block). `package` is `Some`
+/// only for the parent on the package path.
 pub fn check_tx(
     tx: &Transaction,
     fee: u64,
     prevout_ctx: &[PrevoutCtx],
+    unconfirmed_ancestor_count: usize,
     package: Option<PackageCtx>,
 ) -> Result<(), PolicyViolation> {
     let vsize = tx.vsize() as u64;
     let is_v3 = tx.version.0 == 3;
+
+    // Core IsStandardTx: nVersion must be in 1..=3 ("version"). A version-0 or
+    // version-4+ tx is non-standard and never relays, regardless of fee/dust.
+    if tx.version.0 < 1 || tx.version.0 > 3 {
+        return Err(PolicyViolation::NonStandardVersion { version: tx.version.0 });
+    }
 
     // --- Output standardness + dust -----------------------------------------
     let mut dust_outputs = 0usize;
@@ -246,12 +279,10 @@ pub fn check_tx(
     if is_v3 && vsize > TRUC_MAX_VSIZE_VB {
         return Err(PolicyViolation::TrucTooLarge { vsize });
     }
-    let mut unconfirmed_parents = 0usize;
     for ctx in prevout_ctx {
         if !ctx.unconfirmed_parent {
             continue;
         }
-        unconfirmed_parents += 1;
         // v3 spends v3; non-v3 must not spend unconfirmed v3 (and vice versa).
         if ctx.parent_is_v3 != is_v3 {
             return Err(PolicyViolation::TrucVersionMix);
@@ -265,8 +296,13 @@ pub fn check_tx(
             }
         }
     }
-    // TRUC: at most ONE unconfirmed parent for a v3 tx.
-    if is_v3 && unconfirmed_parents > 1 {
+    // TRUC (BIP431): a v3 tx may have at most ONE unconfirmed ANCESTOR
+    // transaction. The chain passes the transitive distinct-ancestor count, so
+    // this counts distinct ancestor TXS (not inputs): a child spending two
+    // outputs of one parent is ONE ancestor (not falsely rejected), and a
+    // 3-deep unconfirmed v3 chain (G→P→C) is correctly rejected where
+    // per-input counting saw only the direct parent.
+    if is_v3 && unconfirmed_ancestor_count > 1 {
         return Err(PolicyViolation::TrucTopology);
     }
 

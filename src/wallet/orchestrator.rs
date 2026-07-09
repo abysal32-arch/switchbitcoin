@@ -64,8 +64,9 @@ pub enum FundingAction {
     /// and the exchange.
     Proceed { our_height: u32, their_height: u32, s_height: u32 },
     /// Abort to refunds and discard session state: Block-X deadline passed,
-    /// co-funding window exceeded, or the counterparty escrow is not at
-    /// D+Δ_fee (wrong/absent encumbrance).
+    /// co-funding window exceeded, or the counterparty escrow is not at the
+    /// tier escrow amount (D + Δ_fee − setup_cost, scheme (a)) —
+    /// wrong/absent encumbrance.
     Abort(&'static str),
 }
 
@@ -165,7 +166,8 @@ impl FundingCoordinator {
             }
         }
         // The counterparty escrow is VERIFIED-encumbered iff both sources
-        // agree it is confirmed at exactly D+Δ_fee.
+        // agree it is confirmed at exactly the tier escrow amount
+        // (D + Δ_fee − setup_cost, scheme (a)).
         let their_encumbrance_ok = matches!(
             their_reading,
             FundingReading::Confirmed { amount: Some(a), .. } if a == expected
@@ -180,7 +182,7 @@ impl FundingCoordinator {
                 // First funder broadcasts as soon as jitter elapses.
                 FundingOrder::First => FundingAction::BroadcastOurSetup,
                 // Second funder funds only after the first escrow is VERIFIED
-                // at exactly D+Δ_fee.
+                // at exactly the tier escrow amount.
                 FundingOrder::Second => {
                     if their_encumbrance_ok {
                         FundingAction::BroadcastOurSetup
@@ -203,7 +205,8 @@ impl FundingCoordinator {
         if oh.abs_diff(th) > self.params.cofunding_window {
             return Ok(FundingAction::Abort("co-funding window exceeded; abandon to refunds"));
         }
-        // Final encumbrance gate: proceed only when VERIFIED at D+Δ_fee. If it
+        // Final encumbrance gate: proceed only when VERIFIED at the tier escrow
+        // amount (D + Δ_fee − setup_cost). If it
         // is merely unverifiable (source disagreement), WAIT — never abort an
         // honestly-funded swap on a single lying source. (A persistent liar
         // degrades to refund-at-maturity, a delay, never theft.)
@@ -387,7 +390,7 @@ mod tests {
     fn second_funder_broadcasts_once_encumbrance_verified() {
         let c = coord();
         let chain = SimChain::new(1_000);
-        chain.fund_with_amount(op(2), 1_001, unit()); // theirs, exactly D+fee
+        chain.fund_with_amount(op(2), 1_001, unit()); // theirs, exactly the tier escrow amount
         assert_eq!(
             c.next_funding_action(&chain, FundingOrder::Second, op(1), op(2), false, true, 2_000)
                 .unwrap(),
