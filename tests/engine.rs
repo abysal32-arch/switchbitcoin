@@ -341,6 +341,73 @@ fn engine_open_recovers_a_crashed_signing_swap() {
     );
 }
 
+/// The manifest-params bookend (row 98 residual): `record_funding` must reject
+/// any params VALUE that diverges from the signed, version-gated manifest
+/// BEFORE persisting. A fresh wallet's manifest store falls back to the
+/// compiled-in provisional manifest, whose params == `testnet_provisional()`,
+/// so a mutated clone is off-manifest and must be refused with nothing written.
+#[test]
+fn record_funding_rejects_params_off_manifest() {
+    let params = Params::testnet_provisional();
+    let wallet_dir = tempfile::tempdir().unwrap();
+    let lease = tempfile::tempdir().unwrap();
+    let possession = tempfile::tempdir().unwrap();
+    let funding_coin =
+        onboard_one_coin(wallet_dir.path(), params.pre_encumbrance_sats(), [0x5Au8; 32]);
+    let (engine, actions) = SwapEngine::open(
+        wallet_dir.path(),
+        &ModeledEnclave,
+        Box::new(ModeledKeySource::new(&ModeledEnclave)),
+        &ModeledTrustRoot,
+    )
+    .unwrap();
+    assert!(actions.is_empty(), "fresh wallet has no recovery actions");
+
+    let sl = keypair();
+    let sh = keypair();
+    // The guard fires before the ctx is read, so a cheap-but-well-typed ctx is
+    // enough: a raw-bytes pre-armed refund + its watchtower receipt (same
+    // lightweight constructors the SH settlement thread uses above).
+    let refund = PreArmedRefund::from_signed_tx(vec![0xaa; 64], 700_010).unwrap();
+    let receipt = confirm_watchtower_handoff(&refund, refund.fingerprint()).unwrap();
+    let ctx = make_ctx(
+        sl.sk, sh.pk,
+        OutPoint::new(txid_from(2), 0), OutPoint::new(txid_from(1), 0),
+        params.escrow_amount_sats(), [0u8; 32], [0u8; 32],
+        refund, None, [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32],
+        lease.path().to_path_buf(), possession.path().to_path_buf(),
+        receipt, funding_coin,
+    );
+
+    // A params value one satoshi off the signed manifest must be rejected...
+    let off_manifest = {
+        let mut p = params.clone();
+        p.tier_d_sats += 1;
+        p
+    };
+    let rejected = engine.record_funding(&ctx, Role::SecretLearner, off_manifest);
+    assert!(
+        matches!(rejected, Err(Error::Validation(_))),
+        "off-manifest params must be rejected, got {rejected:?}"
+    );
+
+    // ...and rejected BEFORE the store put: nothing was persisted for this swap.
+    let sid = swap_session_id(sl.pk, sh.pk).unwrap();
+    assert!(
+        engine.store().get(&sid).unwrap().is_none(),
+        "a rejected record_funding must not persist a SwapRecord"
+    );
+
+    // Sanity: the exact manifest params ARE accepted (same ctx, correct value).
+    engine
+        .record_funding(&ctx, Role::SecretLearner, params)
+        .expect("manifest-matching params must be accepted");
+    assert_eq!(
+        engine.store().get(&sid).unwrap().unwrap().phase,
+        SwapPhase::Funding
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn make_ctx(
     our_seckey: Scalar,

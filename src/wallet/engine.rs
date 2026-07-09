@@ -164,6 +164,18 @@ impl SwapEngine {
         role: Role,
         params: crate::settlement::params::Params,
     ) -> Result<()> {
+        // Every swap's params MUST equal the signed, version-gated manifest —
+        // they arrive as signed values, NOT free-form wallet settings (see the
+        // params.rs doctrine). `run_exchange` already pins params immutable
+        // ACROSS puts by reusing the frozen funding-time snapshot; this is the
+        // missing bookend on the FIRST put, so an off-manifest (unsigned or
+        // divergent) params value can never enter a swap's lifecycle — which
+        // is what keeps the equal-Δ_fee tier anonymity set enforceable.
+        if &params != self.manifest.current().params() {
+            return Err(Error::Validation(
+                "record_funding: params do not match the signed manifest",
+            ));
+        }
         self.store.put(&SwapRecord {
             swap_session_id: Self::swap_session_id(ctx)?,
             role,
