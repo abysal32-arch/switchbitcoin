@@ -62,6 +62,7 @@
 
 pub mod abort_hygiene;
 pub mod claim_scheduler;
+pub mod driver;
 pub mod engine;
 pub mod keys;
 pub mod watchtower_driver;
@@ -70,6 +71,7 @@ pub mod manifest;
 pub mod orchestrator;
 pub mod store;
 
+pub use driver::{DriveStatus, SwapDriver};
 pub use manifest::{
     ClaimDelayPosture, ManifestOpenReport, ManifestStore, ManifestTrustRoot, ModeledTrustRoot,
     SignedManifest,

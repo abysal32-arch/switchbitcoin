@@ -288,7 +288,7 @@ impl SwapEngine {
     /// the caller's (a new UTXO's outpoint exists only post-confirmation).
     pub fn settle(
         &mut self,
-        possessing: Possessing,
+        possessing: &Possessing,
         ctx: &SwapContext,
         chain: &impl ChainView,
     ) -> Result<SwapOutcome> {
@@ -323,7 +323,7 @@ impl SwapEngine {
                 };
                 let scheduler = ClaimScheduler::from_manifest(self.manifest.current());
                 let schedule: ScheduledClaim =
-                    scheduler.schedule_claim(&possessing, &reveal, chain.tip_height())?;
+                    scheduler.schedule_claim(possessing, &reveal, chain.tip_height())?;
                 let mut rec = self.store.get(&sid)?.ok_or(Error::Abort("record vanished"))?;
                 rec.phase = SwapPhase::Completing;
                 rec.completion_tx = Some(schedule.comp_sl_final.0.to_vec());

@@ -17,6 +17,7 @@ use swapkey::settlement::state_machine::{
 };
 use swapkey::tx::escrow::Escrow;
 use swapkey::tx::txbuild::{build_completion, finalize_key_spend};
+use swapkey::wallet::driver::{DriveStatus, SwapDriver};
 use swapkey::wallet::engine::{SwapContext, SwapEngine, SwapOutcome};
 use swapkey::wallet::keys::ModeledKeySource;
 use swapkey::wallet::ledger::{acknowledge_phase0, Ledger, WalletClock, PHASE0_WARNING};
@@ -230,7 +231,7 @@ fn full_swap_driven_through_the_engine() {
     // Phase B: settle through the engine — observe the reveal (mempool-first),
     // extract, schedule the posture-bounded claim, persist Completing→Completed,
     // mark the funding coin spent.
-    match engine.settle(possessing, &ctx, &chain).unwrap() {
+    match engine.settle(&possessing, &ctx, &chain).unwrap() {
         SwapOutcome::Completed { our_final_sig } => {
             // The completed SL claim is a valid key-path spend of E_sh.
             let comp_sl_final = finalize_key_spend(comp_sl_spend, our_final_sig);
@@ -338,6 +339,254 @@ fn engine_open_recovers_a_crashed_signing_swap() {
         ),
         "coin state after recovery: {:?}",
         coin.state
+    );
+}
+
+/// The SAME complete two-party swap as `full_swap_driven_through_the_engine`,
+/// but the SL side runs end-to-end through the `SwapDriver` composition layer
+/// (start → poll* → Completed) instead of hand-sequencing record_funding →
+/// run_exchange → settle. Proves the driver composes the engine spine into one
+/// re-enterable API that honours the engine boundary (returns our_final_sig;
+/// the caller does the chain-layer finalize+broadcast) and the forward-or-refund
+/// invariant (AwaitingReveal is a re-drive, never a terminal).
+#[test]
+fn full_swap_driven_through_the_swap_driver() {
+    let params = Params::testnet_provisional();
+    let unit = params.escrow_amount_sats();
+    let d = params.tier_d_sats;
+    let s_height = 700_000u32;
+    let delta_late = u32::try_from(params.delta_late()).unwrap();
+
+    let sh = keypair();
+    let sl = keypair();
+    let internal =
+        swapkey::settlement::state_machine::canonical_internal_key(sh.pk, sl.pk).unwrap();
+    let escrow_comp_sh = Escrow::new(&internal, &sl.pk, params.delta_early).unwrap(); // E_sl
+    let escrow_comp_sl = Escrow::new(&internal, &sh.pk, delta_late).unwrap(); // E_sh
+    let op_comp_sh = OutPoint::new(txid_from(2), 0); // E_sl — SL funded, SH sweeps
+    let op_comp_sl = OutPoint::new(txid_from(1), 0); // E_sh — SH funded, SL sweeps
+
+    let chain = SimChain::new(s_height);
+    chain.fund(op_comp_sh, s_height);
+    chain.fund(op_comp_sl, s_height);
+
+    let dest = escrow_comp_sh.funding_script_pubkey().clone();
+    let comp_sh_spend =
+        build_completion(&escrow_comp_sh, op_comp_sh, unit, dest.clone(), d, params.anchor_sats).unwrap();
+    let comp_sl_spend =
+        build_completion(&escrow_comp_sl, op_comp_sl, unit, dest, d, params.anchor_sats).unwrap();
+    let msg_sh = comp_sh_spend.sighash;
+    let msg_sl = comp_sl_spend.sighash;
+    let root_sh = escrow_comp_sh.merkle_root();
+    let root_sl = escrow_comp_sl.merkle_root();
+    let ok_sh = escrow_comp_sh.output_key_xonly();
+    let ok_sl = escrow_comp_sl.output_key_xonly();
+
+    let swap_id = [0xE9u8; 32];
+    let sid = swap_session_id(sl.pk, sh.pk).unwrap();
+    let lease_sh = tempfile::tempdir().unwrap();
+    let lease_sl = tempfile::tempdir().unwrap();
+    let possession_store = tempfile::tempdir().unwrap();
+    let wallet_dir = tempfile::tempdir().unwrap();
+    let (io_sh, io_sl) = duplex();
+
+    let funding_coin = onboard_one_coin(wallet_dir.path(), params.pre_encumbrance_sats(), sid);
+    let (mut engine, actions) = SwapEngine::open(
+        wallet_dir.path(),
+        &ModeledEnclave,
+        Box::new(ModeledKeySource::new(&ModeledEnclave)),
+        &ModeledTrustRoot,
+    )
+    .unwrap();
+    assert!(actions.is_empty(), "fresh wallet has no recovery actions");
+
+    let dest2 = escrow_comp_sh.funding_script_pubkey().clone();
+    let sl_refund =
+        PreArmedRefund::arm(&escrow_comp_sh, op_comp_sh, unit, &sl.sk, dest2, d, params.anchor_sats, s_height).unwrap();
+    let sl_receipt = confirm_watchtower_handoff(&sl_refund, sl_refund.fingerprint()).unwrap();
+
+    // SH counterparty as a raw settlement thread (a separate node in production).
+    let sh_params = params.clone();
+    let sh_chain = chain.clone();
+    let comp_sh_for_sh = comp_sh_spend.clone();
+    let sh_handle = std::thread::spawn(move || -> Result<[u8; 64]> {
+        let refund = PreArmedRefund::from_signed_tx(vec![0xaa; 64], s_height + delta_late)?;
+        let receipt = confirm_watchtower_handoff(&refund, refund.fingerprint())?;
+        let (t, _) = AdaptorSecret::generate()?;
+        let peer = PeerSession::new(swap_id, Box::new(io_sh));
+        let funded = Funding::new(sh_params, peer).funded_manual(Role::SecretHolder, s_height)?;
+        let possessing = funded.run_adaptor_exchange(ExchangeInputs {
+            our_seckey: sh.sk,
+            their_pubkey: ValidatedPoint::from_bytes(&sl.pk.serialize())?,
+            msg_comp_sh: msg_sh,
+            msg_comp_sl: msg_sl,
+            pre_armed_refund: refund,
+            adaptor_secret: Some(t),
+            lease_dir: Some(lease_sh.path().to_path_buf()),
+            possession_store: None,
+            taproot_root_comp_sh: Some(root_sh),
+            taproot_root_comp_sl: Some(root_sl),
+            taproot_output_comp_sh: Some(ok_sh),
+            taproot_output_comp_sl: Some(ok_sl),
+        })?;
+        let sig = possessing.broadcast_completion(s_height + 10, &receipt)?;
+        sh_chain
+            .broadcast(&finalize_key_spend(comp_sh_for_sh, sig.0))
+            .expect("Comp->SH to mempool");
+        Ok(sig.0)
+    });
+
+    // SL side, driven ENTIRELY through the SwapDriver.
+    let peer = PeerSession::new(swap_id, Box::new(io_sl));
+    let funded = Funding::new(params.clone(), peer)
+        .funded_manual(Role::SecretLearner, s_height)
+        .unwrap();
+    let ctx = make_ctx(
+        sl.sk, sh.pk, op_comp_sh, op_comp_sl, unit, msg_sh, msg_sl, sl_refund, None,
+        root_sh, root_sl, ok_sh, ok_sl, lease_sl.path().to_path_buf(),
+        possession_store.path().to_path_buf(), sl_receipt, funding_coin,
+    );
+
+    // Scope the driver so its &mut engine borrow is released before the
+    // post-run assertions read the store/ledger.
+    let our_final_sig = {
+        let mut driver =
+            SwapDriver::start(&mut engine, Role::SecretLearner, funded, ctx, &chain).unwrap();
+
+        // SH finishes the interlocked exchange and broadcasts Comp->SH (the
+        // reveal); capture its sig so we can re-broadcast below.
+        let sh_sig = sh_handle.join().unwrap().expect("SH side");
+        assert!(matches!(chain.spend_status(op_comp_sh), SpendStatus::InMempool));
+
+        // Regression (review Bug A): the SL reveal peek and settle's own
+        // re-observe are two NON-ATOMIC ChainView reads. Evict the reveal to
+        // force the "seen, then gone" case at poll granularity — the driver must
+        // stay re-drivable (AwaitingReveal), NOT poison. This holds only because
+        // settle now BORROWS the Possessing instead of consuming it.
+        chain.evict(op_comp_sh);
+        assert!(matches!(chain.spend_status(op_comp_sh), SpendStatus::Unspent));
+        assert_eq!(driver.poll(&chain).unwrap(), DriveStatus::AwaitingReveal);
+
+        // Reveal reappears → the SAME retained driver drives to the terminal.
+        chain
+            .broadcast(&finalize_key_spend(comp_sh_spend, sh_sig))
+            .expect("re-broadcast Comp->SH");
+        assert!(matches!(chain.spend_status(op_comp_sh), SpendStatus::InMempool));
+        let mut sig = None;
+        for _ in 0..4 {
+            match driver.poll(&chain).unwrap() {
+                DriveStatus::Completed { our_final_sig } => {
+                    sig = Some(our_final_sig);
+                    break;
+                }
+                DriveStatus::AwaitingReveal => continue,
+                DriveStatus::Refunding(r) => panic!("unexpected refund: {r}"),
+            }
+        }
+        sig.expect("driver settled SL's leg to Completed")
+    };
+
+    // Engine boundary: the caller finalizes + broadcasts OUR completion tx.
+    let comp_sl_final = finalize_key_spend(comp_sl_spend, our_final_sig);
+    chain.broadcast(&comp_sl_final).expect("Comp->SL accepted");
+    chain.mine();
+    assert!(matches!(chain.spend_status(op_comp_sl), SpendStatus::Confirmed(_)));
+
+    // The full lifecycle persisted through the driver, and the ledger reconciled.
+    assert_eq!(engine.store().get(&sid).unwrap().unwrap().phase, SwapPhase::Completed);
+    let coin = engine
+        .ledger()
+        .find(&funding_coin)
+        .expect("funding coin tracked");
+    assert_eq!(
+        coin.state,
+        swapkey::wallet::ledger::CoinState::Spent,
+        "the driver's run_exchange marked the funding coin spent"
+    );
+}
+
+/// Regression (review Bug B): a Phase-A exchange failure must surface as
+/// `Refunding` ONLY when the engine actually persisted `AbortRefund`. Here the
+/// counterparty transport is dead, so `run_adaptor_exchange` fails and
+/// `run_exchange` routes to `abort()` → `AbortRefund`; `start` must read that
+/// persisted phase (not the bare `Err`) and report `Refunding`.
+#[test]
+fn swap_driver_reports_refunding_when_phase_a_fails() {
+    let params = Params::testnet_provisional();
+    let unit = params.escrow_amount_sats();
+    let d = params.tier_d_sats;
+    let s_height = 700_000u32;
+
+    let sh = keypair();
+    let sl = keypair();
+    let internal =
+        swapkey::settlement::state_machine::canonical_internal_key(sh.pk, sl.pk).unwrap();
+    let escrow_comp_sh = Escrow::new(&internal, &sl.pk, params.delta_early).unwrap();
+    let escrow_comp_sl =
+        Escrow::new(&internal, &sh.pk, u32::try_from(params.delta_late()).unwrap()).unwrap();
+    let op_comp_sh = OutPoint::new(txid_from(2), 0);
+    let op_comp_sl = OutPoint::new(txid_from(1), 0);
+
+    let chain = SimChain::new(s_height);
+    chain.fund(op_comp_sh, s_height);
+    chain.fund(op_comp_sl, s_height);
+
+    let dest = escrow_comp_sh.funding_script_pubkey().clone();
+    let comp_sh_spend =
+        build_completion(&escrow_comp_sh, op_comp_sh, unit, dest.clone(), d, params.anchor_sats).unwrap();
+    let comp_sl_spend =
+        build_completion(&escrow_comp_sl, op_comp_sl, unit, dest, d, params.anchor_sats).unwrap();
+    let msg_sh = comp_sh_spend.sighash;
+    let msg_sl = comp_sl_spend.sighash;
+
+    let swap_id = [0xE9u8; 32];
+    let sid = swap_session_id(sl.pk, sh.pk).unwrap();
+    let lease_sl = tempfile::tempdir().unwrap();
+    let possession_store = tempfile::tempdir().unwrap();
+    let wallet_dir = tempfile::tempdir().unwrap();
+
+    let funding_coin = onboard_one_coin(wallet_dir.path(), params.pre_encumbrance_sats(), sid);
+    let (mut engine, _actions) = SwapEngine::open(
+        wallet_dir.path(),
+        &ModeledEnclave,
+        Box::new(ModeledKeySource::new(&ModeledEnclave)),
+        &ModeledTrustRoot,
+    )
+    .unwrap();
+
+    let dest2 = escrow_comp_sh.funding_script_pubkey().clone();
+    let sl_refund =
+        PreArmedRefund::arm(&escrow_comp_sh, op_comp_sh, unit, &sl.sk, dest2, d, params.anchor_sats, s_height).unwrap();
+    let sl_receipt = confirm_watchtower_handoff(&sl_refund, sl_refund.fingerprint()).unwrap();
+
+    // Kill the counterparty transport: with the SH end dropped, SL's interlocked
+    // adaptor exchange cannot complete and run_exchange aborts to the refund.
+    let (io_sh, io_sl) = duplex();
+    drop(io_sh);
+    let peer = PeerSession::new(swap_id, Box::new(io_sl));
+    let funded = Funding::new(params.clone(), peer)
+        .funded_manual(Role::SecretLearner, s_height)
+        .unwrap();
+    let ctx = make_ctx(
+        sl.sk, sh.pk, op_comp_sh, op_comp_sl, unit, msg_sh, msg_sl, sl_refund, None,
+        escrow_comp_sh.merkle_root(), escrow_comp_sl.merkle_root(),
+        escrow_comp_sh.output_key_xonly(), escrow_comp_sl.output_key_xonly(),
+        lease_sl.path().to_path_buf(), possession_store.path().to_path_buf(),
+        sl_receipt, funding_coin,
+    );
+
+    let mut driver =
+        SwapDriver::start(&mut engine, Role::SecretLearner, funded, ctx, &chain).unwrap();
+    assert!(
+        matches!(driver.poll(&chain).unwrap(), DriveStatus::Refunding(_)),
+        "a Phase-A failure that persisted AbortRefund must surface as Refunding"
+    );
+    drop(driver);
+
+    // The engine persisted the refund exit — the pre-armed refund is the sink.
+    assert_eq!(
+        engine.store().get(&sid).unwrap().unwrap().phase,
+        SwapPhase::AbortRefund
     );
 }
 
