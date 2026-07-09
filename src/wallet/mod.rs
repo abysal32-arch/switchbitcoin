@@ -61,6 +61,7 @@
 //!     phase and reconciling the ledger. The integration layer over the parts.
 
 pub mod abort_hygiene;
+pub mod backstop_driver;
 pub mod claim_scheduler;
 pub mod driver;
 pub mod engine;
@@ -71,6 +72,7 @@ pub mod manifest;
 pub mod orchestrator;
 pub mod store;
 
+pub use backstop_driver::{BackstopDriver, BackstopTick};
 pub use driver::{DriveStatus, SwapDriver};
 pub use manifest::{
     ClaimDelayPosture, ManifestOpenReport, ManifestStore, ManifestTrustRoot, ModeledTrustRoot,
