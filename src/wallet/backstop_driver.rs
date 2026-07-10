@@ -16,17 +16,25 @@
 //! `Completing`, so the tower owns the refund ENTIRELY and `classify_stalled_tx`
 //! owns ONLY the non-refund side — they never double-handle.
 //!
-//! # Scope (increment 2 — safe fallbacks; bump inert)
-//! No reserve coin is provisioned in the wallet yet (`promote_change_to_reserve`
-//! is test-only; onboarding's single change output folds into fee), so
-//! `reserve_available` is unconditionally false and every congested path routes
-//! to a SAFE fallback — `KeepWaiting` (refund), `FallbackToRefund` (unbroadcast
-//! completion), `KeepFighting` (in-flight/revealed completion), `AbortBeforeLock`
-//! (setup) — plus the dead-device refund fire. None strands a coin or misses a
-//! deadline, so fund-safety holds. The actual CPFP BUMP (lease a reserve, then
-//! build, sign, and submit the 1P1C child) is deferred to increment 2a, which
-//! provisions a reserve and computes `reserve_available` for real (sized against
-//! `tx::backstop::required_child_fee`).
+//! # Scope (increment 2a — the CPFP bump is wired)
+//! [`tick`](BackstopDriver::tick) is a PURE decision: the caller passes
+//! `reserve_available` (computed from the ledger via
+//! [`Ledger::has_leasable_reserve`](crate::wallet::ledger::Ledger::has_leasable_reserve)
+//! sized against [`required_child_fee`](crate::tx::backstop::required_child_fee)),
+//! and `tick` routes each congested case. When no suitable reserve exists every
+//! path is a SAFE fallback — `KeepWaiting` (refund), `FallbackToRefund`
+//! (unbroadcast completion), `KeepFighting` (in-flight/revealed completion),
+//! `AbortBeforeLock` (setup) — plus the dead-device refund fire; none strands a
+//! coin or misses a deadline, so fund-safety holds with the bump inert. When a
+//! reserve IS available the decision is [`BackstopTick::Bump`] (silent, refund)
+//! or [`BackstopTick::NeedsConsent`] (a completion bump links the reserve's
+//! provenance, so it awaits a privacy `LinkageAck`), and the caller EXECUTES the
+//! 1P1C bump via [`run_cpfp_bump`] — lease → build → enclave-sign → submit →
+//! mark-spent, releasing the lease on any failure so a reserve is never
+//! stranded. What remains for a full deployment: a PRODUCTION path that MINTS a
+//! reserve (onboarding promoting change instead of folding it to fee) and the
+//! dead-device reserve-key custody (who holds the `KeySource` when the owner's
+//! device is down); the bump machinery here is complete and test-driven.
 //!
 //! # Classification safe-default (fund-load-bearing)
 //! The unbroadcast↔in-flight split for SH is NOT derivable from the persisted
@@ -41,9 +49,14 @@
 //! Pure composition of built wallet ranks over the existing `ChainView` trait —
 //! no curve math, no new settlement-core surface.
 
+use bitcoin::{OutPoint, Txid};
+
 use crate::chain::{ChainView, SpendStatus};
 use crate::settlement::state_machine::Role;
-use crate::wallet::ledger::BumpTarget;
+use crate::tx::backstop::{build_cpfp_bump, finalize_cpfp_bump, required_child_fee};
+use crate::tx::setup::pre_encumbrance_spk;
+use crate::wallet::keys::{KeyPurpose, KeySource};
+use crate::wallet::ledger::{BumpTarget, Ledger, LinkageAck};
 use crate::wallet::store::{SwapPhase, SwapRecord};
 use crate::wallet::watchtower_driver::{
     backstop_decision, bump_target, BackstopAction, StalledTx, WatchtowerDriver, WatchtowerTick,
@@ -73,12 +86,16 @@ pub enum BackstopTick {
     /// A stalled SETUP with no reserve: the escrow won't confirm and the
     /// pre-encumbrance coin is untouched — abort cleanly before any lock.
     AbortBeforeLock,
-    /// Congested and a reserve WOULD CPFP-bump `target`, but reserve provisioning
-    /// is increment 2a — the bump build/submit is intentionally not wired yet.
-    /// Unreachable while `reserve_available` is false.
-    BumpDeferred { target: BumpTarget },
-    /// A completion bump awaits an explicit privacy `LinkageAck` (increment 2a).
-    /// Unreachable while `reserve_available` is false.
+    /// Congested, a suitably-sized reserve is available, and `target` should be
+    /// CPFP-bumped NOW (a refund bump is silent; a completion bump only reaches
+    /// here with standing consent). The caller executes it with
+    /// [`run_cpfp_bump`]. Reachable only when the caller passed
+    /// `reserve_available = true`.
+    Bump { target: BumpTarget },
+    /// A COMPLETION bump is warranted and a reserve is available, but it links
+    /// the reserve's provenance to this swap — it awaits an explicit privacy
+    /// [`LinkageAck`](crate::wallet::ledger::LinkageAck) before the caller may
+    /// [`run_cpfp_bump`] it. Reachable only when `reserve_available = true`.
     NeedsConsent { target: BumpTarget },
 }
 
@@ -101,12 +118,18 @@ impl BackstopDriver {
     /// `congested` is the caller's observation that OUR current non-refund tx
     /// (the setup or completion it broadcasts, at the engine boundary) could not
     /// relay under the fee floor. The refund's own congestion is detected here
-    /// internally by the tower and needs no caller signal.
+    /// internally by the tower and needs no caller signal. `reserve_available`
+    /// is the caller's ledger read — `Ledger::has_leasable_reserve(min)` for a
+    /// conservative `required_child_fee` estimate — kept a parameter (not a
+    /// ledger handle) so `tick` stays a pure decision; on a `Bump`/`NeedsConsent`
+    /// result the caller executes the bump with [`run_cpfp_bump`], whose build
+    /// step re-checks the exact reserve sizing.
     pub fn tick(
         &self,
         rec: &SwapRecord,
         chain: &impl ChainView,
         congested: bool,
+        reserve_available: bool,
     ) -> Result<BackstopTick> {
         // 1) REFUND side (dead-device, primary-independent). The tower owns
         //    E_ours entirely — the fire, and the refund's relay-floor congestion.
@@ -114,7 +137,7 @@ impl BackstopDriver {
             WatchtowerTick::FiredRefund => return Ok(BackstopTick::FiredRefund),
             WatchtowerTick::RefundStalledBelowFeeFloor => {
                 let action =
-                    backstop_decision(StalledTx::Refund, true, self.reserve_available(), None);
+                    backstop_decision(StalledTx::Refund, true, reserve_available, None);
                 return Ok(resolve(action, BumpTarget::Refund));
             }
             // Idle / StandDown: the refund needs nothing this tick. Fall through
@@ -130,7 +153,7 @@ impl BackstopDriver {
                 let action = backstop_decision(
                     kind,
                     congested,
-                    self.reserve_available(),
+                    reserve_available,
                     // Dead-device policy (adopted): no standing pre-authorized
                     // consent — an in-flight completion keeps fighting until the
                     // owner returns, never a reserve-linking bump behind their back.
@@ -140,13 +163,6 @@ impl BackstopDriver {
             }
             None => Ok(BackstopTick::Idle),
         }
-    }
-
-    /// Increment 2 provisions no reserve, so this is unconditionally false and
-    /// every congested path routes to a safe fallback. Increment 2a computes it
-    /// from a leasable `Reserve` coin sized against `required_child_fee`.
-    fn reserve_available(&self) -> bool {
-        false
     }
 }
 
@@ -158,12 +174,163 @@ fn resolve(action: BackstopAction, target: BumpTarget) -> BackstopTick {
         BackstopAction::FallbackToRefund => BackstopTick::FallbackToRefund,
         BackstopAction::KeepFighting => BackstopTick::KeepFighting,
         BackstopAction::AbortBeforeLock => BackstopTick::AbortBeforeLock,
-        // Reachable only once increment 2a sets `reserve_available`; the actual
-        // lease + CPFP build + submit is that increment's work.
+        // Reserve is available: the caller executes the bump via `run_cpfp_bump`.
+        // A refund bump is silent; a completion bump reaching here already
+        // carries standing consent (the wallet's dead-device policy passes
+        // consent=None, so a completion routes to NeedsConsent instead).
         BackstopAction::BumpSilently | BackstopAction::BumpConsented => {
-            BackstopTick::BumpDeferred { target }
+            BackstopTick::Bump { target }
         }
         BackstopAction::NeedsConsent => BackstopTick::NeedsConsent { target },
+    }
+}
+
+/// Everything [`run_cpfp_bump`] needs about the STALLED PARENT and the desired
+/// bump, besides the ledger/keys/chain. The caller assembles it at the engine
+/// boundary (it knows the parent tx it broadcast and the fee floor it observed).
+pub struct CpfpBumpRequest<'a> {
+    /// What is being bumped (drives the consent gate + the taint).
+    pub target: BumpTarget,
+    /// The privacy consent for a COMPLETION bump (spec: refunds are silent, so
+    /// `None` is fine for a refund; a completion without it is refused).
+    pub linkage_ack: Option<LinkageAck>,
+    /// Lease holder id (the swap_session_id / backstop id), so a crash between
+    /// lease and spend is reconciled by `Ledger::reconcile_leases`.
+    pub lessee: [u8; 32],
+    /// The fully-signed stalled parent, for the 1P1C `submit_package`.
+    pub parent_bytes: &'a [u8],
+    /// The parent's anchor outpoint `(parent_txid, ANCHOR_VOUT)`.
+    pub parent_anchor: OutPoint,
+    /// The parent anchor output's real value (`Params::anchor_sats`) — the
+    /// prevout the child sighash commits to.
+    pub anchor_value_sats: u64,
+    /// The stalled parent's own fee and vsize, and the feerate the package must
+    /// reach — together they fix `required_child_fee`.
+    pub parent_fee_sats: u64,
+    pub parent_vsize_vb: u64,
+    pub target_feerate_sat_vb: u64,
+    /// A FRESH, unused `Reserve` key index for the child's single output. The
+    /// executor DERIVES the change scriptPubKey from this (never an opaque
+    /// caller spk) so the residual reserve value lands at a key the wallet can
+    /// re-sign, and registers it as a new Reserve coin — the pool replenishes
+    /// itself instead of leaking the change untracked. The caller allocates the
+    /// index the same way onboarding allocates the next key.
+    pub change_key_index: u32,
+}
+
+/// The result of a [`run_cpfp_bump`] attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BumpOutcome {
+    /// The 1P1C package was accepted. `deposit_linked` is `true` for a
+    /// completion bump — the caller MUST persist the taint on the swapped
+    /// output (`Ledger::record_swapped_output(.., deposit_linked = true)`).
+    Submitted {
+        child_txid: Txid,
+        reserve_outpoint: OutPoint,
+        deposit_linked: bool,
+        /// The child's change output, registered as a new Reserve coin so the
+        /// backstop pool survives the bump (`change_outpoint = child_txid:0`).
+        change_outpoint: OutPoint,
+        change_amount_sats: u64,
+    },
+    /// No suitable reserve was leasable, or the bump could not be built/submitted
+    /// (e.g. the reserve was too small, or the package still did not clear the
+    /// floor). The lease, if taken, was RELEASED — nothing is stranded — and the
+    /// caller keeps its safe fallback (`KeepFighting` / `KeepWaiting`).
+    NoBump,
+}
+
+/// Execute the CPFP congestion bump the [`BackstopDriver`] decided on: lease a
+/// reserve, build the anchor+reserve child sized to lift the parent+child
+/// package to the target feerate, sign the reserve input through the enclave
+/// seam, and submit the 1P1C package; then mark the reserve spent.
+///
+/// Fund-safety: the lease is RELEASED on every failure after it is taken (a bad
+/// build, a signing error, or a package the mempool still rejects), so a reserve
+/// is never stranded Leased — the swap simply keeps its safe fallback. The
+/// reserve is marked spent ONLY after the package is accepted. A completion
+/// target without a `LinkageAck` is refused by `lease_reserve` before anything
+/// is leased (the privacy gate).
+pub fn run_cpfp_bump(
+    ledger: &mut Ledger,
+    keys: &dyn KeySource,
+    chain: &impl ChainView,
+    req: CpfpBumpRequest<'_>,
+) -> Result<BumpOutcome> {
+    let child_fee = required_child_fee(
+        req.target_feerate_sat_vb,
+        req.parent_fee_sats,
+        req.parent_vsize_vb,
+    );
+
+    // The child change lands at a fresh, TRACKED Reserve key so it replenishes
+    // the pool (derived here, never an opaque caller spk — the on-chain output
+    // and the coin we later re-sign can never diverge).
+    let change_xonly = keys.derive_xonly(KeyPurpose::Reserve, req.change_key_index)?;
+    let change_spk = pre_encumbrance_spk(change_xonly)?;
+
+    // Lease first — this enforces the completion consent gate AND the size gate
+    // (a reserve too small for the fee is not leased, matching
+    // `has_leasable_reserve`). `None` means no leasable reserve; nothing was
+    // taken, so just fall back.
+    let reserve = match ledger.lease_reserve(req.target, child_fee, req.linkage_ack, req.lessee)? {
+        Some(c) => c,
+        None => return Ok(BumpOutcome::NoBump),
+    };
+
+    // Build + sign + submit WITHOUT touching the ledger, so any failure leaves
+    // exactly one thing to undo: the lease. The reserve signs under the key
+    // purpose it was ISSUED with (change promoted to reserve still signs under
+    // OnboardingChange), never under its current class. The closure returns the
+    // child txid and its change value.
+    let built = (|| -> Result<(Txid, u64)> {
+        let reserve_xonly = keys.derive_xonly(reserve.key_purpose, reserve.key_index)?;
+        let bump = build_cpfp_bump(
+            req.parent_anchor,
+            req.anchor_value_sats,
+            reserve.outpoint,
+            reserve.amount_sats,
+            reserve_xonly,
+            child_fee,
+            change_spk,
+        )?;
+        let sig = keys.sign_key_path(reserve.key_purpose, reserve.key_index, bump.reserve_sighash)?;
+        let child_bytes = finalize_cpfp_bump(bump, sig);
+        let (_parent_txid, child_txid) = chain.submit_package(req.parent_bytes, &child_bytes)?;
+        // build_cpfp_bump already validated this is > dust and non-overflowing.
+        let change_amount = req.anchor_value_sats + reserve.amount_sats - child_fee;
+        Ok((child_txid, change_amount))
+    })();
+
+    match built {
+        Ok((child_txid, change_amount)) => {
+            let change_outpoint = OutPoint::new(child_txid, 0);
+            // ONE persist: mark the reserve spent AND register the change as a
+            // new Reserve coin (deposit provenance follows the value). The
+            // change keeps the pool non-empty across the bump.
+            ledger.spend_reserve_into_change(
+                reserve.outpoint,
+                change_outpoint,
+                change_amount,
+                req.change_key_index,
+                chain.tip_height(),
+                reserve.deposit_linked,
+            )?;
+            Ok(BumpOutcome::Submitted {
+                child_txid,
+                reserve_outpoint: reserve.outpoint,
+                deposit_linked: req.target == BumpTarget::Completion,
+                change_outpoint,
+                change_amount_sats: change_amount,
+            })
+        }
+        Err(_) => {
+            // Never strand the reserve: release the lease so it can be retried
+            // (a bigger reserve, or once congestion eases). The swap keeps its
+            // safe fallback in the meantime.
+            ledger.release_lease(reserve.outpoint)?;
+            Ok(BumpOutcome::NoBump)
+        }
     }
 }
 
@@ -491,7 +658,7 @@ mod tests {
         chain.fund(e_ours, 490_000);
         let driver = BackstopDriver::arm(armed_tower(e_ours, 900_000, 144, maturity));
         let r = rec(SwapPhase::AbortRefund, Role::SecretHolder, Some(e_ours), Some(op(51)));
-        assert_eq!(driver.tick(&r, &chain, false).unwrap(), BackstopTick::FiredRefund);
+        assert_eq!(driver.tick(&r, &chain, false, false).unwrap(), BackstopTick::FiredRefund);
     }
 
     #[test]
@@ -507,9 +674,9 @@ mod tests {
         chain.broadcast(&spend_of(e_sl, 900_000, None)).unwrap(); // reveal public
         let driver = BackstopDriver::arm(armed_tower(e_ours, 900_000, 144, 500_144));
         let r = rec(SwapPhase::Completing, Role::SecretHolder, Some(e_ours), Some(e_sl));
-        assert_eq!(driver.tick(&r, &chain, true).unwrap(), BackstopTick::KeepFighting);
+        assert_eq!(driver.tick(&r, &chain, true, false).unwrap(), BackstopTick::KeepFighting);
         // Not congested ⇒ nothing to do.
-        assert_eq!(driver.tick(&r, &chain, false).unwrap(), BackstopTick::Idle);
+        assert_eq!(driver.tick(&r, &chain, false, false).unwrap(), BackstopTick::Idle);
     }
 
     #[test]
@@ -523,6 +690,33 @@ mod tests {
         chain.fund(e_sl, 490_000); // unspent
         let driver = BackstopDriver::arm(armed_tower(e_ours, 900_000, 144, 500_144));
         let r = rec(SwapPhase::Completing, Role::SecretHolder, Some(e_ours), Some(e_sl));
-        assert_eq!(driver.tick(&r, &chain, true).unwrap(), BackstopTick::FallbackToRefund);
+        assert_eq!(driver.tick(&r, &chain, true, false).unwrap(), BackstopTick::FallbackToRefund);
+    }
+
+    #[test]
+    fn reserve_available_flips_completion_to_needs_consent() {
+        // A revealed, congested completion: with NO reserve it keeps fighting;
+        // with a reserve available it surfaces NeedsConsent (the dead-device
+        // policy passes consent=None, so a completion never bumps silently).
+        // This is the increment-2a behaviour change — `reserve_available` now
+        // flows through `tick` instead of being hardcoded false.
+        let e_ours = op(90);
+        let e_sl = op(91);
+        let chain = SimChain::new(500_000);
+        chain.fund(e_ours, 490_000);
+        chain.fund(e_sl, 490_000);
+        chain.broadcast(&spend_of(e_sl, 900_000, None)).unwrap(); // reveal public
+        let driver = BackstopDriver::arm(armed_tower(e_ours, 900_000, 144, 500_144));
+        let r = rec(SwapPhase::Completing, Role::SecretHolder, Some(e_ours), Some(e_sl));
+        assert_eq!(
+            driver.tick(&r, &chain, true, false).unwrap(),
+            BackstopTick::KeepFighting,
+            "no reserve ⇒ keep fighting"
+        );
+        assert_eq!(
+            driver.tick(&r, &chain, true, true).unwrap(),
+            BackstopTick::NeedsConsent { target: BumpTarget::Completion },
+            "reserve available ⇒ a completion bump awaits consent"
+        );
     }
 }

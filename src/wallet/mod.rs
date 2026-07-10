@@ -74,7 +74,9 @@ pub mod orchestrator;
 pub mod recovery_driver;
 pub mod store;
 
-pub use backstop_driver::{BackstopDriver, BackstopTick};
+pub use backstop_driver::{
+    run_cpfp_bump, BackstopDriver, BackstopTick, BumpOutcome, CpfpBumpRequest,
+};
 pub use driver::{DriveStatus, SwapDriver};
 pub use funding_driver::{FundingDriver, FundingTick, HandoffError};
 pub use recovery_driver::{RecoveryDriver, RecoveryTick};

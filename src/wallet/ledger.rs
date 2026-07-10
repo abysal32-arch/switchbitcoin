@@ -904,6 +904,7 @@ impl Ledger {
     pub fn lease_reserve(
         &mut self,
         target: BumpTarget,
+        min_sats: u64,
         linkage_ack: Option<LinkageAck>,
         lessee: [u8; 32],
     ) -> Result<Option<CoinRecord>> {
@@ -912,10 +913,21 @@ impl Ledger {
                 "bumping a completion from reserve requires the linkage acknowledgement",
             ));
         }
+        // Size-aware, matching `has_leasable_reserve(min_sats)`: pick the LARGEST
+        // unspent reserve that covers `min_sats`, so the gate and the lease can
+        // never disagree (a true gate followed by a too-small lease that the
+        // build then rejects). `min_sats` is the caller's `required_child_fee`.
         let idx = self
             .coins
             .iter()
-            .position(|c| c.class == CoinClass::Reserve && c.state == CoinState::Unspent);
+            .enumerate()
+            .filter(|(_, c)| {
+                c.class == CoinClass::Reserve
+                    && c.state == CoinState::Unspent
+                    && c.amount_sats >= min_sats
+            })
+            .max_by_key(|(_, c)| c.amount_sats)
+            .map(|(i, _)| i);
         match idx {
             Some(i) => self.transact(|l| {
                 l.coins[i].state = CoinState::Leased;
@@ -972,6 +984,53 @@ impl Ledger {
             }
             c.state = CoinState::Spent;
             c.lessee = None;
+            Ok(())
+        })
+    }
+
+    /// Spend a leased reserve into its CPFP child and register the child's
+    /// change output as a NEW Reserve coin — in ONE persist, so the reserve
+    /// accounting and the pool replenishment can never straddle a crash. The
+    /// change inherits the source reserve's deposit provenance (never launders
+    /// it). Called by `run_cpfp_bump` only after `submit_package` accepted.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spend_reserve_into_change(
+        &mut self,
+        reserve_outpoint: OutPoint,
+        change_outpoint: OutPoint,
+        change_amount_sats: u64,
+        change_key_index: u32,
+        height: u32,
+        deposit_linked: bool,
+    ) -> Result<()> {
+        if self.find(&change_outpoint).is_some() {
+            return Err(Error::Validation("ledger: change outpoint already tracked"));
+        }
+        self.transact(|l| {
+            let c = l
+                .find_mut(&reserve_outpoint)
+                .ok_or(Error::Validation("ledger: unknown reserve outpoint"))?;
+            if !matches!(c.state, CoinState::Leased | CoinState::Unspent) {
+                return Err(Error::Ordering("ledger: reserve is not spendable"));
+            }
+            c.state = CoinState::Spent;
+            c.lessee = None;
+            l.coins.push(CoinRecord {
+                outpoint: change_outpoint,
+                amount_sats: change_amount_sats,
+                class: CoinClass::Reserve,
+                state: CoinState::Unspent,
+                key_purpose: KeyPurpose::Reserve,
+                key_index: change_key_index,
+                created_height: height,
+                delay_or_eligible_unix: 0,
+                eligible_height: 0,
+                deposit_linked,
+                parent: None,
+                lessee: None,
+                split_tx: None,
+                split_attempts: Vec::new(),
+            });
             Ok(())
         })
     }
@@ -1034,6 +1093,22 @@ impl Ledger {
 
     pub fn coins(&self) -> &[CoinRecord] {
         &self.coins
+    }
+
+    /// Is there a leasable reserve coin — unspent, class `Reserve` — holding at
+    /// least `min_sats`? This is the production `reserve_available` gate the
+    /// congestion backstop consults before deciding to CPFP-bump; `min_sats`
+    /// is the caller's (conservative) `required_child_fee` estimate. The exact
+    /// sizing is re-checked when the child is built, so an optimistic answer
+    /// here never mints an under-funded bump — it degrades to the safe
+    /// fallback. `lease_reserve` picks the same class/state, so a `true` here
+    /// means a lease will succeed (modulo a concurrent lease).
+    pub fn has_leasable_reserve(&self, min_sats: u64) -> bool {
+        self.coins.iter().any(|c| {
+            c.class == CoinClass::Reserve
+                && c.state == CoinState::Unspent
+                && c.amount_sats >= min_sats
+        })
     }
 
     pub fn find(&self, outpoint: &OutPoint) -> Option<&CoinRecord> {
@@ -1501,21 +1576,33 @@ mod tests {
         );
 
         // Refund bump: silent (no ack needed).
-        let r = ledger.lease_reserve(BumpTarget::Refund, None, LESSEE).unwrap().unwrap();
+        let r = ledger.lease_reserve(BumpTarget::Refund, 1, None, LESSEE).unwrap().unwrap();
         ledger.release_lease(r.outpoint).unwrap();
 
         // Completion bump: refused without the typed linkage ack.
         assert!(matches!(
-            ledger.lease_reserve(BumpTarget::Completion, None, LESSEE),
+            ledger.lease_reserve(BumpTarget::Completion, 1, None, LESSEE),
             Err(Error::Ordering(_))
         ));
         assert!(acknowledge_linkage("ok").is_err());
         let ack = acknowledge_linkage(LINKAGE_WARNING).unwrap();
         let r = ledger
-            .lease_reserve(BumpTarget::Completion, Some(ack), LESSEE)
+            .lease_reserve(BumpTarget::Completion, 1, Some(ack), LESSEE)
             .unwrap()
             .expect("reserve leased");
         assert_eq!(r.outpoint, change_op);
+
+        // Size gate: no reserve is large enough → no lease (the gate and the
+        // lease agree).
+        let ack2 = acknowledge_linkage(LINKAGE_WARNING).unwrap();
+        ledger.release_lease(r.outpoint).unwrap();
+        assert!(
+            ledger
+                .lease_reserve(BumpTarget::Completion, u64::MAX, Some(ack2), LESSEE)
+                .unwrap()
+                .is_none(),
+            "an oversized min must find no leasable reserve"
+        );
 
         // The bumped swap's output carries the persisted taint.
         ledger
