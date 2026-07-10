@@ -71,11 +71,13 @@ pub mod watchtower_driver;
 pub mod ledger;
 pub mod manifest;
 pub mod orchestrator;
+pub mod recovery_driver;
 pub mod store;
 
 pub use backstop_driver::{BackstopDriver, BackstopTick};
 pub use driver::{DriveStatus, SwapDriver};
 pub use funding_driver::{FundingDriver, FundingTick, HandoffError};
+pub use recovery_driver::{RecoveryDriver, RecoveryTick};
 pub use manifest::{
     ClaimDelayPosture, ManifestOpenReport, ManifestStore, ManifestTrustRoot, ModeledTrustRoot,
     SignedManifest,
