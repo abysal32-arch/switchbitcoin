@@ -303,12 +303,24 @@ impl SwapRecord {
     }
 
     /// Immutability rules relative to what is already on disk: identity,
-    /// role, and params are pinned; money-bearing artifacts are write-once.
-    /// This is what makes a "legal put" unable to erase the refund, flip the
-    /// role into an SL-only phase, or silently re-deadline a live swap.
+    /// role (post-funding), and params are pinned; money-bearing artifacts are
+    /// write-once. This is what makes a "legal put" unable to erase the
+    /// refund, flip the role into an SL-only phase, or silently re-deadline a
+    /// live swap.
     fn check_against(&self, existing: &SwapRecord) -> Result<()> {
-        if self.role != existing.role {
-            return Err(Error::Ordering("swap record role is immutable"));
+        // Role is pinned from the first post-funding put. While the EXISTING
+        // record is still `Funding` it is PROVISIONAL: the real role derives
+        // from the two funding txids + S only after both escrows confirm
+        // (v3.14), yet the crash-safe early Funding record must exist from the
+        // moment our Setup is on the wire — so a put over a still-Funding
+        // record may correct it. Sound because no Funding-phase consumer reads
+        // role (recovery surfaces the standing refund from the outpoint +
+        // pre-armed refund alone; the backstop classifies Funding role-free),
+        // and `check()` enforces the SL-only phase constraints against the NEW
+        // record's role, so a correction can never smuggle a role into an
+        // SL-only phase.
+        if self.role != existing.role && existing.phase != SwapPhase::Funding {
+            return Err(Error::Ordering("swap record role is immutable after funding"));
         }
         if self.params != existing.params {
             return Err(Error::Ordering(
@@ -1142,11 +1154,6 @@ mod tests {
         let rec = base_record(15, SwapPhase::Funding);
         store.put(&rec).unwrap();
 
-        // Role flip rejected (would dodge role-gated phase rules).
-        let mut flip = rec.clone();
-        flip.role = Role::SecretHolder;
-        assert!(matches!(store.put(&flip).unwrap_err(), Error::Ordering(_)));
-
         // Params mutation rejected (re-deadlining a live swap).
         let mut repar = rec.clone();
         repar.params.delta_buffer += 1;
@@ -1179,6 +1186,43 @@ mod tests {
         let mut re_s = rec.clone();
         re_s.s_height += 1;
         assert!(matches!(store.put(&re_s).unwrap_err(), Error::Ordering(_)));
+    }
+
+    /// The provisional-role rule: role is CORRECTABLE while the on-disk record
+    /// is still `Funding` (the early crash-safe record is written before the
+    /// role is derivable from txids+S), and PINNED from the first post-funding
+    /// put onward (flipping it later would dodge the role-gated phase rules).
+    #[test]
+    fn provisional_role_corrects_while_funding_then_pins() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = open_store(dir.path());
+
+        // Early record with the provisional guess (SH).
+        let mut early = base_record(21, SwapPhase::Funding);
+        early.role = Role::SecretHolder;
+        early.possession_record = None; // pre-exchange, no G1 pointer yet
+        store.put(&early).unwrap();
+
+        // The Proceed handoff derives the REAL role (SL here) and corrects it
+        // while the record is still Funding — allowed.
+        let mut corrected = early.clone();
+        corrected.role = Role::SecretLearner;
+        store.put(&corrected).expect("role correction while Funding is legal");
+        assert_eq!(store.get(&sid(21)).unwrap().unwrap().role, Role::SecretLearner);
+
+        // Advance past funding (Signing pins it; SL needs its G1 pointer).
+        let mut signing = corrected.clone();
+        signing.phase = SwapPhase::Signing;
+        attach_real_possession(dir.path(), &mut signing);
+        store.put(&signing).unwrap();
+
+        // Any role change after funding is rejected — even phase-preserving.
+        let mut flip = store.get(&sid(21)).unwrap().unwrap();
+        flip.role = Role::SecretHolder;
+        assert!(
+            matches!(store.put(&flip).unwrap_err(), Error::Ordering(_)),
+            "role must be immutable once past Funding"
+        );
     }
 
     #[test]

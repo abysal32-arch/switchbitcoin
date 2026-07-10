@@ -39,27 +39,34 @@
 //! `Transport`/`ChainView` traits — no curve math, no new settlement-core
 //! surface.
 //!
-//! # Known residual (pre-existing, documented — NOT introduced here)
-//! The FIRST durable `SwapRecord` for a swap is written at the `Proceed`
-//! handoff (`enter_settlement` → `record_funding`), so the window between the
-//! caller broadcasting its Setup and reaching `Proceed` has an on-chain-funded
-//! escrow with no persisted record. A crash there is not re-entered by
-//! [`SwapApp::recover`] (the store has nothing to find). This is inherent to the
-//! current FundingDriver design (funding is chain-observable but role-underivable
-//! until both escrows confirm, so an early record cannot carry a correct role);
-//! closing it — an early provisional-role `Funding` record corrected at
-//! `run_exchange` — is a separate hardening task, tracked in RESUME.md.
+//! # Crash story: the early `Funding` record
+//! [`SwapApp::setup_broadcast`] persists a PROVISIONAL-ROLE `Funding` record the
+//! moment the caller confirms our Setup is on the wire — the instant the
+//! crash-exposure window of a funded escrow opens. From then on the swap is
+//! durable: a crash anywhere before the `Proceed` handoff is re-entered by
+//! [`SwapApp::recover`] (the record surfaces the standing pre-armed refund),
+//! `SwapEngine::open`'s lease reconcile keeps the funding coin leased (no
+//! phantom re-expose of a coin the in-flight Setup spends), and a funded
+//! pre-funding abort advances the record to `AbortRefund` so recovery drives
+//! the completion-supersedes refund decision. The role is corrected to the
+//! derived one at the `Proceed` handoff (the store permits this only while the
+//! record is still `Funding` — see `SwapStore::check_against`). The remaining
+//! unrecorded stretch is only the caller-side gap between its actual broadcast
+//! and its `setup_broadcast` call; a re-driven restart heals it (the fresh
+//! driver re-issues `BroadcastSetup`, the re-broadcast is idempotent, and
+//! `setup_broadcast` re-runs).
 
 use bitcoin::OutPoint;
 
 use crate::chain::ChainView;
 use crate::crypto::ValidatedPoint;
-use crate::settlement::state_machine::{Funded, PeerSession, Possessing};
+use crate::settlement::state_machine::{Funded, PeerSession, Possessing, Role};
 use crate::wallet::backstop_driver::{BackstopDriver, BackstopTick};
 use crate::wallet::engine::{DriveStatus, SettleEntry, SwapContext, SwapEngine};
 use crate::wallet::funding_driver::{FundingDriver, FundingTick, HandoffError};
 use crate::wallet::orchestrator::FundingOrder;
 use crate::wallet::recovery_driver::{RecoveryDriver, RecoveryScan};
+use crate::wallet::store::{SwapPhase, SwapRecord};
 use crate::wallet::watchtower_driver::WatchtowerDriver;
 use crate::{Error, Result};
 
@@ -91,14 +98,14 @@ pub enum AppTick {
     /// finalizes+broadcasts onto its own completion tx (the engine boundary).
     Completed { our_final_sig: [u8; 64] },
     /// Terminal (automatic refund): the swap routed to its pre-armed refund
-    /// exit and OUR escrow was locked, so the refund is the sink — either
-    /// `AbortRefund` was persisted (a settlement-phase failure) or a pre-funding
-    /// abort left our funded escrow to its standing refund (no record yet). Keep
-    /// [`backstop_tick`](SwapApp::backstop_tick) running until the refund confirms
-    /// — it fires the dead-device refund at CSV maturity in BOTH cases (via the
-    /// tower, record or no record). Once a settlement record exists, call
-    /// [`SwapEngine::record_refunded`] on confirmation (a no-op for the
-    /// record-less pre-funding case). Carries the static reason.
+    /// exit and OUR escrow was locked, so the refund is the sink. `AbortRefund`
+    /// is persisted on both routes — a settlement-phase failure via the engine,
+    /// and a funded pre-funding abort via the early `Funding` record (see the
+    /// module docs' crash story). Keep [`backstop_tick`](SwapApp::backstop_tick)
+    /// running until the refund confirms — it fires the dead-device refund at
+    /// CSV maturity even if the record put failed (the tower needs only the
+    /// escrow + chain) — then call [`SwapEngine::record_refunded`]. Carries the
+    /// static reason.
     Refunding(&'static str),
     /// Terminal (clean abort): the swap was abandoned BEFORE our escrow was ever
     /// locked (a pre-funding Block-X / co-funding-window / encumbrance /
@@ -223,13 +230,60 @@ impl SwapApp {
     }
 
     /// Signal that the caller performed the [`AppTick::BroadcastSetup`]
-    /// broadcast. Records our own flag (the abort discriminator) and forwards to
-    /// the pre-funding driver.
-    pub fn setup_broadcast(&mut self) {
-        self.our_setup_broadcast = true;
-        if let AppPhase::Funding { driver, .. } = &mut self.phase {
-            driver.setup_broadcast();
+    /// broadcast — our Setup is on the wire, so the crash-exposure window of a
+    /// funded escrow opens HERE. Records our own flag (the abort
+    /// discriminator), forwards to the pre-funding driver, and persists the
+    /// EARLY `Funding` record, making the escrow durable from this moment: a
+    /// crash before the `Proceed` handoff is re-entered by
+    /// [`SwapApp::recover`] (the standing pre-armed refund is the exit), and
+    /// `SwapEngine::open`'s lease reconcile keeps the funding coin leased
+    /// instead of re-exposing a coin the in-flight Setup spends.
+    ///
+    /// The record's role is PROVISIONAL — the real role derives from the two
+    /// funding txids + S only after both escrows confirm, so it is unknowable
+    /// here; the store permits correcting it while the record is still
+    /// `Funding`, and the `Proceed` handoff re-persists the derived role.
+    ///
+    /// Idempotent: an existing record is left untouched (a restarted caller
+    /// re-confirming its idempotent re-broadcast), and an `Err` from the store
+    /// is retryable by calling this again. Call this IMMEDIATELY after the
+    /// broadcast — the caller-side gap between the two is the only remaining
+    /// unrecorded stretch, and a re-driven restart heals it (the fresh driver
+    /// re-issues `BroadcastSetup` → re-broadcast is idempotent → this re-runs).
+    ///
+    /// No-op outside the pre-funding phase.
+    pub fn setup_broadcast(&mut self, engine: &SwapEngine) -> Result<()> {
+        match &mut self.phase {
+            AppPhase::Funding { driver, .. } => {
+                self.our_setup_broadcast = true;
+                driver.setup_broadcast();
+            }
+            _ => return Ok(()),
         }
+        let sid = SwapEngine::swap_session_id(&self.ctx)?;
+        if engine.store().get(&sid)?.is_none() {
+            engine.store().put(&SwapRecord {
+                swap_session_id: sid,
+                // Provisional (see above) — deterministic placeholder the
+                // Proceed handoff corrects once txids + S fix the real role.
+                role: Role::SecretHolder,
+                phase: SwapPhase::Funding,
+                // Snapshot the manifest params NOW. `record_funding` at Proceed
+                // re-puts the live manifest's params; the store pins the
+                // snapshot, so a mid-swap manifest bump becomes a hard error
+                // there instead of a silent desync from the on-chain amounts
+                // the coordinator gated under the old params.
+                params: engine.manifest().current().params().clone(),
+                s_height: 0,
+                sweep_escrow_height: 0,
+                our_escrow_outpoint: Some(self.ctx.our_escrow_op),
+                their_escrow_outpoint: Some(self.ctx.their_escrow_op),
+                pre_armed_refund: Some(self.ctx.pre_armed_refund.clone()),
+                completion_tx: None,
+                possession_record: None,
+            })?;
+        }
+        Ok(())
     }
 
     /// Advance the swap one step. Re-enterable and idempotent: safe to call
@@ -264,7 +318,7 @@ impl SwapApp {
             FundingTick::Wait => Ok(AppTick::Wait),
             FundingTick::AwaitingVerification => Ok(AppTick::AwaitingVerification),
             FundingTick::BroadcastOurSetup => Ok(AppTick::BroadcastSetup),
-            FundingTick::Abort(reason) => Ok(self.terminate_abort(reason)),
+            FundingTick::Abort(reason) => Ok(self.terminate_abort(engine, reason)),
             FundingTick::Proceed { .. } => self.cross_into_settlement(engine, chain),
         }
     }
@@ -363,7 +417,7 @@ impl SwapApp {
                     // A terminal refusal (sticky abort, Block-X, wrong amount,
                     // scriptPubKey mismatch): end the swap, routed by whether our
                     // escrow is locked.
-                    Error::Abort(reason) => Ok(self.terminate_abort(reason)),
+                    Error::Abort(reason) => Ok(self.terminate_abort(engine, reason)),
                     // A benign re-drive refusal (no go-signal yet, unverifiable
                     // counterparty escrow): keep the restored phase and re-poll.
                     _ => Ok(AppTick::Wait),
@@ -430,8 +484,31 @@ impl SwapApp {
     /// Classify a pre-funding abort into a terminal: with our Setup on the wire
     /// our escrow is (being) funded, so the pre-armed refund is the sink
     /// (`Refunding`); otherwise nothing is locked (`Aborted`).
-    fn terminate_abort(&mut self, reason: &'static str) -> AppTick {
-        let tick = if self.our_setup_broadcast {
+    ///
+    /// The discriminator is the in-memory flag OR the early record: the flag
+    /// does not survive a restart, but the record does — a record existing for
+    /// this swap means our Setup went on the wire in SOME session, so a
+    /// restarted app that aborts before the caller re-confirms its idempotent
+    /// re-broadcast still classifies as a FUNDED abort, never a clean
+    /// "nothing locked" `Aborted`.
+    ///
+    /// A funded abort also advances the early `Funding` record to `AbortRefund`
+    /// (best-effort, mirroring `SwapEngine::abort` — the terminal classification
+    /// itself must not fail on a store hiccup; the live backstop and the G2
+    /// watchtower still guard the refund regardless), so a crash after this
+    /// terminal is re-entered by [`recover`](SwapApp::recover) as the
+    /// completion-supersedes refund decision.
+    fn terminate_abort(&mut self, engine: &SwapEngine, reason: &'static str) -> AppTick {
+        let record = SwapEngine::swap_session_id(&self.ctx)
+            .ok()
+            .and_then(|sid| engine.store().get(&sid).ok().flatten());
+        let tick = if self.our_setup_broadcast || record.is_some() {
+            if let Some(mut rec) = record {
+                if rec.phase == SwapPhase::Funding {
+                    rec.phase = SwapPhase::AbortRefund;
+                    let _ = engine.store().put(&rec);
+                }
+            }
             AppTick::Refunding(reason)
         } else {
             AppTick::Aborted(reason)

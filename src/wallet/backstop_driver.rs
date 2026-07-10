@@ -723,6 +723,38 @@ mod tests {
     }
 
     #[test]
+    fn tick_refund_only_fires_the_tower_without_a_record() {
+        // The record-less arm (a pre-Proceed funded escrow): the tower needs
+        // only the escrow + chain, so the dead-device refund still fires at
+        // CSV maturity, and pre-maturity it is a quiet Idle.
+        let e_ours = op(95);
+        let maturity = 500_144u32;
+        let chain = SimChain::new(500_000);
+        chain.fund(e_ours, 500_000);
+        let driver = BackstopDriver::arm(armed_tower(e_ours, 900_000, 144, maturity));
+
+        assert_eq!(
+            driver.tick_refund_only(&chain, false).unwrap(),
+            BackstopTick::Idle,
+            "immature refund: nothing to do"
+        );
+        while chain.tip_height() < maturity {
+            chain.mine();
+        }
+        assert_eq!(
+            driver.tick_refund_only(&chain, false).unwrap(),
+            BackstopTick::FiredRefund,
+            "matured, unspent, record-less: the tower fires"
+        );
+        chain.mine();
+        assert_eq!(
+            driver.tick_refund_only(&chain, false).unwrap(),
+            BackstopTick::Idle,
+            "confirmed refund: stand down maps to Idle"
+        );
+    }
+
+    #[test]
     fn reserve_available_flips_completion_to_needs_consent() {
         // A revealed, congested completion: with NO reserve it keeps fighting;
         // with a reserve available it surfaces NeedsConsent (the dead-device

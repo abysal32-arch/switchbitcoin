@@ -40,6 +40,7 @@ use swapkey::wallet::keys::ModeledKeySource;
 use swapkey::wallet::ledger::{acknowledge_phase0, BumpTarget, Ledger, WalletClock, PHASE0_WARNING};
 use swapkey::wallet::ledger::CoinState;
 use swapkey::wallet::manifest::ModeledTrustRoot;
+use swapkey::wallet::orchestrator::AbortAction;
 use swapkey::wallet::recovery_driver::{RecoveryDriver, RecoveryTick};
 use swapkey::wallet::store::{ModeledEnclave, SwapPhase, SwapRecord};
 use swapkey::{Error, Result};
@@ -342,7 +343,7 @@ fn swap_app_runs_a_full_swap_to_completed() {
             match app.poll(&mut engine, &chain).unwrap() {
                 AppTick::BroadcastSetup => {
                     chain.broadcast(&sl_setup).expect("idempotent re-broadcast");
-                    app.setup_broadcast();
+                    app.setup_broadcast(&engine).unwrap();
                 }
                 AppTick::Wait => {}
                 AppTick::AwaitingReveal => {
@@ -454,7 +455,7 @@ fn swap_app_routes_to_refunding_when_phase_a_fails() {
         match app.poll(&mut engine, &chain).unwrap() {
             AppTick::BroadcastSetup => {
                 chain.broadcast(&sl_setup).unwrap();
-                app.setup_broadcast();
+                app.setup_broadcast(&engine).unwrap();
             }
             AppTick::Wait => {}
             AppTick::Refunding(reason) => {
@@ -599,7 +600,13 @@ fn swap_app_funded_abort_routes_to_refunding() {
     // WRONG amount → a funded abort → Refunding.
     assert_eq!(app.poll(&mut engine, &chain).unwrap(), AppTick::BroadcastSetup);
     chain.broadcast(&sl_setup).unwrap();
-    app.setup_broadcast();
+    app.setup_broadcast(&engine).unwrap();
+    // The early Funding record is durable the moment our Setup is on the wire.
+    assert_eq!(
+        engine.store().get(&sid).unwrap().unwrap().phase,
+        SwapPhase::Funding,
+        "setup_broadcast persists the early Funding record"
+    );
     chain.fund_with_amount(their_op, base + 1, escrow_amt - 1); // hostile: 1 sat short
     chain.mine();
 
@@ -609,11 +616,22 @@ fn swap_app_funded_abort_routes_to_refunding() {
     }
     assert!(app.is_terminal());
 
-    // The funded abort wrote NO durable record (record_funding only runs at
-    // Proceed) — yet forward-or-refund must still hold: backstop_tick guards the
-    // funded escrow's dead-device refund via the tower and fires it at CSV
-    // maturity, record or no record.
-    assert!(engine.store().get(&sid).unwrap().is_none(), "no record before Proceed");
+    // The funded abort advanced the early record to AbortRefund, so a crash
+    // here is re-entered by recover() as the refund decision (escrow funded,
+    // refund immature → Wait).
+    assert_eq!(engine.store().get(&sid).unwrap().unwrap().phase, SwapPhase::AbortRefund);
+    let (ticks, failed) = SwapApp::recover(&engine, &chain).unwrap();
+    assert!(failed.is_empty());
+    assert_eq!(ticks.len(), 1);
+    assert_eq!(ticks[0].0, sid);
+    assert!(
+        matches!(ticks[0].1, RecoveryTick::Refund(AbortAction::Wait)),
+        "recover drives the funded abort's refund decision, got {:?}",
+        ticks[0].1
+    );
+
+    // And the live backstop still fires the dead-device refund at CSV maturity
+    // (now via the record path — same tower, same outcome).
     assert_eq!(
         app.backstop_tick(&engine, &chain, false, false).unwrap(),
         BackstopTick::Idle,
@@ -625,7 +643,178 @@ fn swap_app_funded_abort_routes_to_refunding() {
     assert_eq!(
         app.backstop_tick(&engine, &chain, false, false).unwrap(),
         BackstopTick::FiredRefund,
-        "the record-less funded escrow's refund fires at maturity"
+        "the funded escrow's refund fires at maturity"
+    );
+}
+
+// ============================================================================
+// Early Funding record: crash between Setup broadcast and Proceed is durable.
+// ============================================================================
+
+/// THE pre-record crash gap, closed: a crash after our Setup went on the wire
+/// but before the `Proceed` handoff used to leave a funded escrow with NO store
+/// record (recover() blind, and `open`'s reconcile re-exposing the leased
+/// funding coin as a phantom). With the early record persisted at
+/// `setup_broadcast`, the crashed swap (a) keeps its funding-coin lease across
+/// the reopen, and (b) is re-entered by recover() with the standing pre-armed
+/// refund as the exit — Wait while immature, BroadcastRefund at CSV maturity.
+#[test]
+fn early_funding_record_survives_crash_and_recovers() {
+    let params = Params::testnet_provisional();
+    let escrow_amt = params.escrow_amount_sats();
+    let d = params.tier_d_sats;
+    let base = 300_000u32;
+
+    let wallet_dir = tempfile::tempdir().unwrap();
+    // Onboard the coin (the helper's dummy lease is released by open's
+    // reconcile — no record exists for it), then re-lease under the REAL sid.
+    let sl_pre = onboard_one_coin(wallet_dir.path(), params.pre_encumbrance_sats(), [0xAAu8; 32]);
+
+    // Deterministically be the First funder so the first poll is BroadcastSetup.
+    let (sh, sl) = loop {
+        let a = keypair();
+        let b = keypair();
+        if vp(&a.pk).to_bytes() < vp(&b.pk).to_bytes() {
+            break (b, a);
+        } else if vp(&b.pk).to_bytes() < vp(&a.pk).to_bytes() {
+            break (a, b);
+        }
+    };
+    let sid = swap_session_id(sl.pk, sh.pk).unwrap();
+    let internal = canonical_internal_key(sh.pk, sl.pk).unwrap();
+    let e_ours = Escrow::new(&internal, &sl.pk, params.delta_early).unwrap();
+    let e_theirs = Escrow::new(&internal, &sh.pk, params.delta_early).unwrap();
+
+    let chain = SimChain::new(base);
+    let (sl_setup, our_op) = build_real_setup(&chain, &params, sl_pre, base, &e_ours, &sl.sk);
+    let (_sh_setup, their_op) =
+        build_real_setup(&chain, &params, OutPoint::new(txid_from(0xB2), 0), base, &e_theirs, &sh.sk);
+
+    let dest = e_ours.funding_script_pubkey().clone();
+    let comp = build_completion(&e_ours, our_op, escrow_amt, dest.clone(), d, params.anchor_sats).unwrap();
+    let refund =
+        PreArmedRefund::arm(&e_ours, our_op, escrow_amt, &sl.sk, dest, d, params.anchor_sats, base).unwrap();
+    let receipt = confirm_watchtower_handoff(&refund, refund.fingerprint()).unwrap();
+
+    let (mut engine, _) = SwapEngine::open(
+        wallet_dir.path(),
+        &ModeledEnclave,
+        Box::new(ModeledKeySource::new(&ModeledEnclave)),
+        &ModeledTrustRoot,
+    )
+    .unwrap();
+    // The production-shaped lease: the funding coin is leased to THIS swap.
+    let leased = engine
+        .ledger_mut()
+        .lease_pre_encumbrance(params.pre_encumbrance_sats(), &FixedClock(u64::MAX), u32::MAX, sid)
+        .unwrap()
+        .expect("the reconciled coin re-leases under the swap's sid");
+    assert_eq!(leased.outpoint, sl_pre, "same coin, now leased to the swap");
+
+    let lease = tempfile::tempdir().unwrap();
+    let possession = tempfile::tempdir().unwrap();
+    let ctx = make_ctx(
+        sl.sk, sh.pk, our_op, their_op, escrow_amt, comp.sighash, comp.sighash, refund, None,
+        e_ours.merkle_root(), e_theirs.merkle_root(), e_ours.output_key_xonly(),
+        e_theirs.output_key_xonly(), lease.path().to_path_buf(), possession.path().to_path_buf(),
+        receipt, sl_pre,
+    );
+    let peer = PeerSession::new([0u8; 32], Box::new(DeadEnd));
+    let mut app = SwapApp::begin(&engine, ctx, peer, base + 500, 0).unwrap();
+
+    // Broadcast our Setup; the early record lands the moment we confirm it.
+    assert_eq!(app.poll(&mut engine, &chain).unwrap(), AppTick::BroadcastSetup);
+    chain.broadcast(&sl_setup).unwrap();
+    app.setup_broadcast(&engine).unwrap();
+    let rec = engine.store().get(&sid).unwrap().expect("early record persisted");
+    assert_eq!(rec.phase, SwapPhase::Funding);
+    assert_eq!(rec.our_escrow_outpoint, Some(our_op));
+    assert!(rec.pre_armed_refund.is_some(), "G2: the refund rides in the early record");
+    // Idempotent re-confirm (a restarted caller re-broadcasting).
+    app.setup_broadcast(&engine).unwrap();
+
+    chain.mine(); // our escrow confirms; counterparty never funds
+
+    // CRASH: the live app AND engine die; only the store + chain survive.
+    drop(app);
+    drop(engine);
+
+    let (engine2, _) = SwapEngine::open(
+        wallet_dir.path(),
+        &ModeledEnclave,
+        Box::new(ModeledKeySource::new(&ModeledEnclave)),
+        &ModeledTrustRoot,
+    )
+    .unwrap();
+    // (a) The lease reconcile sees the live Funding record and KEEPS the lease —
+    // the coin the in-flight Setup spends is never re-exposed as a phantom.
+    let coin = engine2.ledger().find(&sl_pre).expect("funding coin tracked");
+    assert_eq!(
+        coin.state,
+        CoinState::Leased,
+        "the early record keeps the funding-coin lease across a crash"
+    );
+
+    // (b) recover() re-enters the crashed swap from the record alone: escrow
+    // funded, refund immature → Wait; at CSV maturity → BroadcastRefund.
+    let (ticks, failed) = SwapApp::recover(&engine2, &chain).unwrap();
+    assert!(failed.is_empty());
+    assert_eq!(ticks.len(), 1);
+    assert_eq!(ticks[0].0, sid);
+    assert!(
+        matches!(ticks[0].1, RecoveryTick::Funding { refund: Some(AbortAction::Wait) }),
+        "immature: recover surfaces the standing refund as Wait, got {:?}",
+        ticks[0].1
+    );
+    while chain.tip_height() < base + 200 {
+        chain.mine();
+    }
+    let (ticks, _) = SwapApp::recover(&engine2, &chain).unwrap();
+    assert!(
+        matches!(ticks[0].1, RecoveryTick::Funding { refund: Some(AbortAction::BroadcastRefund) }),
+        "matured: recover routes to the refund broadcast, got {:?}",
+        ticks[0].1
+    );
+
+    // Restart shape: a FRESH app over the surviving record (broadcast flag
+    // lost) hits the Block-X abort before the caller re-confirms its
+    // re-broadcast. The early record is the durable discriminator — this must
+    // classify as a FUNDED abort (Refunding, record → AbortRefund), never a
+    // clean "nothing locked" Aborted.
+    while chain.tip_height() < base + 500 {
+        chain.mine(); // Block-X passes; the counterparty never funded
+    }
+    let refund2 = PreArmedRefund::arm(
+        &e_ours,
+        our_op,
+        escrow_amt,
+        &sl.sk,
+        e_ours.funding_script_pubkey().clone(),
+        d,
+        params.anchor_sats,
+        base,
+    )
+    .unwrap();
+    let receipt2 = confirm_watchtower_handoff(&refund2, refund2.fingerprint()).unwrap();
+    let lease2 = tempfile::tempdir().unwrap();
+    let possession2 = tempfile::tempdir().unwrap();
+    let ctx2 = make_ctx(
+        sl.sk, sh.pk, our_op, their_op, escrow_amt, comp.sighash, comp.sighash, refund2, None,
+        e_ours.merkle_root(), e_theirs.merkle_root(), e_ours.output_key_xonly(),
+        e_theirs.output_key_xonly(), lease2.path().to_path_buf(),
+        possession2.path().to_path_buf(), receipt2, sl_pre,
+    );
+    let peer2 = PeerSession::new([0u8; 32], Box::new(DeadEnd));
+    let mut engine2 = engine2;
+    let mut app2 = SwapApp::begin(&engine2, ctx2, peer2, base + 500, 0).unwrap();
+    match app2.poll(&mut engine2, &chain).unwrap() {
+        AppTick::Refunding(reason) => assert!(reason.contains("Block X"), "got {reason:?}"),
+        other => panic!("a restarted funded abort must be Refunding, got {other:?}"),
+    }
+    assert_eq!(
+        engine2.store().get(&sid).unwrap().unwrap().phase,
+        SwapPhase::AbortRefund,
+        "the restarted funded abort advances the early record to AbortRefund"
     );
 }
 
