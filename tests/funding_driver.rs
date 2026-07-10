@@ -458,6 +458,80 @@ fn premature_handoff_returns_state_and_re_drives() {
     assert!(matches!(funded.role(), Role::SecretHolder | Role::SecretLearner));
 }
 
+/// Anti-substitution: a counterparty that funds its escrow outpoint at EXACTLY
+/// the tier amount but with a scriptPubKey it solely controls (not the agreed
+/// 2-of-2+CSV) must be refused — the amount gate alone would Proceed and let
+/// the counterparty sweep our escrow while our completion against the fake
+/// output is unspendable (deterministic take-both-sides). The driver aborts on
+/// the spk mismatch and the handoff refuses, for whichever funding order we are.
+#[test]
+fn substituted_counterparty_escrow_spk_is_refused() {
+    let manifest = SignedManifest::provisional();
+    let params = manifest.params().clone();
+    let unit = params.pre_encumbrance_sats();
+    let chain = SimChain::new(900_000);
+
+    // Victim A (honest, real 2-of-2 escrow) and attacker B (a fake escrow that
+    // B solely controls — internal key = B's own key, not the canonical
+    // aggregate — funded at the correct amount).
+    let (sk_a, pk_a) = keypair();
+    let (sk_b, pk_b) = keypair();
+    let va = ValidatedPoint::from_bytes(&pk_a.serialize()).unwrap();
+    let vb = ValidatedPoint::from_bytes(&pk_b.serialize()).unwrap();
+    let internal =
+        swapkey::settlement::state_machine::canonical_internal_key(pk_a, pk_b).unwrap();
+    let escrow_a = Escrow::new(&internal, &pk_a, params.delta_early).unwrap(); // genuine
+    let escrow_b_fake = Escrow::new(&pk_b, &pk_b, params.delta_early).unwrap(); // solo-control
+
+    let pre_a = OutPoint::new(txid(0xA1), 0);
+    let pre_b = OutPoint::new(txid(0xB1), 0);
+    chain.fund_with_amount(pre_a, 900_000, unit);
+    chain.fund_with_amount(pre_b, 900_000, unit);
+    let (setup_a, op_a) =
+        build_setup(pre_a, unit, params.escrow_amount_sats(), params.anchor_sats, &escrow_a, &sk_a)
+            .unwrap();
+    let (setup_b, op_b_fake) =
+        build_setup(pre_b, unit, params.escrow_amount_sats(), params.anchor_sats, &escrow_b_fake, &sk_b)
+            .unwrap();
+
+    let view = dual(&chain);
+    let mut d =
+        FundingDriver::begin(&manifest, &va, &vb, op_a, op_b_fake, 900_500, 0).unwrap();
+
+    // Both escrows confirm — B's at the RIGHT amount but the wrong (fake) spk.
+    chain.broadcast(&setup_a).unwrap();
+    chain.broadcast(&setup_b).unwrap();
+    chain.mine();
+
+    // Drive: whichever order we are, we must reach a scriptPubKey Abort and
+    // never Proceed. (First: BroadcastOurSetup once, then Proceed→spk Abort.
+    // Second: the pre-broadcast gate aborts before we ever fund.)
+    let mut spk_aborted = false;
+    for _ in 0..6 {
+        match d.tick(&view).unwrap() {
+            FundingTick::BroadcastOurSetup => d.setup_broadcast(),
+            FundingTick::Wait => {}
+            FundingTick::Abort(reason) => {
+                assert!(reason.contains("scriptPubKey"), "expected spk abort, got {reason:?}");
+                spk_aborted = true;
+                break;
+            }
+            FundingTick::Proceed { .. } => panic!("must not Proceed against a substituted escrow"),
+            FundingTick::AwaitingVerification => panic!("unexpected AwaitingVerification"),
+        }
+    }
+    assert!(spk_aborted, "the substituted escrow must drive a scriptPubKey abort");
+
+    // The handoff refuses too (sticky abort survives into into_funded).
+    match d.into_funded(params, dead_peer(), &view) {
+        Err(HandoffError::Refused { error: Error::Abort(reason), .. }) => {
+            assert!(reason.contains("scriptPubKey"));
+        }
+        Err(other) => panic!("substituted escrow handoff must refuse with the spk abort, got {other:?}"),
+        Ok(_) => panic!("substituted escrow must never mint a Funded"),
+    }
+}
+
 /// The Second funder's jitter decorrelates Setup #2 from escrow #1's
 /// CONFIRMATION: the delay counts from the verification event, not from the
 /// driver's first tick — a first-tick anchor would elapse concurrently with

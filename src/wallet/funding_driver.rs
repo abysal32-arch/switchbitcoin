@@ -43,15 +43,32 @@
 //! Setup #2 on the wire a deterministic beat after verification). Jitter is
 //! privacy, not safety — a crash that resamples and re-anchors is harmless.
 
-use bitcoin::OutPoint;
+use bitcoin::{OutPoint, ScriptBuf};
 
 use crate::chain::{ChainView, FundingReading};
 use crate::crypto::ValidatedPoint;
 use crate::settlement::params::Params;
-use crate::settlement::state_machine::{Funded, Funding, PeerSession};
+use crate::settlement::state_machine::{canonical_internal_key, Funded, Funding, PeerSession};
+use crate::tx::escrow::Escrow;
 use crate::wallet::manifest::SignedManifest;
 use crate::wallet::orchestrator::{FundingAction, FundingCoordinator, FundingOrder};
 use crate::{Error, Result};
+
+/// The sticky-abort reason for a substituted counterparty escrow.
+const SPK_MISMATCH_ABORT: &str =
+    "counterparty escrow scriptPubKey is not the agreed 2-of-2 escrow; abort";
+
+/// The anti-substitution check outcome for the counterparty escrow.
+enum SpkCheck {
+    /// On-chain spk matches an expected 2-of-2+CSV candidate — genuine escrow.
+    Ok,
+    /// On-chain spk is present and matches NEITHER candidate — a hostile
+    /// substitution (a same-amount output the counterparty solely controls).
+    Mismatch,
+    /// The spk cannot be read/agreed yet (source disagreement or a view that
+    /// does not report it) — unverifiable, so wait rather than proceed.
+    Unverifiable,
+}
 
 /// The outcome of one [`FundingDriver::tick`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +119,14 @@ pub struct FundingDriver {
     jitter_anchor: Option<u32>,
     our_setup_broadcast: bool,
     aborted: Option<&'static str>,
+    /// The scriptPubKey(s) the counterparty escrow output is allowed to carry —
+    /// the genuine 2-of-2(our_pk,their_pk) + funder-refund(their_pk) P2TR under
+    /// each admissible CSV. The encumbrance gate checks the on-chain
+    /// counterparty output against these so a same-amount output the
+    /// counterparty solely controls cannot be substituted for the real escrow.
+    /// Both candidates share the aggregate internal key, so a solo-key output
+    /// matches neither regardless of which CSV the (post-funding) role fixes.
+    their_escrow_spks: Vec<ScriptBuf>,
 }
 
 impl FundingDriver {
@@ -128,6 +153,7 @@ impl FundingDriver {
         // wallets derive identically pre-role (equal pubkeys are rejected).
         let order = FundingCoordinator::funding_order(our_pk, their_pk)?;
         let jitter_blocks = jitter_blocks.min(coordinator.jitter_max());
+        let their_escrow_spks = Self::expected_their_escrow_spks(manifest.params(), our_pk, their_pk)?;
         Ok(Self {
             coordinator,
             order,
@@ -140,7 +166,46 @@ impl FundingDriver {
             jitter_anchor: None,
             our_setup_broadcast: false,
             aborted: None,
+            their_escrow_spks,
         })
+    }
+
+    /// The admissible scriptPubKeys of the counterparty escrow: the genuine
+    /// 2-of-2 P2TR under each candidate CSV. The internal key is the canonical
+    /// aggregate of both session pubkeys (role-independent); the refund leaf is
+    /// the counterparty's own key. The CSV is the only role-dependent input and
+    /// the funding-time role is unknown (it derives from txids+S AFTER both
+    /// escrows confirm — the SL-first open question), so both `delta_early` and
+    /// `delta_late` are admitted. Both still bind the aggregate internal key, so
+    /// admitting both never lets a solo-controlled output through.
+    fn expected_their_escrow_spks(
+        params: &Params,
+        our_pk: &ValidatedPoint,
+        their_pk: &ValidatedPoint,
+    ) -> Result<Vec<ScriptBuf>> {
+        let internal = canonical_internal_key(our_pk.point(), their_pk.point())?;
+        let their_point = their_pk.point();
+        let delta_late = u32::try_from(params.delta_late())
+            .map_err(|_| Error::Deadline("delta_late exceeds the CSV height field"))?;
+        let mut spks = Vec::with_capacity(2);
+        for csv in [params.delta_early, delta_late] {
+            let spk = Escrow::new(&internal, &their_point, csv)?
+                .funding_script_pubkey()
+                .clone();
+            if !spks.contains(&spk) {
+                spks.push(spk);
+            }
+        }
+        Ok(spks)
+    }
+
+    /// Anti-substitution read of the counterparty escrow's on-chain spk.
+    fn verify_their_escrow_spk(&self, chain: &impl ChainView) -> SpkCheck {
+        match chain.funding_spk(self.their_escrow) {
+            Some(spk) if self.their_escrow_spks.contains(&spk) => SpkCheck::Ok,
+            Some(_) => SpkCheck::Mismatch,
+            None => SpkCheck::Unverifiable,
+        }
     }
 
     /// The counterparty-agreed funding order for this swap (who funds first).
@@ -234,9 +299,38 @@ impl FundingDriver {
                     FundingTick::Wait
                 }
             }
-            FundingAction::BroadcastOurSetup => FundingTick::BroadcastOurSetup,
+            FundingAction::BroadcastOurSetup => {
+                // The Second funder is about to fund AGAINST the counterparty
+                // escrow, so bind that escrow's identity first: a same-amount
+                // output the counterparty solely controls must not draw our
+                // Setup onto the wire. The First funder funds unconditionally
+                // (no counterparty escrow exists yet) and is instead protected
+                // at the Proceed gate below, before it ever signs the exchange.
+                match self.order {
+                    FundingOrder::First => FundingTick::BroadcastOurSetup,
+                    FundingOrder::Second => match self.verify_their_escrow_spk(chain) {
+                        SpkCheck::Ok => FundingTick::BroadcastOurSetup,
+                        SpkCheck::Mismatch => {
+                            self.aborted = Some(SPK_MISMATCH_ABORT);
+                            FundingTick::Abort(SPK_MISMATCH_ABORT)
+                        }
+                        SpkCheck::Unverifiable => FundingTick::Wait,
+                    },
+                }
+            }
             FundingAction::Proceed { our_height, their_height, s_height } => {
-                FundingTick::Proceed { our_height, their_height, s_height }
+                // Final identity gate before the exchange: the counterparty
+                // escrow we are about to sweep must carry the agreed 2-of-2 spk.
+                // A substituted output is a terminal Abort (refund our escrow);
+                // an unverifiable read is a re-drive (never proceed unverified).
+                match self.verify_their_escrow_spk(chain) {
+                    SpkCheck::Ok => FundingTick::Proceed { our_height, their_height, s_height },
+                    SpkCheck::Mismatch => {
+                        self.aborted = Some(SPK_MISMATCH_ABORT);
+                        FundingTick::Abort(SPK_MISMATCH_ABORT)
+                    }
+                    SpkCheck::Unverifiable => FundingTick::Wait,
+                }
             }
             FundingAction::Abort(reason) => {
                 self.aborted = Some(reason);
@@ -298,7 +392,31 @@ impl FundingDriver {
             }
         };
         match action {
-            FundingAction::Proceed { .. } => {}
+            FundingAction::Proceed { .. } => {
+                // Un-bypassable identity gate: even on a coordinator go-signal,
+                // never mint a Funded against a substituted counterparty escrow.
+                match self.verify_their_escrow_spk(chain) {
+                    SpkCheck::Ok => {}
+                    SpkCheck::Mismatch => {
+                        let mut driver = self;
+                        driver.aborted = Some(SPK_MISMATCH_ABORT);
+                        return Err(HandoffError::Refused {
+                            driver: Box::new(driver),
+                            peer,
+                            error: Error::Abort(SPK_MISMATCH_ABORT),
+                        });
+                    }
+                    SpkCheck::Unverifiable => {
+                        return Err(HandoffError::Refused {
+                            driver: Box::new(self),
+                            peer,
+                            error: Error::Deadline(
+                                "counterparty escrow identity unverifiable; re-drive tick()",
+                            ),
+                        })
+                    }
+                }
+            }
             FundingAction::Abort(reason) => {
                 // Keep the terminal sticky on the returned driver, exactly
                 // as the equivalent tick would have.

@@ -19,7 +19,7 @@ pub mod policy;
 
 use crate::{Error, Result};
 use bitcoin::relative::LockTime;
-use bitcoin::{OutPoint, Transaction, Txid};
+use bitcoin::{OutPoint, ScriptBuf, Transaction, Txid};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -79,6 +79,17 @@ pub trait ChainView {
     /// check (escrow == exactly D+Δ_fee) needs this, so amount-bearing views
     /// (SimChain, a real filter client reading the funding tx) override it.
     fn funding_amount(&self, _outpoint: OutPoint) -> Option<u64> {
+        None
+    }
+    /// Confirmed scriptPubKey of a funding output, if known. Default `None`
+    /// for views that don't retain it; amount/tx-bearing views (SimChain, a
+    /// real filter client reading the funding tx) override it. This is the
+    /// input to the anti-substitution check: the counterparty escrow output
+    /// must carry the agreed 2-of-2+CSV P2TR spk, not a same-amount output the
+    /// counterparty solely controls. Like `funding_amount`, a dual-source view
+    /// returns it only when both sources agree (never proceed on unverified
+    /// escrow identity).
+    fn funding_spk(&self, _outpoint: OutPoint) -> Option<ScriptBuf> {
         None
     }
     /// Status of whatever spends `escrow_outpoint`.
@@ -495,6 +506,20 @@ impl ChainView for SimChain {
         self.0.lock().unwrap().funded.get(&outpoint).map(|(_, a)| *a)
     }
 
+    fn funding_spk(&self, outpoint: OutPoint) -> Option<ScriptBuf> {
+        // Only report the spk of a CONFIRMED funding output whose creating tx
+        // we retain (a real Setup broadcast → mined). A synthetic `fund` /
+        // `fund_with_amount` fixture has no tx, so its spk is unknown (None) —
+        // exactly like a source that cannot report it, so the gate WAITs
+        // rather than proceeding on an unverifiable escrow identity.
+        let g = self.0.lock().unwrap();
+        g.funded.get(&outpoint)?;
+        let tx = g.txs.get(&outpoint.txid)?;
+        tx.output
+            .get(outpoint.vout as usize)
+            .map(|o| o.script_pubkey.clone())
+    }
+
     fn spend_txid(&self, outpoint: OutPoint) -> Option<Txid> {
         self.0.lock().unwrap().spends.get(&outpoint).map(|(t, _, _)| *t)
     }
@@ -576,6 +601,9 @@ pub trait ChainSource {
     fn funding_amount(&self, _outpoint: OutPoint) -> Option<u64> {
         None
     }
+    fn funding_spk(&self, _outpoint: OutPoint) -> Option<ScriptBuf> {
+        None
+    }
     fn spend_status(&self, escrow_outpoint: OutPoint) -> SpendStatus;
     fn spend_txid(&self, _outpoint: OutPoint) -> Option<Txid> {
         None
@@ -616,6 +644,9 @@ impl<C: ChainView> ChainSource for Source<C> {
     }
     fn funding_amount(&self, outpoint: OutPoint) -> Option<u64> {
         self.view.funding_amount(outpoint)
+    }
+    fn funding_spk(&self, outpoint: OutPoint) -> Option<ScriptBuf> {
+        self.view.funding_spk(outpoint)
     }
     fn spend_status(&self, escrow_outpoint: OutPoint) -> SpendStatus {
         self.view.spend_status(escrow_outpoint)
@@ -743,6 +774,33 @@ impl<A: ChainSource, B: ChainSource> DualSourceChainView<A, B> {
         }
     }
 
+    /// Funding scriptPubKey, only if both sources agree (the anti-substitution
+    /// read). Disagreement, or a source that cannot report the spk, => Err so
+    /// the gate waits rather than proceeding on an unverified escrow identity.
+    pub fn verified_funding_spk(&self, outpoint: OutPoint) -> Result<Option<ScriptBuf>> {
+        let (hx, hy) = (self.a.funding_height(outpoint), self.b.funding_height(outpoint));
+        if hx != hy {
+            return Err(Error::Deadline(
+                "chain sources disagree on funding confirmation; wait-or-abort",
+            ));
+        }
+        match hx {
+            None => Ok(None),
+            Some(_) => {
+                let (sx, sy) = (self.a.funding_spk(outpoint), self.b.funding_spk(outpoint));
+                match (sx, sy) {
+                    (Some(x), Some(y)) if x == y => Ok(Some(x)),
+                    (Some(_), Some(_)) => Err(Error::Deadline(
+                        "chain sources disagree on funding scriptPubKey; wait-or-abort",
+                    )),
+                    _ => Err(Error::Deadline(
+                        "a chain source cannot report the funding scriptPubKey; cannot verify escrow identity",
+                    )),
+                }
+            }
+        }
+    }
+
     /// Spend status, only if both sources agree. Disagreement => wait-or-abort.
     pub fn verified_spend_status(&self, escrow_outpoint: OutPoint) -> Result<SpendStatus> {
         let (x, y) = (self.a.spend_status(escrow_outpoint), self.b.spend_status(escrow_outpoint));
@@ -792,6 +850,11 @@ impl<A: ChainSource, B: ChainSource> ChainView for DualSourceChainView<A, B> {
     fn funding_amount(&self, outpoint: OutPoint) -> Option<u64> {
         // Amount only when both sources agree on height AND amount.
         self.verified_funding(outpoint).ok().flatten().map(|(_, a)| a)
+    }
+    fn funding_spk(&self, outpoint: OutPoint) -> Option<ScriptBuf> {
+        // Spk only when both sources agree; disagreement/absent collapses to
+        // None so the anti-substitution gate waits, never proceeds unverified.
+        self.verified_funding_spk(outpoint).ok().flatten()
     }
     fn spend_status(&self, escrow_outpoint: OutPoint) -> SpendStatus {
         self.authoritative_spend_status(escrow_outpoint)
