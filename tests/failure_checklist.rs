@@ -422,8 +422,12 @@ fn claim_delay_never_breaches_safe_window() {
     use proptest::test_runner::{Config, TestRunner};
 
     // Valid-by-construction parameter space: delta_buffer in (0, delta_early),
-    // allowance in (0, margin + delta_buffer) — matching Params::validate.
-    let strategy = (2u32..1000, 1u32..500, 0u32..5_000_000, 0u32..600)
+    // allowance in (0, margin) — matching the tightened, malicious-SH
+    // Params::validate (allowance in (0, margin - cofunding_window), with the
+    // body neutralizing cofunding_window to 0 below).
+    // margin >= 2 so the tightened window (margin - cofunding_window, with
+    // cofunding_window neutralized to 0) admits at least allowance == 1.
+    let strategy = (2u32..1000, 2u32..500, 0u32..5_000_000, 0u32..600)
         .prop_flat_map(|(delta_early, margin, s_height, reveal_off)| {
             (
                 Just(delta_early),
@@ -434,7 +438,9 @@ fn claim_delay_never_breaches_safe_window() {
             )
         })
         .prop_flat_map(|(delta_early, margin, delta_buffer, s_height, reveal_off)| {
-            let window = (margin as u64 + delta_buffer as u64).min(u32::MAX as u64) as u32;
+            // Tightened bound: allowance in (0, margin) once cofunding_window is
+            // neutralized to 0 in the body (no delta_buffer term — malicious SH).
+            let window = margin;
             (
                 Just(delta_early),
                 Just(margin),

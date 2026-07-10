@@ -145,6 +145,18 @@ impl SignedManifest {
             active_posture: ClaimDelayPosture::Moderate,
             // Worst-case claim window for the provisional params is
             // margin(72) + buffer(24) - cofund(12) - allowance(6) = 78.
+            //
+            // ⚠ CRYPTOGRAPHER REVIEW ITEM #5 (OPEN, needs a posture decision):
+            // the ADVERSARY-PROOF (malicious-SH) window is only
+            // margin - cofund - allowance = 54, so this top posture max (72)
+            // exceeds it. The runtime `max_claim_delay` clamp binds the
+            // ACHIEVABLE delay to the adversary-proof value, so there is no
+            // runtime fund loss — but the STATED posture and this manifest
+            // delay-bound check are calibrated to the loose honest-SH window.
+            // Tightening the manifest window + this posture to <54 changes the
+            // SIGNED manifest bytes (test vectors) and reduces the honest-early-
+            // reveal privacy delay, so it is deferred to an owner/cryptographer
+            // posture decision rather than retuned unilaterally.
             delay_bounds: [(0, 6), (6, 36), (12, 72)],
             cofunding_jitter_max: 6,
             quorum_q: 3,
@@ -212,6 +224,15 @@ impl SignedManifest {
         // Worst-case post-reveal claim window (blocks), at maximum
         // co-funding skew, after reserving the confirmation allowance.
         // Positive by Params::validate.
+        //
+        // ⚠ CRYPTOGRAPHER REVIEW ITEM #5 (OPEN): this window keeps the
+        // honest-SH `delta_buffer` term, so it is looser than the adversary-
+        // proof `margin - cofunding_window - allowance`. The runtime
+        // `max_claim_delay` clamp is already adversary-proof, so this loose
+        // DEFENSIVE bound causes no runtime loss; tightening it (and the
+        // provisional posture) is deferred with the posture decision above.
+        // `Params::validate`'s allowance bound IS already tightened, which
+        // closes the reported exploit (an over-large allowance).
         let window = (self.params.margin as u64 + self.params.delta_buffer as u64)
             .saturating_sub(self.params.cofunding_window as u64)
             .saturating_sub(self.params.claim_confirm_allowance as u64);

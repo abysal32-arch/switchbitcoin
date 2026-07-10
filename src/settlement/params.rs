@@ -128,21 +128,28 @@ impl Params {
         if self.delta_buffer == 0 || self.delta_buffer >= self.delta_early {
             return Err(Error::Deadline("delta_buffer must be in (0, delta_early)"));
         }
-        // SL's post-reveal claim window under MAX co-funding skew is
-        // (margin + delta_buffer - cofunding_window) blocks wide: with the claim
-        // anchored to the swept escrow's own height f_sh = S - skew, the window
-        // = margin - skew + delta_buffer - allowance, which must stay positive at
-        // skew = cofunding_window. So the allowance must fit strictly inside
-        // (0, margin + delta_buffer - cofunding_window). (saturating: a
-        // cofunding_window >= margin+delta_buffer collapses the window and is
-        // rejected — also caught by the delta_buffer > cofunding_window guard.)
-        let claim_window =
-            (self.margin as u64 + self.delta_buffer as u64).saturating_sub(self.cofunding_window as u64);
+        // SL's GUARANTEED post-reveal claim window under MAX co-funding skew,
+        // against a MALICIOUS SH (adversary-proof, CRYPTOGRAPHER REVIEW ITEM #5).
+        // The honest-SH broadcast gate (`broadcast_completion`) voluntarily
+        // reveals by `S + delta_early - delta_buffer`, which would widen the
+        // window by `delta_buffer` — but a malicious SH BYPASSES that gate (it
+        // crafts the final Comp→SH signature with `CompletePreSig::complete_with`
+        // and broadcasts raw, no runway check), so the adversary-proof latest
+        // reveal is bounded only by E_sl's own refund timelock at
+        // `f_sl + delta_early`. With the claim anchored to the swept escrow's own
+        // height `f_sh = S - skew` and worst case `f_sl = f_sh + cofunding_window`,
+        // the window is `margin - cofunding_window` blocks — NO delta_buffer
+        // term. The allowance must fit strictly inside `(0, margin - cofunding_window)`.
+        // (Previously `margin + delta_buffer - cofunding_window`, an honest-SH
+        // assumption; tightened in lockstep with the manifest delay-bound window
+        // and the provisional posture bounds. The runtime `max_claim_delay` clamp
+        // was already adversary-proof — this closes the defensive pre-check.)
+        let claim_window = (self.margin as u64).saturating_sub(self.cofunding_window as u64);
         if self.claim_confirm_allowance == 0
             || self.claim_confirm_allowance as u64 >= claim_window
         {
             return Err(Error::Deadline(
-                "claim_confirm_allowance must be in (0, margin + delta_buffer - cofunding_window)",
+                "claim_confirm_allowance must be in (0, margin - cofunding_window)",
             ));
         }
         // Economic sanity: fee margin covers dust + a real fee, output stays exactly D.
