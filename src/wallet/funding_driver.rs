@@ -28,7 +28,8 @@
 //!   coordinator Waits forever and Block-X cannot fire) is SURFACED as
 //!   [`FundingTick::AwaitingVerification`] so the caller can escalate to the
 //!   `AbortDriver` refund path once its pre-armed refund matures; the
-//!   escalation itself is refund-driver wiring, outside this increment.
+//!   escalation itself is refund-driver wiring, outside this increment
+//!   (wired: `SwapApp::poll` terminates a stall at refund maturity).
 //!
 //! # Jitter
 //! Per-party co-funding jitter is in BLOCKS, manifest-signed and bounded

@@ -85,9 +85,13 @@ pub enum AppTick {
     BroadcastSetup,
     /// Pre-funding: both escrows are authoritatively confirmed (Block-X can no
     /// longer fire) yet the verified (agreement) view still lags — a source is
-    /// disagreeing. Without escalation this waits forever; on PERSISTENCE across
-    /// re-polls, route to the refund path once your pre-armed refund matures
-    /// (the escalation itself is refund-driver wiring, outside this type).
+    /// disagreeing. Advisory re-drive: keep polling (an agreement lag can
+    /// resolve a block later). The escalation is WIRED: a stall that persists
+    /// to our pre-armed refund's CSV maturity is terminated by `poll` itself
+    /// (→ [`AppTick::Refunding`], record advanced to `AbortRefund`) — the
+    /// same height at which [`backstop_tick`](SwapApp::backstop_tick) fires
+    /// the dead-device refund regardless, so a stalled swap can never wait
+    /// forever.
     AwaitingVerification,
     /// Settlement (SL only): the counterparty's reveal is not on chain yet.
     /// Advance the `ChainView` and re-poll — the swap has NOT failed and the
@@ -316,7 +320,28 @@ impl SwapApp {
         };
         match tick {
             FundingTick::Wait => Ok(AppTick::Wait),
-            FundingTick::AwaitingVerification => Ok(AppTick::AwaitingVerification),
+            // The persistent-liar stall (both escrows authoritatively
+            // confirmed, the agreement view lagging) would otherwise wait
+            // FOREVER — Block-X can no longer fire, and the coordinator
+            // deliberately never proceeds unverified. This is the escalation
+            // the FundingDriver docs assign to its caller: once OUR pre-armed
+            // refund matures, route to the refund path. Maturity IS the
+            // persistence criterion (a lag that outlives the whole CSV window
+            // is not resolving itself a block later), and it is exactly the
+            // height at which the dead-device tower fires this refund anyway
+            // (`backstop_tick`), so escalating here makes the app's terminal
+            // agree with what the backstop does regardless. Pre-maturity the
+            // stall stays the advisory `AwaitingVerification` re-drive.
+            FundingTick::AwaitingVerification => {
+                if chain.tip_height() >= self.ctx.pre_armed_refund.csv_maturity_height() {
+                    Ok(self.terminate_abort(
+                        engine,
+                        "verification stall outlived the refund maturity; the pre-armed refund is the exit",
+                    ))
+                } else {
+                    Ok(AppTick::AwaitingVerification)
+                }
+            }
             FundingTick::BroadcastOurSetup => Ok(AppTick::BroadcastSetup),
             FundingTick::Abort(reason) => Ok(self.terminate_abort(engine, reason)),
             FundingTick::Proceed { .. } => self.cross_into_settlement(engine, chain),

@@ -22,7 +22,7 @@
 //!   re-entry delegates to `RecoveryDriver::reenter_all`.
 
 use bitcoin::OutPoint;
-use swapkey::chain::{ChainView, SimChain, SpendStatus};
+use swapkey::chain::{ChainView, DualSourceChainView, SimChain, Source, SpendStatus};
 use swapkey::crypto::adaptor::AdaptorSecret;
 use swapkey::crypto::ValidatedPoint;
 use swapkey::settlement::params::Params;
@@ -644,6 +644,120 @@ fn swap_app_funded_abort_routes_to_refunding() {
         app.backstop_tick(&engine, &chain, false, false).unwrap(),
         BackstopTick::FiredRefund,
         "the funded escrow's refund fires at maturity"
+    );
+}
+
+// ============================================================================
+// AwaitingVerification escalation: a persistent stall cannot wait forever.
+// ============================================================================
+
+/// The persistent-liar stall, escalated: both escrows are authoritatively
+/// confirmed (Block-X can never fire) but a lying source keeps the agreement
+/// view lagging forever. Pre-maturity every poll is the advisory
+/// `AwaitingVerification` re-drive; the poll at our pre-armed refund's CSV
+/// maturity terminates the swap to `Refunding` and advances the early record
+/// to `AbortRefund` — the same height at which the dead-device tower fires
+/// this refund anyway, so the app's terminal agrees with the backstop.
+#[test]
+fn awaiting_verification_escalates_to_refund_at_maturity() {
+    let params = Params::testnet_provisional();
+    let escrow_amt = params.escrow_amount_sats();
+    let d = params.tier_d_sats;
+    let base = 650_000u32;
+
+    let wallet_dir = tempfile::tempdir().unwrap();
+    let sl_pre = onboard_one_coin(wallet_dir.path(), params.pre_encumbrance_sats(), [0xAAu8; 32]);
+
+    // Deterministically be the First funder for crisp sequencing.
+    let (sh, sl) = loop {
+        let a = keypair();
+        let b = keypair();
+        if vp(&a.pk).to_bytes() < vp(&b.pk).to_bytes() {
+            break (b, a);
+        } else if vp(&b.pk).to_bytes() < vp(&a.pk).to_bytes() {
+            break (a, b);
+        }
+    };
+    let internal = canonical_internal_key(sh.pk, sl.pk).unwrap();
+    let e_ours = Escrow::new(&internal, &sl.pk, params.delta_early).unwrap();
+    let e_theirs = Escrow::new(&internal, &sh.pk, params.delta_early).unwrap();
+
+    // Truth (self-verifying) vs a liar that NEVER syncs the setups.
+    let truth = SimChain::new(base);
+    let liar = SimChain::new(base);
+    let (sl_setup, our_op) = build_real_setup(&truth, &params, sl_pre, base, &e_ours, &sl.sk);
+    let (sh_setup, their_op) =
+        build_real_setup(&truth, &params, OutPoint::new(txid_from(0xB3), 0), base, &e_theirs, &sh.sk);
+    let view = DualSourceChainView::new(
+        Source::new(truth.clone(), true),
+        Source::new(liar.clone(), false),
+    )
+    .unwrap();
+
+    let dest = e_ours.funding_script_pubkey().clone();
+    let comp = build_completion(&e_ours, our_op, escrow_amt, dest.clone(), d, params.anchor_sats).unwrap();
+    let refund =
+        PreArmedRefund::arm(&e_ours, our_op, escrow_amt, &sl.sk, dest, d, params.anchor_sats, base).unwrap();
+    let maturity = refund.csv_maturity_height();
+    let receipt = confirm_watchtower_handoff(&refund, refund.fingerprint()).unwrap();
+
+    let (mut engine, _) = SwapEngine::open(
+        wallet_dir.path(),
+        &ModeledEnclave,
+        Box::new(ModeledKeySource::new(&ModeledEnclave)),
+        &ModeledTrustRoot,
+    )
+    .unwrap();
+    let lease = tempfile::tempdir().unwrap();
+    let possession = tempfile::tempdir().unwrap();
+    let ctx = make_ctx(
+        sl.sk, sh.pk, our_op, their_op, escrow_amt, comp.sighash, comp.sighash, refund, None,
+        e_ours.merkle_root(), e_theirs.merkle_root(), e_ours.output_key_xonly(),
+        e_theirs.output_key_xonly(), lease.path().to_path_buf(), possession.path().to_path_buf(),
+        receipt, sl_pre,
+    );
+    let sid = SwapEngine::swap_session_id(&ctx).unwrap();
+    let peer = PeerSession::new([0u8; 32], Box::new(DeadEnd));
+    let mut app = SwapApp::begin(&engine, ctx, peer, base + 500, 0).unwrap();
+
+    // Fund both escrows ON TRUTH ONLY — the stall premise.
+    assert_eq!(app.poll(&mut engine, &view).unwrap(), AppTick::BroadcastSetup);
+    truth.broadcast(&sl_setup).unwrap();
+    app.setup_broadcast(&engine).unwrap();
+    truth.broadcast(&sh_setup).unwrap();
+    truth.mine();
+
+    // Pre-maturity: every poll is the advisory re-drive, never a terminal.
+    assert_eq!(app.poll(&mut engine, &view).unwrap(), AppTick::AwaitingVerification);
+    while truth.tip_height() < maturity - 1 {
+        truth.mine();
+    }
+    assert_eq!(
+        app.poll(&mut engine, &view).unwrap(),
+        AppTick::AwaitingVerification,
+        "one block before maturity the stall is still a re-drive"
+    );
+
+    // At maturity the stall has outlived the whole CSV window: escalate.
+    truth.mine();
+    match app.poll(&mut engine, &view).unwrap() {
+        AppTick::Refunding(reason) => {
+            assert!(reason.contains("verification stall"), "got {reason:?}")
+        }
+        other => panic!("a matured stall must escalate to Refunding, got {other:?}"),
+    }
+    assert!(app.is_terminal());
+    assert_eq!(
+        engine.store().get(&sid).unwrap().unwrap().phase,
+        SwapPhase::AbortRefund,
+        "the escalation advances the early record to AbortRefund"
+    );
+    // recover() from here drives the refund broadcast (matured, unspent).
+    let (ticks, _) = SwapApp::recover(&engine, &view).unwrap();
+    assert!(
+        matches!(ticks[0].1, RecoveryTick::Refund(AbortAction::BroadcastRefund)),
+        "got {:?}",
+        ticks[0].1
     );
 }
 
