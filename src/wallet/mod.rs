@@ -65,6 +65,7 @@ pub mod backstop_driver;
 pub mod claim_scheduler;
 pub mod driver;
 pub mod engine;
+pub mod funding_driver;
 pub mod keys;
 pub mod watchtower_driver;
 pub mod ledger;
@@ -74,6 +75,7 @@ pub mod store;
 
 pub use backstop_driver::{BackstopDriver, BackstopTick};
 pub use driver::{DriveStatus, SwapDriver};
+pub use funding_driver::{FundingDriver, FundingTick, HandoffError};
 pub use manifest::{
     ClaimDelayPosture, ManifestOpenReport, ManifestStore, ManifestTrustRoot, ModeledTrustRoot,
     SignedManifest,
