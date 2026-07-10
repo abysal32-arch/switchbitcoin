@@ -24,31 +24,13 @@
 
 use crate::chain::ChainView;
 use crate::settlement::state_machine::{Funded, Possessing, Role};
-use crate::wallet::claim_scheduler::ClaimScheduler;
-use crate::wallet::engine::{SwapContext, SwapEngine, SwapOutcome};
-use crate::wallet::store::SwapPhase;
+use crate::wallet::engine::{SettleEntry, SwapContext, SwapEngine};
 use crate::Result;
 
-/// The outcome of a driver [`poll`](SwapDriver::poll): a durable terminal, or a
-/// non-terminal re-drive signal. Every "cannot proceed right now" is a re-drive,
-/// NEVER a terminal — the forward-or-refund invariant means the only terminals
-/// are a completed swap or the (automatic) refund exit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DriveStatus {
-    /// OUR leg is settled and the record is persisted `Completed`.
-    /// `our_final_sig` is the 64-byte signature the caller finalizes+broadcasts
-    /// onto its own completion tx (the engine boundary — see the module docs).
-    Completed { our_final_sig: [u8; 64] },
-    /// SL only: the counterparty's reveal is not on chain yet. Advance the
-    /// `ChainView` and call `poll` again — the swap has NOT failed, and the
-    /// in-flight `Possessing` is retained so no work is lost.
-    AwaitingReveal,
-    /// The swap routed to its pre-armed refund exit; `AbortRefund` is persisted
-    /// and the refund driver / watchtower owns the broadcast from here. Call
-    /// [`SwapEngine::record_refunded`] once the refund confirms. Carries the
-    /// engine's static reason.
-    Refunding(&'static str),
-}
+// `DriveStatus` moved to the engine (it is the return of the shared
+// settlement-step primitive `SwapEngine::step_settlement`); re-exported here so
+// `wallet::driver::DriveStatus` — the historical path — still resolves.
+pub use crate::wallet::engine::DriveStatus;
 
 /// Private lifecycle state. The in-flight `Possessing` is an in-memory,
 /// non-persisted object, so it must live INSIDE the driver across poll steps —
@@ -91,30 +73,12 @@ impl<'e> SwapDriver<'e> {
         mut ctx: SwapContext,
         chain: &impl ChainView,
     ) -> Result<Self> {
-        // The manifest is the ONLY legitimate params source (record_funding
-        // enforces params == the signed manifest), so read it from the engine.
-        let params = engine.manifest().current().params().clone();
-        engine.record_funding(&ctx, role, params)?;
-
-        let stage = match engine.run_exchange(funded, &mut ctx, chain) {
-            Ok(possessing) => Stage::Active(Box::new(possessing)),
-            Err(e) => {
-                // run_exchange routes to abort() (→ AbortRefund) ONLY on the
-                // adaptor-exchange failure path; its pre-exchange and post-release
-                // store failures return Err WITHOUT persisting AbortRefund. Trust
-                // the PERSISTED phase, never the bare Err: report Refunding only
-                // when the refund exit is actually armed. Otherwise surface the
-                // error so the caller recovers (re-opening the engine drives the
-                // record's recovery path) — a post-release SL, where refund is
-                // NOT a safe sink, must never be reported as Refunding.
-                let sid = SwapEngine::swap_session_id(&ctx)?;
-                match engine.store().get(&sid)?.map(|r| r.phase) {
-                    Some(SwapPhase::AbortRefund) => Stage::Done(DriveStatus::Refunding(
-                        "phase-A exchange failed; pre-armed refund is the exit",
-                    )),
-                    _ => return Err(e),
-                }
-            }
+        // Delegate to the shared settlement-spine primitive: record the funding
+        // record, run Phase A, and discriminate a persisted-AbortRefund exit
+        // from a genuine error (see `SwapEngine::enter_settlement`).
+        let stage = match engine.enter_settlement(role, funded, &mut ctx, chain)? {
+            SettleEntry::Active(possessing) => Stage::Active(possessing),
+            SettleEntry::Refunding(reason) => Stage::Done(DriveStatus::Refunding(reason)),
         };
         Ok(Self { engine, ctx, stage })
     }
@@ -124,42 +88,19 @@ impl<'e> SwapDriver<'e> {
     /// (`Completed`/`Refunding`) or the non-terminal `AwaitingReveal`.
     pub fn poll(&mut self, chain: &impl ChainView) -> Result<DriveStatus> {
         // Terminal already reached — return it idempotently. Otherwise borrow
-        // the retained `Possessing`; `settle` only borrows, so nothing here can
-        // strand it.
+        // the retained `Possessing` and take one shared settlement step;
+        // `step_settlement` only BORROWS the `Possessing`, so nothing here can
+        // strand it, and a non-terminal `AwaitingReveal` leaves the stage Active.
         let possessing: &Possessing = match &self.stage {
             Stage::Done(status) => return Ok(*status),
             Stage::Active(p) => p,
         };
-
-        // SL: the reveal must be observable before `settle` can extract the
-        // claim. A not-ready poll is a clean re-drive — the `Possessing` stays
-        // retained, so the next poll can progress.
-        if possessing.role() == Role::SecretLearner
-            && ClaimScheduler::observe_reveal(chain, self.ctx.reveal_escrow_op).is_none()
-        {
-            return Ok(DriveStatus::AwaitingReveal);
+        let status = self.engine.step_settlement(possessing, &self.ctx, chain)?;
+        // Cache ONLY terminals; `AwaitingReveal` must leave the driver Active so
+        // the retained `Possessing` survives for the next poll.
+        if matches!(status, DriveStatus::Completed { .. } | DriveStatus::Refunding(_)) {
+            self.stage = Stage::Done(status);
         }
-
-        let status = match self.engine.settle(possessing, &self.ctx, chain)? {
-            SwapOutcome::Completed { our_final_sig } => DriveStatus::Completed { our_final_sig },
-            SwapOutcome::Aborted(reason) => {
-                // Discriminate a genuine terminal refund (SH broadcast-gate-closed
-                // persists AbortRefund) from a benign re-drive by re-reading the
-                // PERSISTED phase — never the overloaded reason string. A
-                // non-AbortRefund phase is re-drivable: our SL reveal peek and
-                // `settle`'s own re-observe are two independent, non-atomic
-                // ChainView reads, so a reveal seen by the peek can be evicted /
-                // reorged before `settle` re-reads (→ "no reveal observed yet");
-                // the `Possessing` is retained, so the next poll simply tries
-                // again. `AbortRefund` is the only terminal exit here.
-                let sid = SwapEngine::swap_session_id(&self.ctx)?;
-                match self.engine.store().get(&sid)?.map(|r| r.phase) {
-                    Some(SwapPhase::AbortRefund) => DriveStatus::Refunding(reason),
-                    _ => return Ok(DriveStatus::AwaitingReveal),
-                }
-            }
-        };
-        self.stage = Stage::Done(status);
         Ok(status)
     }
 }

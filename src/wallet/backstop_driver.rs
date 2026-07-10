@@ -133,17 +133,11 @@ impl BackstopDriver {
     ) -> Result<BackstopTick> {
         // 1) REFUND side (dead-device, primary-independent). The tower owns
         //    E_ours entirely — the fire, and the refund's relay-floor congestion.
-        match self.tower.tick(chain)? {
-            WatchtowerTick::FiredRefund => return Ok(BackstopTick::FiredRefund),
-            WatchtowerTick::RefundStalledBelowFeeFloor => {
-                let action =
-                    backstop_decision(StalledTx::Refund, true, reserve_available, None);
-                return Ok(resolve(action, BumpTarget::Refund));
-            }
-            // Idle / StandDown: the refund needs nothing this tick. Fall through
-            // to the COMPLETION side — a DIFFERENT escrow (E_theirs) whose
-            // stalled sweep can outlive the refund escrow standing down.
-            WatchtowerTick::Idle | WatchtowerTick::StandDown => {}
+        //    `Some` = the refund side handled this tick; `None` (Idle/StandDown) =
+        //    fall through to the COMPLETION side, a DIFFERENT escrow (E_theirs)
+        //    whose stalled sweep can outlive the refund escrow standing down.
+        if let Some(tick) = self.refund_side(chain, reserve_available)? {
+            return Ok(tick);
         }
 
         // 2) COMPLETION / SETUP side. Classify from the persisted record + a live
@@ -163,6 +157,41 @@ impl BackstopDriver {
             }
             None => Ok(BackstopTick::Idle),
         }
+    }
+
+    /// Poll ONLY the refund / dead-device tower side — for a swap whose durable
+    /// [`SwapRecord`] does not exist yet (a pre-`Proceed` funded abort: our Setup
+    /// went on the wire, so E_ours is funded, but `record_funding` — reached only
+    /// at the `Proceed` handoff — never ran, so the completion-side classifier has
+    /// nothing to read). The tower needs only the escrow + chain, never a record,
+    /// so the dead-device refund still fires at CSV maturity and the refund's own
+    /// relay-floor congestion is still surfaced. The completion side is skipped
+    /// (there is no record to classify). Falls to [`BackstopTick::Idle`] when the
+    /// refund needs nothing this tick.
+    pub fn tick_refund_only(
+        &self,
+        chain: &impl ChainView,
+        reserve_available: bool,
+    ) -> Result<BackstopTick> {
+        Ok(self.refund_side(chain, reserve_available)?.unwrap_or(BackstopTick::Idle))
+    }
+
+    /// The REFUND-side decision, shared by [`tick`](Self::tick) and
+    /// [`tick_refund_only`](Self::tick_refund_only): `Some` when the tower fired
+    /// or the refund is congested, `None` (Idle/StandDown) when it needs nothing.
+    fn refund_side(
+        &self,
+        chain: &impl ChainView,
+        reserve_available: bool,
+    ) -> Result<Option<BackstopTick>> {
+        Ok(match self.tower.tick(chain)? {
+            WatchtowerTick::FiredRefund => Some(BackstopTick::FiredRefund),
+            WatchtowerTick::RefundStalledBelowFeeFloor => {
+                let action = backstop_decision(StalledTx::Refund, true, reserve_available, None);
+                Some(resolve(action, BumpTarget::Refund))
+            }
+            WatchtowerTick::Idle | WatchtowerTick::StandDown => None,
+        })
     }
 }
 

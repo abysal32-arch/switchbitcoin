@@ -61,6 +61,7 @@
 //!     phase and reconciling the ledger. The integration layer over the parts.
 
 pub mod abort_hygiene;
+pub mod app;
 pub mod backstop_driver;
 pub mod claim_scheduler;
 pub mod driver;
@@ -74,6 +75,7 @@ pub mod orchestrator;
 pub mod recovery_driver;
 pub mod store;
 
+pub use app::{AppTick, SwapApp};
 pub use backstop_driver::{
     run_cpfp_bump, BackstopDriver, BackstopTick, BumpOutcome, CpfpBumpRequest,
 };
