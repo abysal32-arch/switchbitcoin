@@ -356,12 +356,16 @@ impl SwapEngine {
                 // Discriminate a genuine terminal refund (SH broadcast-gate-closed
                 // persists AbortRefund) from a benign re-drive by re-reading the
                 // PERSISTED phase — never the overloaded reason string. A
-                // non-AbortRefund phase is re-drivable: our SL reveal peek and
-                // `settle`'s own re-observe are two independent, non-atomic
-                // ChainView reads, so a reveal seen by the peek can be evicted /
-                // reorged before `settle` re-reads (→ "no reveal observed yet");
-                // the `Possessing` is retained, so the next step simply tries
-                // again. `AbortRefund` is the only terminal exit here.
+                // non-AbortRefund phase is re-drivable, covering TWO benign SL
+                // cases: (1) our reveal peek and `settle`'s own re-observe are
+                // two independent, non-atomic ChainView reads, so a reveal seen
+                // by the peek can be evicted / reorged before `settle` re-reads
+                // (→ "no reveal observed yet"); (2) a degraded/lying single
+                // source surfaced a witness that fails extraction (→ "reveal
+                // failed extraction"), where the real reveal may still appear or
+                // a second source may agree. Both retain the `Possessing`, so the
+                // next step simply tries again. `AbortRefund` is the only
+                // terminal exit here.
                 let sid = Self::swap_session_id(ctx)?;
                 match self.store.get(&sid)?.map(|r| r.phase) {
                     Some(SwapPhase::AbortRefund) => Ok(DriveStatus::Refunding(reason)),
@@ -571,7 +575,23 @@ impl SwapEngine {
                 };
                 let scheduler = ClaimScheduler::from_manifest(self.manifest.current());
                 let schedule: ScheduledClaim =
-                    scheduler.schedule_claim(possessing, &reveal, chain.tip_height())?;
+                    match scheduler.schedule_claim(possessing, &reveal, chain.tip_height()) {
+                        Ok(s) => s,
+                        // A degraded/lying single source surfaced a witness that
+                        // fails extraction (malformed BIP340 sig, or a valid sig
+                        // whose extracted t does not open T). This is NOT a
+                        // terminal: the REAL reveal may still appear, or a second
+                        // source may agree. Re-drive as `AwaitingReveal` (the
+                        // Possessing is retained, so the next step retries),
+                        // exactly like an evicted reveal — never a hard poll
+                        // error the caller must special-case, and never a false
+                        // refund (only a persisted AbortRefund is Refunding).
+                        Err(_) => {
+                            return Ok(SwapOutcome::Aborted(
+                                "observed reveal failed extraction; awaiting a valid reveal",
+                            ));
+                        }
+                    };
                 let mut rec = self.store.get(&sid)?.ok_or(Error::Abort("record vanished"))?;
                 rec.phase = SwapPhase::Completing;
                 rec.completion_tx = Some(schedule.comp_sl_final.0.to_vec());

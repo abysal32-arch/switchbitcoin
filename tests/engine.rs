@@ -16,7 +16,7 @@ use swapkey::settlement::state_machine::{
     swap_session_id, ExchangeInputs, Funding, PeerSession, Role, Transport,
 };
 use swapkey::tx::escrow::Escrow;
-use swapkey::tx::txbuild::{build_completion, finalize_key_spend};
+use swapkey::tx::txbuild::{build_completion, finalize_key_spend, sign_schnorr_single};
 use swapkey::wallet::driver::{DriveStatus, SwapDriver};
 use swapkey::wallet::engine::{SwapContext, SwapEngine, SwapOutcome};
 use swapkey::wallet::keys::ModeledKeySource;
@@ -511,6 +511,171 @@ fn full_swap_driven_through_the_swap_driver() {
         swapkey::wallet::ledger::CoinState::Spent,
         "the driver's run_exchange marked the funding coin spent"
     );
+}
+
+/// Task 2 (mangled-reveal Err routing): on the SL settle path, a degraded/lying
+/// single source can surface a witness that FAILS extraction (here a valid
+/// BIP340 signature unrelated to the adaptor). `schedule_claim`'s extraction Err
+/// must NOT propagate out of `settle` as a hard poll error the caller has to
+/// special-case, and must NOT be a refund — it re-drives as `AwaitingReveal`
+/// (the `Possessing` is retained), exactly like an evicted reveal. When a VALID
+/// reveal then appears, the SAME retained driver completes the swap.
+#[test]
+fn sl_settle_reroutes_a_mangled_reveal_to_awaiting_reveal() {
+    let params = Params::testnet_provisional();
+    let unit = params.escrow_amount_sats();
+    let d = params.tier_d_sats;
+    let s_height = 700_000u32;
+    let delta_late = u32::try_from(params.delta_late()).unwrap();
+
+    let sh = keypair();
+    let sl = keypair();
+    let internal =
+        swapkey::settlement::state_machine::canonical_internal_key(sh.pk, sl.pk).unwrap();
+    let escrow_comp_sh = Escrow::new(&internal, &sl.pk, params.delta_early).unwrap(); // E_sl
+    let escrow_comp_sl = Escrow::new(&internal, &sh.pk, delta_late).unwrap(); // E_sh
+    let op_comp_sh = OutPoint::new(txid_from(2), 0); // E_sl — SL funded, SH sweeps
+    let op_comp_sl = OutPoint::new(txid_from(1), 0); // E_sh — SH funded, SL sweeps
+
+    let chain = SimChain::new(s_height);
+    chain.fund(op_comp_sh, s_height);
+    chain.fund_with_spk(
+        op_comp_sl,
+        s_height,
+        unit,
+        escrow_comp_sl.funding_script_pubkey().clone(),
+    );
+
+    let dest = escrow_comp_sh.funding_script_pubkey().clone();
+    let comp_sh_spend =
+        build_completion(&escrow_comp_sh, op_comp_sh, unit, dest.clone(), d, params.anchor_sats).unwrap();
+    let comp_sl_spend =
+        build_completion(&escrow_comp_sl, op_comp_sl, unit, dest, d, params.anchor_sats).unwrap();
+    let msg_sh = comp_sh_spend.sighash;
+    let msg_sl = comp_sl_spend.sighash;
+    let root_sh = escrow_comp_sh.merkle_root();
+    let root_sl = escrow_comp_sl.merkle_root();
+    let ok_sh = escrow_comp_sh.output_key_xonly();
+    let ok_sl = escrow_comp_sl.output_key_xonly();
+
+    let swap_id = [0xEBu8; 32];
+    let sid = swap_session_id(sl.pk, sh.pk).unwrap();
+    let lease_sh = tempfile::tempdir().unwrap();
+    let lease_sl = tempfile::tempdir().unwrap();
+    let possession_store = tempfile::tempdir().unwrap();
+    let wallet_dir = tempfile::tempdir().unwrap();
+    let (io_sh, io_sl) = duplex();
+
+    let funding_coin = onboard_one_coin(wallet_dir.path(), params.pre_encumbrance_sats(), sid);
+    let (mut engine, actions) = SwapEngine::open(
+        wallet_dir.path(),
+        &ModeledEnclave,
+        Box::new(ModeledKeySource::new(&ModeledEnclave)),
+        &ModeledTrustRoot,
+    )
+    .unwrap();
+    assert!(actions.is_empty(), "fresh wallet has no recovery actions");
+
+    let dest2 = escrow_comp_sh.funding_script_pubkey().clone();
+    let sl_refund =
+        PreArmedRefund::arm(&escrow_comp_sh, op_comp_sh, unit, &sl.sk, dest2, d, params.anchor_sats, s_height).unwrap();
+    let sl_receipt = confirm_watchtower_handoff(&sl_refund, sl_refund.fingerprint()).unwrap();
+
+    // SH counterparty thread: completes and broadcasts the REAL Comp->SH reveal.
+    let sh_params = params.clone();
+    let sh_chain = chain.clone();
+    let comp_sh_for_sh = comp_sh_spend.clone();
+    let sh_handle = std::thread::spawn(move || -> Result<[u8; 64]> {
+        let refund = PreArmedRefund::from_signed_tx(vec![0xaa; 64], s_height + delta_late)?;
+        let receipt = confirm_watchtower_handoff(&refund, refund.fingerprint())?;
+        let (t, _) = AdaptorSecret::generate()?;
+        let peer = PeerSession::new(swap_id, Box::new(io_sh));
+        let funded = Funding::new(sh_params, peer).funded_manual(Role::SecretHolder, s_height)?;
+        let possessing = funded.run_adaptor_exchange(ExchangeInputs {
+            our_seckey: sh.sk,
+            their_pubkey: ValidatedPoint::from_bytes(&sl.pk.serialize())?,
+            msg_comp_sh: msg_sh,
+            msg_comp_sl: msg_sl,
+            pre_armed_refund: refund,
+            adaptor_secret: Some(t),
+            lease_dir: Some(lease_sh.path().to_path_buf()),
+            possession_store: None,
+            taproot_root_comp_sh: Some(root_sh),
+            taproot_root_comp_sl: Some(root_sl),
+            taproot_output_comp_sh: Some(ok_sh),
+            taproot_output_comp_sl: Some(ok_sl),
+        })?;
+        let sig = possessing.broadcast_completion(s_height + 10, &receipt)?;
+        sh_chain
+            .broadcast(&finalize_key_spend(comp_sh_for_sh, sig.0))
+            .expect("Comp->SH to mempool");
+        Ok(sig.0)
+    });
+
+    let peer = PeerSession::new(swap_id, Box::new(io_sl));
+    let funded = Funding::new(params.clone(), peer)
+        .funded_manual(Role::SecretLearner, s_height)
+        .unwrap();
+    let ctx = make_ctx(
+        sl.sk, sh.pk, op_comp_sh, op_comp_sl, unit, msg_sh, msg_sl, sl_refund, None,
+        root_sh, root_sl, ok_sh, ok_sl, lease_sl.path().to_path_buf(),
+        possession_store.path().to_path_buf(), sl_receipt, funding_coin,
+    );
+
+    let our_final_sig = {
+        let mut driver =
+            SwapDriver::start(&mut engine, Role::SecretLearner, funded, ctx, &chain).unwrap();
+
+        let sh_sig = sh_handle.join().unwrap().expect("SH side");
+        assert!(matches!(chain.spend_status(op_comp_sh), SpendStatus::InMempool));
+
+        // EVICT the honest reveal and replace it with a BAD-witness spend of the
+        // same escrow: a valid BIP340 signature (over an unrelated message) that
+        // observe_reveal happily surfaces but extract_and_complete_claim rejects
+        // (t*G != T). This models a degraded/lying single source.
+        chain.evict(op_comp_sh);
+        let bad_sig = sign_schnorr_single(sl.sk.serialize(), msg_sl).unwrap();
+        chain
+            .broadcast(&finalize_key_spend(comp_sh_spend.clone(), bad_sig))
+            .expect("bad reveal to mempool");
+        assert!(matches!(chain.spend_status(op_comp_sh), SpendStatus::InMempool));
+
+        // The mangled reveal must re-drive, NOT hard-error and NOT refund.
+        assert_eq!(
+            driver.poll(&chain).unwrap(),
+            DriveStatus::AwaitingReveal,
+            "a witness that fails extraction must re-drive as AwaitingReveal"
+        );
+        // Still re-drivable on a repeat poll (the bad witness persists) — never
+        // a poison / terminal.
+        assert_eq!(driver.poll(&chain).unwrap(), DriveStatus::AwaitingReveal);
+
+        // The VALID reveal reappears (SH re-broadcast / a second source agrees):
+        // the SAME retained driver drives to Completed.
+        chain.evict(op_comp_sh);
+        chain
+            .broadcast(&finalize_key_spend(comp_sh_spend, sh_sig))
+            .expect("re-broadcast the valid Comp->SH");
+        let mut sig = None;
+        for _ in 0..4 {
+            match driver.poll(&chain).unwrap() {
+                DriveStatus::Completed { our_final_sig } => {
+                    sig = Some(our_final_sig);
+                    break;
+                }
+                DriveStatus::AwaitingReveal => continue,
+                DriveStatus::Refunding(r) => panic!("unexpected refund: {r}"),
+            }
+        }
+        sig.expect("driver settled SL's leg to Completed after a valid reveal")
+    };
+
+    // The swap completed through the driver despite the intervening bad reveal.
+    let comp_sl_final = finalize_key_spend(comp_sl_spend, our_final_sig);
+    chain.broadcast(&comp_sl_final).expect("Comp->SL accepted");
+    chain.mine();
+    assert!(matches!(chain.spend_status(op_comp_sl), SpendStatus::Confirmed(_)));
+    assert_eq!(engine.store().get(&sid).unwrap().unwrap().phase, SwapPhase::Completed);
 }
 
 /// Regression (review Bug B): a Phase-A exchange failure must surface as
