@@ -376,7 +376,7 @@ impl SwapEngine {
         &mut self,
         funded: Funded,
         ctx: &mut SwapContext,
-        _chain: &impl AuthoritativeChainView,
+        chain: &impl AuthoritativeChainView,
     ) -> Result<Possessing> {
         let role = funded.role();
         let sid = Self::swap_session_id(ctx)?;
@@ -392,6 +392,17 @@ impl SwapEngine {
             .get(&sid)?
             .ok_or(Error::Ordering("run_exchange before record_funding"))?;
         let params = funding_rec.params.clone();
+
+        // CSV-BINDING GUARD — BEFORE any ledger/store mutation or partial
+        // release. Refuse (and refund) a swept escrow whose refund leaf carries
+        // the wrong CSV: the extract-and-race theft the deep audit found
+        // UNBLOCKED. A mismatch aborts to the pre-armed refund exactly like an
+        // adaptor-exchange failure (Funding → AbortRefund), so nothing is
+        // released and the caller re-reads the phase as `Refunding`.
+        if let Err(e) = self.verify_swept_escrow_csv(role, ctx, &params, chain) {
+            self.abort(ctx);
+            return Err(e);
+        }
 
         // Funding is confirmed (this is `Funded`), so the pre-encumbrance coin
         // has been spent whole into our escrow on-chain. Mark it spent NOW so
@@ -452,6 +463,59 @@ impl SwapEngine {
             self.store.put(&rec)?;
         }
         Ok(possessing)
+    }
+
+    /// The CSV-binding guard (closes the deep audit's one UNBLOCKED theft path).
+    ///
+    /// The escrow WE SWEEP is the counterparty-funded `ctx.their_escrow_op`. Its
+    /// refund leaf must carry the ROLE-CORRECT CSV: as SL we sweep the SH-funded
+    /// escrow and it MUST be `delta_late` — the exact runway
+    /// [`max_claim_delay`](crate::settlement::params::Params::max_claim_delay)
+    /// budgets our post-reveal claim against; as SH we sweep the SL-funded
+    /// escrow and it must be `delta_early`. A malicious counterparty that funded
+    /// the swept escrow with the WRONG (shorter) CSV would let it refund that
+    /// escrow out from under our claim while also taking our escrow — BOTH sides
+    /// (the audit's `SH-takes-both` path: the funding gate
+    /// `verify_their_escrow_spk` admits BOTH candidate CSVs because roles are
+    /// unknown at funding time, and `max_claim_delay` hard-codes `delta_late`).
+    ///
+    /// The P2TR output key cryptographically commits to the single refund leaf,
+    /// so a reconstruction under the role-correct CSV that EQUALS the on-chain
+    /// spk PROVES the leaf; any other spk is a hostile escrow → refuse + refund.
+    ///
+    /// Enforceable only when the chain reports the swept escrow's spk. In
+    /// production the funding gate already required a reported, MATCHING spk
+    /// before the `into_funded` handoff, so a real swap always reaches here with
+    /// `Some`; a raw settlement caller over a view that does not retain the spk
+    /// (a synthetic test fixture) opts out and owns escrow identity itself.
+    fn verify_swept_escrow_csv(
+        &self,
+        role: Role,
+        ctx: &SwapContext,
+        params: &crate::settlement::params::Params,
+        chain: &impl AuthoritativeChainView,
+    ) -> Result<()> {
+        let expected_csv = match role {
+            Role::SecretLearner => u32::try_from(params.delta_late())
+                .map_err(|_| Error::Deadline("delta_late exceeds the CSV height field"))?,
+            Role::SecretHolder => params.delta_early,
+        };
+        let our_point = ctx.our_seckey * secp::G;
+        let their_point = secp::Point::from_slice(&ctx.their_pubkey.to_bytes())
+            .map_err(|_| Error::Validation("csv-binding: invalid counterparty pubkey"))?;
+        let internal =
+            crate::settlement::state_machine::canonical_internal_key(our_point, their_point)?;
+        let expected_spk = crate::tx::escrow::Escrow::new(&internal, &their_point, expected_csv)?
+            .funding_script_pubkey()
+            .clone();
+        match chain.funding_spk(ctx.their_escrow_op) {
+            Some(spk) if spk == expected_spk => Ok(()),
+            Some(_) => Err(Error::Abort(
+                "swept escrow carries the wrong refund CSV (extract-and-race guard); refund",
+            )),
+            // Unreported: the funding gate is the authority (see the method docs).
+            None => Ok(()),
+        }
     }
 
     /// PHASE B — settle. Dispatches on the derived role: SL observes SH's

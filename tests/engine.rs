@@ -368,7 +368,15 @@ fn full_swap_driven_through_the_swap_driver() {
 
     let chain = SimChain::new(s_height);
     chain.fund(op_comp_sh, s_height);
-    chain.fund(op_comp_sl, s_height);
+    // Fund the SWEPT escrow (E_sh) WITH its real spk so the engine's CSV-binding
+    // guard can read it — and confirm the guard PASSES an honest delta_late
+    // escrow (no false abort; the swap still completes below).
+    chain.fund_with_spk(
+        op_comp_sl,
+        s_height,
+        unit,
+        escrow_comp_sl.funding_script_pubkey().clone(),
+    );
 
     let dest = escrow_comp_sh.funding_script_pubkey().clone();
     let comp_sh_spend =
@@ -706,4 +714,89 @@ fn hex(id: &[u8; 32]) -> String {
         let _ = write!(s, "{b:02x}");
     }
     s
+}
+
+/// THEFT-PREVENTION regression (deep-audit UNBLOCKED path — role<->CSV binding):
+/// a malicious counterparty funds the escrow SL sweeps (E_sh) with the WRONG,
+/// SHORTER refund CSV (delta_early instead of delta_late), which — absent this
+/// guard — would let it refund E_sh out from under SL's miscalibrated claim
+/// window while also taking E_sl (both sides). The engine's CSV-binding guard
+/// reconstructs the role-correct escrow spk (delta_late for SL), sees the
+/// on-chain spk does NOT match, and REFUSES to release — aborting to the
+/// pre-armed refund (Funding -> AbortRefund) before any partial is exchanged.
+#[test]
+fn wrong_csv_swept_escrow_refuses_to_release_and_refunds() {
+    let params = Params::testnet_provisional();
+    let unit = params.escrow_amount_sats();
+    let s_height = 700_000u32;
+    let delta_early = params.delta_early;
+
+    let sh = keypair();
+    let sl = keypair();
+    let sid = swap_session_id(sl.pk, sh.pk).unwrap();
+    let internal =
+        swapkey::settlement::state_machine::canonical_internal_key(sh.pk, sl.pk).unwrap();
+
+    // E_sl (SL funds, SH sweeps) — honest early leaf; its spk is irrelevant to
+    // the SL-side guard (SH sweeps it), so a bare fund is fine.
+    let op_comp_sh = OutPoint::new(txid_from(2), 0); // E_sl (our escrow)
+    // E_sh (SH funds, SL sweeps) — MALICIOUS: built with delta_early, not
+    // delta_late, and funded WITH that wrong-CSV spk so the guard can read it.
+    let escrow_evil = Escrow::new(&internal, &sh.pk, delta_early).unwrap();
+    let op_comp_sl = OutPoint::new(txid_from(1), 0); // E_sh (swept escrow)
+
+    let chain = SimChain::new(s_height);
+    chain.fund(op_comp_sh, s_height);
+    chain.fund_with_spk(
+        op_comp_sl,
+        s_height,
+        unit,
+        escrow_evil.funding_script_pubkey().clone(),
+    );
+
+    let wallet_dir = tempfile::tempdir().unwrap();
+    let lease = tempfile::tempdir().unwrap();
+    let possession = tempfile::tempdir().unwrap();
+    let funding_coin = onboard_one_coin(wallet_dir.path(), params.pre_encumbrance_sats(), sid);
+    let (mut engine, _) = SwapEngine::open(
+        wallet_dir.path(),
+        &ModeledEnclave,
+        Box::new(ModeledKeySource::new(&ModeledEnclave)),
+        &ModeledTrustRoot,
+    )
+    .unwrap();
+
+    // A lightweight but well-typed ctx: the guard reads our_seckey, their_pubkey
+    // and their_escrow_op only, and fires before the exchange touches the rest.
+    let refund = PreArmedRefund::from_signed_tx(vec![0xaa; 64], s_height + delta_early).unwrap();
+    let receipt = confirm_watchtower_handoff(&refund, refund.fingerprint()).unwrap();
+    let mut ctx = make_ctx(
+        sl.sk, sh.pk, op_comp_sh, op_comp_sl, unit, [0u8; 32], [0u8; 32], refund, None,
+        [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], lease.path().to_path_buf(),
+        possession.path().to_path_buf(), receipt, funding_coin,
+    );
+
+    engine
+        .record_funding(&ctx, Role::SecretLearner, params.clone())
+        .unwrap();
+
+    let (io_sl, _io_sh) = duplex();
+    let peer = PeerSession::new([0xE9u8; 32], Box::new(io_sl));
+    let funded = Funding::new(params, peer)
+        .funded_manual(Role::SecretLearner, s_height)
+        .unwrap();
+
+    // The guard fires: run_exchange refuses and routes to the refund.
+    match engine.run_exchange(funded, &mut ctx, &chain) {
+        Err(swapkey::Error::Abort(reason)) => {
+            assert!(reason.contains("wrong refund CSV"), "got {reason:?}")
+        }
+        Err(other) => panic!("expected the CSV-mismatch Abort, got {other:?}"),
+        Ok(_) => panic!("a wrong-CSV swept escrow must abort before release, got Ok(Possessing)"),
+    }
+    // The refund exit is armed; nothing was released.
+    assert_eq!(
+        engine.store().get(&sid).unwrap().unwrap().phase,
+        SwapPhase::AbortRefund
+    );
 }

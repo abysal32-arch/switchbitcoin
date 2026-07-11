@@ -406,6 +406,30 @@ impl SimChain {
         self.0.lock().unwrap().funded.insert(outpoint, (height, amount_sats));
     }
 
+    /// Record a confirmed funding output WITH its scriptPubKey, by synthesizing
+    /// a creating tx so [`funding_spk`](ChainView::funding_spk) reports `spk`
+    /// (a bare `fund`/`fund_with_amount` has no tx, so its spk reads `None`).
+    /// For escrow-identity / CSV-binding tests that need a reportable spk without
+    /// a full Setup broadcast.
+    pub fn fund_with_spk(&self, outpoint: OutPoint, height: u32, amount_sats: u64, spk: ScriptBuf) {
+        use bitcoin::{absolute, transaction::Version, Amount, TxOut};
+        let mut g = self.0.lock().unwrap();
+        g.funded.insert(outpoint, (height, amount_sats));
+        let mut output: Vec<TxOut> = (0..outpoint.vout)
+            .map(|_| TxOut { value: Amount::from_sat(0), script_pubkey: ScriptBuf::new() })
+            .collect();
+        output.push(TxOut { value: Amount::from_sat(amount_sats), script_pubkey: spk });
+        let tx = Transaction {
+            version: Version(3),
+            lock_time: absolute::LockTime::ZERO,
+            input: Vec::new(),
+            output,
+        };
+        // Keyed by the outpoint's txid (funding_spk looks up outpoint.txid), so
+        // the synthesized tx's own computed txid is irrelevant to the lookup.
+        g.txs.insert(outpoint.txid, tx);
+    }
+
     /// Set the minimum relay fee (congestion level). A tx paying less will not
     /// be accepted until it is fee-bumped or the congestion clears.
     pub fn set_congestion(&self, min_fee_sats: u64) {
