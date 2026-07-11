@@ -152,15 +152,11 @@ impl SwapEngine {
 
         // Reconcile leases against the swaps that are still live: any coin
         // leased to a swap that no longer exists (crashed before its
-        // SwapRecord was written) is released back to unspent.
-        let live: Vec<[u8; 32]> = store
-            .list()?
-            .0
-            .iter()
-            .filter(|r| !matches!(r.phase, SwapPhase::Completed | SwapPhase::Refunded))
-            .map(|r| r.swap_session_id)
-            .collect();
-        ledger.reconcile_leases(&live)?;
+        // SwapRecord was written) is released back to unspent. This pass is
+        // chain-BLIND (open takes no chain); the chain-aware phantom heal is the
+        // post-open `reconcile_leases_with_chain` below (a Leased coin a terminal
+        // swap already spent on chain must become Spent, not re-exposed Unspent).
+        ledger.reconcile_leases(&live_lessees(&store)?)?;
 
         Ok((SwapEngine { store, ledger, manifest, keys }, actions))
     }
@@ -202,6 +198,26 @@ impl SwapEngine {
         chain: &dyn crate::chain::AuthoritativeChainView,
     ) -> Result<Vec<OutPoint>> {
         self.ledger.sweep_spent_reserves(chain)
+    }
+
+    /// Chain-aware LEASE reconciliation — run at startup (after `open`) with the
+    /// authoritative chain, the lease analogue of [`reconcile_reserves`](Self::reconcile_reserves).
+    /// `open`'s lease reconcile is chain-BLIND, so a `Leased` coin a terminal
+    /// swap already spent on chain (e.g. a pre-funding abort whose Setup confirmed
+    /// but whose `run_exchange` mark-spent never ran) is released back to
+    /// `Unspent` when the swap reaches a terminal — a phantom pre-encumbrance
+    /// coin a later swap would re-select and `submit_package` would reject
+    /// forever. This consults
+    /// [`Ledger::reconcile_leases_with_chain`](crate::wallet::ledger::Ledger::reconcile_leases_with_chain)
+    /// to mark any `Leased`-or-`Unspent` coin the chain confirms spent as `Spent`
+    /// (never re-leasable) and release remaining orphaned leases — closing the
+    /// terminal-Refunded lease-release residual and the increment-2a phantom.
+    pub fn reconcile_leases_with_chain(
+        &mut self,
+        chain: &dyn crate::chain::AuthoritativeChainView,
+    ) -> Result<crate::wallet::ledger::LeaseReconcile> {
+        let live = live_lessees(&self.store)?;
+        self.ledger.reconcile_leases_with_chain(&live, chain)
     }
 
     /// Execute a decided CPFP bump against this wallet's ledger + enclave seam
@@ -690,4 +706,17 @@ fn hex32(id: &[u8; 32]) -> String {
         let _ = write!(s, "{b:02x}");
     }
     s
+}
+
+/// The set of swap_session_ids of every NON-terminal record — the lessees whose
+/// leases are still legitimately held. Shared by `open`'s chain-blind reconcile
+/// and the post-open chain-aware `reconcile_leases_with_chain`.
+fn live_lessees(store: &SwapStore) -> Result<Vec<[u8; 32]>> {
+    Ok(store
+        .list()?
+        .0
+        .iter()
+        .filter(|r| !matches!(r.phase, SwapPhase::Completed | SwapPhase::Refunded))
+        .map(|r| r.swap_session_id)
+        .collect())
 }

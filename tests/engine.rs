@@ -830,6 +830,85 @@ fn record_funding_rejects_params_off_manifest() {
     );
 }
 
+/// A minimal v3 spend of `outpoint` to a standard P2TR, so a funding coin's
+/// outpoint can be marked confirmed-spent on the sim.
+fn spend_std(outpoint: OutPoint, out: u64) -> Vec<u8> {
+    use bitcoin::{
+        absolute, transaction::Version, Amount, ScriptBuf, Sequence, Transaction, TxIn, TxOut,
+        Witness,
+    };
+    let mut spk = vec![0x51u8, 0x20];
+    spk.extend_from_slice(&[0x77u8; 32]);
+    let tx = Transaction {
+        version: Version(3),
+        lock_time: absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: outpoint,
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut { value: Amount::from_sat(out), script_pubkey: ScriptBuf::from_bytes(spk) }],
+    };
+    bitcoin::consensus::encode::serialize(&tx)
+}
+
+/// Task 3 end-to-end: the funding-coin phantom, healed through the engine. A
+/// pre-encumbrance coin leased to a swap whose Setup CONFIRMED on chain (the coin
+/// is spent into its escrow) but which then aborted pre-funding leaves the coin
+/// `Leased`; `open`'s chain-BLIND reconcile releases the orphan lease back to
+/// `Unspent` — a phantom, because the coin is genuinely spent. The post-open
+/// `engine.reconcile_leases_with_chain` marks it `Spent`, so it is never
+/// re-selected for a lease and rejected at submit forever.
+#[test]
+fn engine_reconcile_leases_with_chain_heals_a_funding_coin_phantom() {
+    use swapkey::wallet::ledger::CoinState;
+    let params = Params::testnet_provisional();
+    let base = 500_000u32;
+    let wallet_dir = tempfile::tempdir().unwrap();
+    let sid = [0x7Au8; 32];
+    let funding_coin = onboard_one_coin(wallet_dir.path(), params.pre_encumbrance_sats(), sid);
+
+    // The Setup confirmed on chain: the funding coin is spent into its escrow.
+    let chain = SimChain::new(base);
+    chain.fund_with_amount(funding_coin, base, params.pre_encumbrance_sats());
+    chain
+        .broadcast(&spend_std(funding_coin, params.pre_encumbrance_sats() - 500))
+        .unwrap();
+    chain.mine();
+    assert!(matches!(chain.spend_status(funding_coin), SpendStatus::Confirmed(_)));
+
+    // open's chain-blind reconcile releases the orphan lease (no record for sid)
+    // back to Unspent — the phantom (the coin is actually spent on chain).
+    let (mut engine, _) = SwapEngine::open(
+        wallet_dir.path(),
+        &ModeledEnclave,
+        Box::new(ModeledKeySource::new(&ModeledEnclave)),
+        &ModeledTrustRoot,
+    )
+    .unwrap();
+    assert_eq!(
+        engine.ledger().find(&funding_coin).unwrap().state,
+        CoinState::Unspent,
+        "the chain-blind reconcile re-exposes the spent coin as a phantom"
+    );
+
+    // The chain-aware reconcile heals it to Spent.
+    let out = engine.reconcile_leases_with_chain(&chain).unwrap();
+    assert_eq!(out.swept, vec![funding_coin], "the phantom is swept");
+    assert_eq!(engine.ledger().find(&funding_coin).unwrap().state, CoinState::Spent);
+
+    // Never re-selected for a lease again (the pool is not silently poisoned).
+    assert!(
+        engine
+            .ledger_mut()
+            .lease_pre_encumbrance(params.pre_encumbrance_sats(), &FixedClock(u64::MAX), u32::MAX, sid)
+            .unwrap()
+            .is_none(),
+        "a swept phantom must never be leasable again"
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn make_ctx(
     our_seckey: Scalar,

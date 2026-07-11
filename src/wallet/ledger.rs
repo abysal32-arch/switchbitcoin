@@ -298,6 +298,18 @@ pub struct SplitPlan {
     pub delay_secs: Vec<u64>,
 }
 
+/// The outcome of a chain-aware lease reconciliation
+/// ([`Ledger::reconcile_leases_with_chain`]): the outpoints marked `Spent`
+/// because the chain confirms them gone (the phantom heal), and the orphaned
+/// leases released back to `Unspent`.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct LeaseReconcile {
+    /// Leased-or-unspent coins the chain confirms spent → now `Spent`.
+    pub swept: Vec<OutPoint>,
+    /// Still-leased coins whose lessee is not in the live set → now `Unspent`.
+    pub released: Vec<OutPoint>,
+}
+
 /// Sealed, fail-closed, single-instance wallet coin ledger.
 pub struct Ledger {
     path: PathBuf,
@@ -1012,6 +1024,71 @@ impl Ledger {
         })
     }
 
+    /// Chain-aware lease reconciliation (the LEASE analogue of
+    /// [`sweep_spent_reserves`](Self::sweep_spent_reserves)): run at startup,
+    /// after `open`, with the authoritative chain. Two effects in one persist:
+    ///
+    ///   1. SWEEP — any coin the ledger still counts spendable (`Leased` OR
+    ///      `Unspent`) whose outpoint is CONFIRMED spent on chain is marked
+    ///      `Spent` (never re-leasable), REGARDLESS of lease liveness. This is
+    ///      the phantom a terminal swap's funding coin becomes: a pre-funding
+    ///      abort spent the pre-encumbrance coin into its escrow on chain, but
+    ///      `run_exchange` (which marks the funding coin `Spent`) never ran, so
+    ///      the coin stayed `Leased`; when the swap reaches a terminal, `open`'s
+    ///      chain-BLIND [`reconcile_leases`](Self::reconcile_leases) releases the
+    ///      lease back to `Unspent` — a phantom that a later `lease_*` would
+    ///      re-select and `submit_package` would reject forever. Considering both
+    ///      `Leased` and `Unspent` catches the coin whether or not `open` already
+    ///      released it, so running this post-open is idempotent and complete.
+    ///
+    ///   2. RELEASE — any coin STILL `Leased` whose lessee is not in the live set
+    ///      is released to `Unspent`, exactly as [`reconcile_leases`] does (the
+    ///      orphaned-lease crash between lease and swap-record creation).
+    ///
+    /// Only CONFIRMED spends are swept — an `InMempool` spend may be our own
+    /// still-confirming legitimate Setup/bump. (A reorg that reverts a swept
+    /// spend leaves the coin `Spent` until a rescan re-derives it — the same
+    /// bounded, non-fund-loss caveat [`sweep_spent_reserves`] carries.)
+    ///
+    /// The sweep is SCOPED to the LEASABLE classes (`PreEncumbrance`, `Reserve`)
+    /// — the only coins a lease can strand as a phantom. It deliberately does NOT
+    /// touch `Deposit`/`OnboardingChange`/`SwapDestination`, whose spent-ness is
+    /// owned by their own lifecycles (the deposit→split state machine, a normal
+    /// send), so this reconcile can never race those. Returns swept + released.
+    pub fn reconcile_leases_with_chain(
+        &mut self,
+        live_lessees: &[[u8; 32]],
+        chain: &dyn crate::chain::AuthoritativeChainView,
+    ) -> Result<LeaseReconcile> {
+        self.transact(|l| {
+            let mut out = LeaseReconcile::default();
+            for c in &mut l.coins {
+                let leasable = matches!(c.class, CoinClass::PreEncumbrance | CoinClass::Reserve);
+                let confirmed_spent = leasable
+                    && matches!(c.state, CoinState::Leased | CoinState::Unspent)
+                    && matches!(
+                        chain.spend_status(c.outpoint),
+                        crate::chain::SpendStatus::Confirmed(_)
+                    );
+                if confirmed_spent {
+                    c.state = CoinState::Spent;
+                    c.lessee = None;
+                    out.swept.push(c.outpoint);
+                    continue;
+                }
+                if c.state == CoinState::Leased {
+                    let live = c.lessee.map(|who| live_lessees.contains(&who)).unwrap_or(false);
+                    if !live {
+                        c.state = CoinState::Unspent;
+                        c.lessee = None;
+                        out.released.push(c.outpoint);
+                    }
+                }
+            }
+            Ok(out)
+        })
+    }
+
     /// A leased coin's swap/backstop was aborted before it was spent.
     pub fn release_lease(&mut self, outpoint: OutPoint) -> Result<()> {
         self.transact(|l| {
@@ -1689,6 +1766,101 @@ mod tests {
         assert_eq!(released, vec![c2.outpoint], "only the orphan released");
         assert_eq!(ledger.find(&c1.outpoint).unwrap().state, CoinState::Leased);
         assert_eq!(ledger.find(&c2.outpoint).unwrap().state, CoinState::Unspent);
+    }
+
+    /// A minimal v3 spend of `outpoint` paying `out` sats to a standard P2TR, so
+    /// a leased coin's outpoint can be marked confirmed-spent on the sim.
+    fn spend_std(outpoint: OutPoint, out: u64) -> Vec<u8> {
+        use bitcoin::{
+            absolute, transaction::Version, Amount, ScriptBuf, Sequence, Transaction, TxIn, TxOut,
+            Witness,
+        };
+        let mut spk = vec![0x51u8, 0x20];
+        spk.extend_from_slice(&[0x77u8; 32]);
+        let tx = Transaction {
+            version: Version(3),
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: outpoint,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut { value: Amount::from_sat(out), script_pubkey: ScriptBuf::from_bytes(spk) }],
+        };
+        bitcoin::consensus::encode::serialize(&tx)
+    }
+
+    /// Task 3: the chain-aware lease reconcile marks a `Leased` coin the chain
+    /// confirms SPENT as `Spent` (never re-exposed as a phantom), independent of
+    /// lease liveness, while still releasing orphaned leases and leaving a
+    /// live+unspent lease untouched. This is the funding-coin phantom: a
+    /// pre-funding abort spent the pre-encumbrance coin into its escrow on chain,
+    /// but `run_exchange` never marked it spent, so the chain-blind reconcile
+    /// would re-expose it as `Unspent`.
+    #[test]
+    fn reconcile_leases_with_chain_sweeps_a_confirmed_spent_lease() {
+        use crate::chain::{ChainView, SimChain};
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, keys) = fresh(dir.path());
+        let params = Params::testnet_provisional();
+        let unit = params.tier_d_sats + params.delta_fee_sats;
+        add_deposit(&mut ledger, &keys, outpoint(1), 3 * unit + 2_000, true);
+        let plan = ledger.split_deposit(outpoint(1), &params, 2_000, &keys).unwrap();
+        ledger.confirm_split(plan.txid, 105, &FixedClock(1_000)).unwrap();
+
+        // A NON-LEASABLE coin: a bare Deposit (Unspent, class Deposit), left
+        // unsplit. It exercises the class-scoping guard — even confirmed-spent on
+        // chain it must NEVER be swept (its spent-ness is owned by the
+        // deposit→split lifecycle, not this reconcile). Marking a real deposit
+        // Spent here would strand a genuine coin.
+        add_deposit(&mut ledger, &keys, outpoint(2), 5_000_000, false);
+        assert_eq!(ledger.find(&outpoint(2)).unwrap().state, CoinState::Unspent);
+        assert_eq!(ledger.find(&outpoint(2)).unwrap().class, CoinClass::Deposit);
+
+        let late = FixedClock(u64::MAX);
+        let live = [0xAA; 32];
+        let dead = [0xBB; 32];
+        // Three leased pre-encumbrance coins: live+unspent, live+spent (the
+        // phantom this fix heals), and an orphan (dead lessee) + unspent.
+        let c_live = ledger.lease_pre_encumbrance(unit, &late, u32::MAX, live).unwrap().unwrap();
+        let c_spent = ledger.lease_pre_encumbrance(unit, &late, u32::MAX, live).unwrap().unwrap();
+        let c_orphan = ledger.lease_pre_encumbrance(unit, &late, u32::MAX, dead).unwrap().unwrap();
+
+        // The chain confirms c_spent's outpoint SPENT (its Setup confirmed) AND
+        // the bare Deposit's outpoint spent (a normal on-chain send of it);
+        // c_live and c_orphan are never touched on chain.
+        let chain = SimChain::new(200);
+        chain.fund_with_amount(c_spent.outpoint, 200, unit);
+        chain.broadcast(&spend_std(c_spent.outpoint, unit - 500)).unwrap();
+        chain.fund_with_amount(outpoint(2), 200, 5_000_000);
+        chain.broadcast(&spend_std(outpoint(2), 4_999_500)).unwrap();
+        chain.mine();
+        assert!(matches!(chain.spend_status(c_spent.outpoint), crate::chain::SpendStatus::Confirmed(_)));
+        assert!(matches!(chain.spend_status(outpoint(2)), crate::chain::SpendStatus::Confirmed(_)));
+
+        let out = ledger.reconcile_leases_with_chain(&[live], &chain).unwrap();
+        assert_eq!(out.swept, vec![c_spent.outpoint], "ONLY the leasable confirmed-spent lease is swept");
+        assert_eq!(out.released, vec![c_orphan.outpoint], "the orphan lease is released");
+        // The phantom is permanently Spent — never a lease candidate again.
+        assert_eq!(ledger.find(&c_spent.outpoint).unwrap().state, CoinState::Spent);
+        // The orphan is Unspent (re-leasable, unchanged from the chain-blind rule).
+        assert_eq!(ledger.find(&c_orphan.outpoint).unwrap().state, CoinState::Unspent);
+        // The live+unspent lease is untouched.
+        assert_eq!(ledger.find(&c_live.outpoint).unwrap().state, CoinState::Leased);
+        // THE GUARD: the non-leasable Deposit is left Unspent despite the chain
+        // confirming it spent — this reconcile must never touch it.
+        assert_eq!(
+            ledger.find(&outpoint(2)).unwrap().state,
+            CoinState::Unspent,
+            "a non-leasable coin must never be swept by the lease reconcile"
+        );
+
+        // Idempotent: a second run over the healed ledger sweeps/releases nothing
+        // new (c_spent is now Spent so not a sweep target; c_orphan is Unspent+
+        // not-on-chain so not swept, and it is now leaseable, not leased).
+        let again = ledger.reconcile_leases_with_chain(&[live], &chain).unwrap();
+        assert!(again.swept.is_empty() && again.released.is_empty(), "reconcile is idempotent");
     }
 
     #[test]
