@@ -64,11 +64,13 @@ pub enum RecoveryTick {
     /// INCOMPLETE for this swap. The next `open` retries the rewrite; surfaced
     /// so the caller knows this swap is not yet driven.
     RewritePending,
-    /// SL restore-and-extract (`Released`). `final_sig` is `Some` when the
-    /// reveal is already on chain — the finalized Comp->SL to broadcast, now
-    /// persisted `Completing`; `None` when the reveal is not yet observed and
-    /// `fallback` is the [`AbortDriver`] decision on OUR escrow (the
-    /// `Released -> AbortRefund` exit if SH never completes).
+    /// SL restore-and-extract (`Released`, or the post-release `AbortRefund`
+    /// corner where SH's completion supersedes our armed refund). `final_sig`
+    /// is `Some` when the reveal is already observable — the finalized
+    /// Comp->SL to broadcast, now persisted `Completing`; `None` (Released
+    /// only) when the reveal is not yet observed and `fallback` is the
+    /// [`AbortDriver`] decision on OUR escrow (the `Released -> AbortRefund`
+    /// exit if SH never completes).
     Extract {
         final_sig: Option<[u8; 64]>,
         fallback: AbortAction,
@@ -80,7 +82,9 @@ pub enum RecoveryTick {
         final_sig: [u8; 64],
         confirmed: bool,
     },
-    /// `AbortRefund`: the completion-supersedes decision on our escrow.
+    /// `AbortRefund`: the completion-supersedes decision on our escrow (an SL
+    /// record with G1 possession whose reveal is already observable EXECUTES
+    /// the take-the-swap arm instead, surfacing as [`Extract`](Self::Extract)).
     Refund(AbortAction),
 }
 
@@ -125,8 +129,62 @@ impl RecoveryDriver {
             SwapPhase::Funding => Self::reenter_funding(rec, chain),
             SwapPhase::Released => Self::reenter_released(store, rec, chain),
             SwapPhase::Completing => Self::reenter_completing(store, rec, chain),
-            SwapPhase::AbortRefund => Ok(RecoveryTick::Refund(Self::abort_action(rec, chain)?)),
+            SwapPhase::AbortRefund => Self::reenter_abort_refund(store, rec, chain),
         }
+    }
+
+    /// `AbortRefund`: the completion-supersedes decision on our escrow — with
+    /// the SL take-the-swap EXECUTOR for the post-release corner. An SL that
+    /// released its enabling partial (possession persisted, G1) and only then
+    /// aborted can still be handed the swap: SH's completion spends OUR escrow
+    /// and reveals t. Observing that reveal here EXECUTES the claim — restore,
+    /// extract, persist `Completing` (rule 3, via the `AbortRefund →
+    /// Completing` completion-supersedes edge) — exactly as the `Released`
+    /// re-entry does, instead of merely signalling `Refund(TakeTheSwap)` with
+    /// no extractor. SH records and pre-exchange (early-record) aborts carry
+    /// no possession material and keep the plain refund decision. SL's own
+    /// script-path refund can never masquerade as the reveal:
+    /// `observe_reveal` surfaces key-path witnesses only.
+    fn reenter_abort_refund(
+        store: &SwapStore,
+        rec: &SwapRecord,
+        chain: &dyn ChainView,
+    ) -> Result<RecoveryTick> {
+        if rec.role == Role::SecretLearner && rec.possession_record.is_some() {
+            if let Some(our_escrow) = rec.our_escrow_outpoint {
+                if let Some(reveal) = ClaimScheduler::observe_reveal(chain, our_escrow) {
+                    return Self::restore_and_extract(store, rec, chain, &reveal);
+                }
+            }
+        }
+        Ok(RecoveryTick::Refund(Self::abort_action(rec, chain)?))
+    }
+
+    /// Restore the SL possession record and complete the claim from an observed
+    /// on-chain reveal, persisting the finalized signature as `Completing`
+    /// BEFORE it is handed back (rule 3). Shared by the `Released` re-entry and
+    /// the post-release `AbortRefund` completion-supersedes executor.
+    fn restore_and_extract(
+        store: &SwapStore,
+        rec: &SwapRecord,
+        chain: &dyn ChainView,
+        reveal: &[u8; 64],
+    ) -> Result<RecoveryTick> {
+        let record_path = rec
+            .possession_record
+            .as_ref()
+            .ok_or(Error::Ordering("restore-and-extract without a possession pointer"))?;
+        let restored = Possessing::restore_secret_learner(record_path, &rec.swap_session_id)?;
+        let observed = ValidatedFinalSig::from_bytes(reveal)?;
+        // Extract t and complete our leg; the delay is clamped inside to the
+        // swept escrow's claim ceiling (never past S + delta_late).
+        let plan = restored.claim_after_reveal(&observed, chain.tip_height())?;
+        let final_sig = plan.comp_sl_final.0;
+        let mut next = rec.clone();
+        next.phase = SwapPhase::Completing;
+        next.completion_tx = Some(final_sig.to_vec());
+        store.put(&next)?;
+        Ok(RecoveryTick::Extract { final_sig: Some(final_sig), fallback: AbortAction::Wait })
     }
 
     /// `Funding`: if our escrow is confirmed on chain the standing pre-armed
@@ -167,23 +225,13 @@ impl RecoveryDriver {
             .our_escrow_outpoint
             .ok_or(Error::Ordering("Released record without our escrow outpoint"))?;
 
-        let restored = Possessing::restore_secret_learner(record_path, &rec.swap_session_id)?;
+        // Restore up front even when no reveal is observable yet: a corrupt
+        // possession record must surface NOW (the record claims G1 evidence),
+        // not only once SH completes.
+        let _validated = Possessing::restore_secret_learner(record_path, &rec.swap_session_id)?;
 
         match ClaimScheduler::observe_reveal(chain, our_escrow) {
-            Some(reveal) => {
-                let observed = ValidatedFinalSig::from_bytes(&reveal)?;
-                // Extract t and complete our leg; the delay is clamped inside to
-                // the swept escrow's claim ceiling (never past S + delta_late).
-                let plan = restored.claim_after_reveal(&observed, chain.tip_height())?;
-                let final_sig = plan.comp_sl_final.0;
-                // Rule 3: persist the finalized claim as `Completing` BEFORE it
-                // is handed back for broadcast, so a re-crash rebroadcasts it.
-                let mut next = rec.clone();
-                next.phase = SwapPhase::Completing;
-                next.completion_tx = Some(final_sig.to_vec());
-                store.put(&next)?;
-                Ok(RecoveryTick::Extract { final_sig: Some(final_sig), fallback: AbortAction::Wait })
-            }
+            Some(reveal) => Self::restore_and_extract(store, rec, chain, &reveal),
             None => {
                 // No reveal yet: SH has not completed. The safe fallback is the
                 // AbortDriver decision on OUR escrow — wait, refund at maturity,

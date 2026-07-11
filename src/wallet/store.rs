@@ -164,6 +164,12 @@ impl SwapPhase {
 /// no `AbortRefund -> Signing` (a dead session is never resumed — INV-4).
 /// `AbortRefund -> Completed` is completion-supersedes: the refund driver
 /// discovers the counterparty's completion winning and takes the swap.
+/// `AbortRefund -> Completing` is the SL half of the same rule: SH's
+/// completion revealed t while our refund path was armed, so recovery
+/// EXECUTES the take-the-swap arm — the extracted claim is persisted (rule 3)
+/// and babysat exactly like any `Completing`. No signing session resumes
+/// (the claim derives from the possession record + the on-chain reveal
+/// alone), so INV-4's absence is untouched.
 fn transition_ok(from: SwapPhase, to: SwapPhase) -> bool {
     use SwapPhase::*;
     if from == to {
@@ -185,6 +191,7 @@ fn transition_ok(from: SwapPhase, to: SwapPhase) -> bool {
             | (Completing, AbortRefund)
             | (AbortRefund, Refunded)
             | (AbortRefund, Completed)
+            | (AbortRefund, Completing)
     )
 }
 
@@ -1145,6 +1152,21 @@ mod tests {
         let mut bad_params = base_record(6, SwapPhase::Funding);
         bad_params.params.margin = 0;
         assert!(store.put(&bad_params).is_err());
+
+        // AbortRefund -> Completing is the SL completion-supersedes edge
+        // (recovery persists the extracted claim, rule 3); AbortRefund ->
+        // Signing stays ABSENT (INV-4: a dead session never resumes).
+        store.put(&base_record(8, SwapPhase::Funding)).unwrap();
+        store.put(&base_record(8, SwapPhase::AbortRefund)).unwrap();
+        assert!(
+            store.put(&base_record(8, SwapPhase::Signing)).is_err(),
+            "INV-4: AbortRefund -> Signing must stay illegal"
+        );
+        let mut take = base_record(8, SwapPhase::Completing);
+        take.completion_tx = Some(vec![0xcd; 64]);
+        store
+            .put(&take)
+            .expect("AbortRefund -> Completing (completion-supersedes) must be legal");
     }
 
     #[test]

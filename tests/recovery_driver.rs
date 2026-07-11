@@ -304,6 +304,58 @@ fn released_without_reveal_falls_back_to_refund_decision() {
     }
 }
 
+/// The post-release AbortRefund corner (C5 audit finding): an SL that released
+/// its enabling partial (possession persisted, G1) and THEN aborted — record
+/// at `AbortRefund` — is handed the swap by SH's completion, which spends OUR
+/// escrow and reveals t. Recovery must EXECUTE the take-the-swap arm (restore
+/// → extract → persist `Completing`, rule 3, via the new `AbortRefund →
+/// Completing` edge), not merely signal `Refund(TakeTheSwap)` with no
+/// extractor; without a reveal it stays the plain refund decision.
+#[test]
+fn abort_refund_with_reveal_executes_take_the_swap() {
+    let s = released_swap();
+    // Post-release abort: the wallet routed the swap to AbortRefund (e.g. the
+    // transport died after SL's release). Released -> AbortRefund is legal.
+    let mut rec = s.store.get(&s.sid).unwrap().unwrap();
+    rec.phase = SwapPhase::AbortRefund;
+    s.store.put(&rec).unwrap();
+
+    // No reveal yet: the abort stays a refund decision (immature → Wait) —
+    // never a stuck signal, never a premature extraction.
+    match RecoveryDriver::reenter_one(&s.store, &s.store.get(&s.sid).unwrap().unwrap(), &s.chain)
+        .unwrap()
+    {
+        RecoveryTick::Refund(AbortAction::Wait) => {}
+        other => panic!("no reveal: the abort stays a refund decision, got {other:?}"),
+    }
+
+    // SH's completion lands — the reveal spends OUR escrow while we sit in
+    // AbortRefund. Completion-supersedes must now EXECUTE.
+    s.chain.broadcast(&s.comp_sh_final).expect("Comp->SH accepted");
+    s.chain.mine();
+
+    let rec = s.store.get(&s.sid).unwrap().unwrap();
+    let final_sig = match RecoveryDriver::reenter_one(&s.store, &rec, &s.chain).unwrap() {
+        RecoveryTick::Extract { final_sig: Some(sig), .. } => sig,
+        other => panic!("a reveal on an SL AbortRefund must extract, got {other:?}"),
+    };
+    // Rule 3: the finalized claim is persisted BEFORE broadcast.
+    assert_eq!(s.store.get(&s.sid).unwrap().unwrap().phase, SwapPhase::Completing);
+
+    // The recovered signature is a real, broadcastable claim; the record
+    // finalizes once our sweep confirms.
+    let finalized = finalize_key_spend(s.comp_sl_spend, final_sig);
+    s.chain.broadcast(&finalized).expect("Comp->SL accepted");
+    s.chain.mine();
+    assert!(matches!(s.chain.spend_status(s.op_comp_sl), SpendStatus::Confirmed(_)));
+    let rec = s.store.get(&s.sid).unwrap().unwrap();
+    match RecoveryDriver::reenter_one(&s.store, &rec, &s.chain).unwrap() {
+        RecoveryTick::Rebroadcast { confirmed: true, .. } => {}
+        other => panic!("expected Rebroadcast(confirmed) once swept, got {other:?}"),
+    }
+    assert_eq!(s.store.get(&s.sid).unwrap().unwrap().phase, SwapPhase::Completed);
+}
+
 /// AbortRefund and Funding records need no possession material — recovery
 /// routes AbortRefund to the completion-supersedes decision (Wait until CSV
 /// maturity, then BroadcastRefund) and surfaces a funded Funding record's
