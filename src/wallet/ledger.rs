@@ -136,6 +136,19 @@ impl WalletClock for SystemClock {
 /// per Bitcoin Core's P2TR dust rule (546 is the LEGACY threshold — using it
 /// would silently burn relayable 330–545-sat change).
 const DUST_SATS: u64 = 330;
+/// Sane wall-clock window for the confirmation-time eligibility anchor. A
+/// reading outside it is a clock FAULT (dead-battery RTC pinned to an extreme
+/// date, an NTP glitch, `SystemClock`'s `unwrap_or(0)` fallback). A faulted
+/// reading is NOT trusted: it collapses to `SANE_CLOCK_MIN_UNIX`, degrading
+/// the WALL half of the dual anchor to trivially-satisfied while the HEIGHT
+/// anchor stays fully load-bearing (the onboarding delay is still enforced in
+/// block time). Collapsing DOWN — never clamping an absurd-future reading to
+/// the window ceiling — is deliberate: the anchor is written exactly once (no
+/// code path re-anchors an `Unspent` coin, and the dual gate needs BOTH
+/// anchors to pass), so an anchor written from an absurd-future reading would
+/// freeze the coin until that date with no recovery API.
+const SANE_CLOCK_MIN_UNIX: u64 = 1_600_000_000; // 2020-09-13
+const SANE_CLOCK_MAX_UNIX: u64 = 7_258_118_400; // 2200-01-01
 /// Standardness guard: cap pre-encumbrance outputs per split; the excess
 /// stays in change (re-splittable later). 64 P2TR outputs ≈ 2.8 kvB.
 const MAX_PRE_ENC_OUTPUTS: u64 = 64;
@@ -236,6 +249,20 @@ impl CoinState {
     }
 }
 
+/// One signed split ATTEMPT (deposit only): the attempt's txid PAIRED with its
+/// full signed bytes. Keeping the bytes per attempt (not just the latest) is
+/// what lets `confirm_split` retain the WINNING attempt's tx for shallow-reorg
+/// rebroadcast: `bump_split_fee` overwrites `split_tx` with the newest attempt,
+/// but a LOWER-fee earlier attempt can still be the one that confirms (a real
+/// mempool/RBF propagation race), and rebroadcasting the latest — losing,
+/// mutually exclusive — tx after a reorg would strand the confirmed children
+/// as phantoms while minting untracked outputs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SplitAttempt {
+    pub txid: Txid,
+    pub tx_bytes: Vec<u8>,
+}
+
 /// One tracked coin. Key material is NOT here — only `(key_purpose, key_index)`.
 #[derive(Clone, Debug)]
 pub struct CoinRecord {
@@ -265,12 +292,15 @@ pub struct CoinRecord {
     pub parent: Option<OutPoint>,
     /// For Leased coins: who holds the lease (swap_session_id or backstop id).
     pub lessee: Option<[u8; 32]>,
-    /// Deposit only: the latest signed split attempt, RETAINED after
-    /// confirmation for shallow-reorg rebroadcast.
+    /// Deposit only: the signed split tx to (re)broadcast — the LATEST attempt
+    /// while the split is pending, and the CONFIRMED (winning) attempt after
+    /// `confirm_split` (retained for shallow-reorg rebroadcast; installing the
+    /// winner is what makes that retention truthful when a non-latest attempt
+    /// confirms).
     pub split_tx: Option<Vec<u8>>,
-    /// Deposit only: every split-attempt txid (mutually exclusive txs; at
-    /// most one ever confirms).
-    pub split_attempts: Vec<Txid>,
+    /// Deposit only: every split attempt — txid + signed bytes, paired
+    /// (mutually exclusive txs; at most one ever confirms).
+    pub split_attempts: Vec<SplitAttempt>,
 }
 
 impl CoinRecord {
@@ -285,6 +315,8 @@ impl CoinRecord {
 }
 
 /// The outcome of `split_deposit` / `bump_split_fee`, ready to broadcast.
+/// (All-public chain data — Debug is safe.)
+#[derive(Debug)]
 pub struct SplitPlan {
     pub tx_bytes: Vec<u8>,
     pub txid: Txid,
@@ -484,6 +516,11 @@ impl Ledger {
         }
         self.transact(|l| {
             l.first_deposit_acked = true;
+            // A caller-supplied index must also RAISE the issuance floor:
+            // recording a coin at an index the counter has not passed yet
+            // (e.g. after a partial restore) must never let a later
+            // `issue_key` re-issue that same (purpose, index) on-chain.
+            l.next_key_index = l.next_key_index.max(key_index.saturating_add(1));
             l.coins.push(CoinRecord {
                 outpoint,
                 amount_sats,
@@ -640,7 +677,7 @@ impl Ledger {
                 let dep = l.find_mut(&deposit).expect("checked above");
                 dep.state = CoinState::SplitPending;
                 dep.split_tx = Some(tx_bytes.clone());
-                dep.split_attempts.push(txid);
+                dep.split_attempts.push(SplitAttempt { txid, tx_bytes: tx_bytes.clone() });
             }
             Ok(SplitPlan {
                 tx_bytes,
@@ -678,7 +715,7 @@ impl Ledger {
         let dep_amount = dep.amount_sats;
         let dep_key_index = dep.key_index;
         let dep_key_purpose = dep.key_purpose;
-        let last_txid = *dep.split_attempts.last().expect("SplitPending has attempts");
+        let last_txid = dep.split_attempts.last().expect("SplitPending has attempts").txid;
         // Old fee from the cached bytes; RBF demands strictly more.
         let old_tx: bitcoin::Transaction = bitcoin::consensus::encode::deserialize(
             dep.split_tx.as_ref().expect("SplitPending caches its tx"),
@@ -692,7 +729,10 @@ impl Ledger {
             ));
         }
         params.validate()?;
-        let unit = params.tier_d_sats + params.delta_fee_sats;
+        let unit = params
+            .tier_d_sats
+            .checked_add(params.delta_fee_sats)
+            .ok_or(Error::Validation("ledger: tier overflow"))?;
         let spendable = dep_amount
             .checked_sub(new_fee_sats)
             .ok_or(Error::Validation("ledger: fee exceeds deposit"))?;
@@ -818,7 +858,7 @@ impl Ledger {
             {
                 let dep = l.find_mut(&deposit).expect("checked above");
                 dep.split_tx = Some(tx_bytes.clone());
-                dep.split_attempts.push(txid);
+                dep.split_attempts.push(SplitAttempt { txid, tx_bytes: tx_bytes.clone() });
             }
             Ok(SplitPlan {
                 tx_bytes,
@@ -834,8 +874,22 @@ impl Ledger {
     /// One split attempt confirmed at `height`: its children activate with
     /// their eligibility ANCHORED NOW (wall clock + chain height), losing
     /// attempts' children are dropped (mutually exclusive txs), the deposit
-    /// becomes Spent. The signed bytes are RETAINED for shallow-reorg
-    /// rebroadcast (the driver re-detects and re-confirms after a reorg).
+    /// becomes Spent. The CONFIRMED (winning) attempt's signed bytes are
+    /// installed as `split_tx` for shallow-reorg rebroadcast — NOT left as the
+    /// latest attempt's, which after an RBF race can be a losing, mutually
+    /// exclusive tx whose rebroadcast would strand the confirmed children.
+    ///
+    /// The wall-clock anchor is FAULT-CHECKED against the sane window (see
+    /// `SANE_CLOCK_MIN/MAX_UNIX`): an out-of-window reading collapses to the
+    /// window floor, so a faulted clock at this instant can neither freeze the
+    /// coin until an absurd future date nor inject a garbage anchor; the
+    /// height anchor stays load-bearing regardless.
+    ///
+    /// Known nuance (documented, not fund-loss): a reorg that unconfirms and
+    /// later re-confirms the same attempt keeps the FIRST confirmation's
+    /// anchors (children are already `Unspent`, so the anchor-writing branch is
+    /// skipped) — the effective delay is measured from the first confirmation,
+    /// a bounded privacy nuance only.
     pub fn confirm_split(
         &mut self,
         split_txid: Txid,
@@ -845,10 +899,22 @@ impl Ledger {
         let deposit_op = self
             .coins
             .iter()
-            .find(|c| c.class == CoinClass::Deposit && c.split_attempts.contains(&split_txid))
+            .find(|c| {
+                c.class == CoinClass::Deposit
+                    && c.split_attempts.iter().any(|a| a.txid == split_txid)
+            })
             .map(|c| c.outpoint)
             .ok_or(Error::Validation("ledger: unknown split txid"))?;
-        let now = clock.now_unix();
+        // Fault-collapse, not trust: an out-of-window reading degrades the wall
+        // anchor to SANE_MIN (trivially satisfied) — the height anchor still
+        // enforces the delay — instead of freezing the coin until an absurd
+        // future date. See the SANE_CLOCK_* doc.
+        let raw_now = clock.now_unix();
+        let now = if (SANE_CLOCK_MIN_UNIX..=SANE_CLOCK_MAX_UNIX).contains(&raw_now) {
+            raw_now
+        } else {
+            SANE_CLOCK_MIN_UNIX
+        };
         self.transact(|l| {
             for coin in &mut l.coins {
                 if coin.parent == Some(deposit_op) && coin.state == CoinState::PendingConfirm {
@@ -872,6 +938,14 @@ impl Ledger {
                     && c.created_height == 0)
             });
             let dep = l.find_mut(&deposit_op).expect("found above");
+            // Install the WINNING attempt's bytes (the confirming txid's own
+            // signed tx) as the retained-for-rebroadcast artifact.
+            let winning = dep
+                .split_attempts
+                .iter()
+                .find(|a| a.txid == split_txid)
+                .map(|a| a.tx_bytes.clone());
+            dep.split_tx = winning;
             dep.state = CoinState::Spent;
             Ok(())
         })
@@ -1146,6 +1220,9 @@ impl Ledger {
             }
             c.state = CoinState::Spent;
             c.lessee = None;
+            // Caller-supplied index also raises the issuance floor (see
+            // `register_deposit`).
+            l.next_key_index = l.next_key_index.max(change_key_index.saturating_add(1));
             l.coins.push(CoinRecord {
                 outpoint: change_outpoint,
                 amount_sats: change_amount_sats,
@@ -1182,6 +1259,10 @@ impl Ledger {
             return Err(Error::Validation("ledger: outpoint already tracked"));
         }
         self.transact(|l| {
+            // Caller-supplied index also raises the issuance floor (see
+            // `register_deposit`): a recorded on-chain index must never be
+            // re-issued by a later `issue_key`.
+            l.next_key_index = l.next_key_index.max(key_index.saturating_add(1));
             l.coins.push(CoinRecord {
                 outpoint,
                 amount_sats,
@@ -1252,17 +1333,22 @@ impl Ledger {
 
     // ---- persistence -----------------------------------------------------
     //
-    // v2 layout (sealed): [1 ver=2][1 first_deposit_acked][4 next_key_index]
+    // v3 layout (sealed): [1 ver=3][1 first_deposit_acked][4 next_key_index]
     // [4 count] then per coin:
     // [32 txid][4 vout][8 amount][1 class][1 state][1 key_purpose]
     // [4 key_index][4 created_height][8 delay_or_eligible][4 eligible_height]
     // [1 flags: b0 deposit_linked, b1 parent, b2 lessee, b3 split_tx,
     //  b4 attempts]
-    // [36 parent]? [32 lessee]? [4 len + bytes split_tx]? [1 n + 32n attempts]?
+    // [36 parent]? [32 lessee]? [4 len + bytes split_tx]?
+    // [1 n + n x (32 txid + 4 len + bytes) attempts]?
+    // (v3 made each split attempt carry its SIGNED BYTES, so confirm_split can
+    // retain the WINNING attempt's tx for reorg rebroadcast; v2 records are
+    // rejected — no deployed data predates this, same precedent as the swap
+    // store's version bumps.)
 
     fn persist(&self) -> Result<()> {
         let mut v = Vec::with_capacity(64 + self.coins.len() * 96);
-        v.push(2u8);
+        v.push(3u8);
         v.push(self.first_deposit_acked as u8);
         v.extend_from_slice(&self.next_key_index.to_le_bytes());
         v.extend_from_slice(&(self.coins.len() as u32).to_le_bytes());
@@ -1307,8 +1393,10 @@ impl Ledger {
             }
             if !c.split_attempts.is_empty() {
                 v.push(c.split_attempts.len() as u8);
-                for t in &c.split_attempts {
-                    v.extend_from_slice(&t.to_byte_array());
+                for a in &c.split_attempts {
+                    v.extend_from_slice(&a.txid.to_byte_array());
+                    v.extend_from_slice(&(a.tx_bytes.len() as u32).to_le_bytes());
+                    v.extend_from_slice(&a.tx_bytes);
                 }
             }
         }
@@ -1336,7 +1424,7 @@ impl Ledger {
 
 fn parse_ledger(b: &[u8]) -> Result<(Vec<CoinRecord>, u32, bool)> {
     let mut at = 0usize;
-    if take_arr::<1>(b, &mut at)?[0] != 2 {
+    if take_arr::<1>(b, &mut at)?[0] != 3 {
         return Err(Error::Validation("ledger: unknown version"));
     }
     let acked = match take_arr::<1>(b, &mut at)?[0] {
@@ -1391,7 +1479,16 @@ fn parse_ledger(b: &[u8]) -> Result<(Vec<CoinRecord>, u32, bool)> {
             let n = take_arr::<1>(b, &mut at)?[0] as usize;
             let mut v = Vec::with_capacity(n);
             for _ in 0..n {
-                v.push(Txid::from_byte_array(take_arr::<32>(b, &mut at)?));
+                let atxid = Txid::from_byte_array(take_arr::<32>(b, &mut at)?);
+                let len = take_le_u32(b, &mut at)? as usize;
+                let end = at
+                    .checked_add(len)
+                    .ok_or(Error::Validation("ledger: attempt length overflow"))?;
+                let s = b
+                    .get(at..end)
+                    .ok_or(Error::Validation("ledger truncated (attempt tx)"))?;
+                at = end;
+                v.push(SplitAttempt { txid: atxid, tx_bytes: s.to_vec() });
             }
             v
         } else {
@@ -1686,6 +1783,450 @@ mod tests {
         let dep = ledger.find(&outpoint(1)).unwrap();
         assert_eq!(dep.state, CoinState::Spent);
         assert!(dep.split_tx.is_some(), "bytes retained for shallow-reorg rebroadcast");
+    }
+
+    /// Audit B2: when a NON-latest (lower-fee) RBF attempt is the one that
+    /// confirms — a real mempool-propagation race — the deposit must retain the
+    /// WINNING attempt's bytes, not the latest's. Rebroadcasting the latest
+    /// (losing, mutually exclusive) tx after a shallow reorg would strand the
+    /// confirmed children as phantoms while minting untracked outputs.
+    #[test]
+    fn confirming_a_non_latest_attempt_retains_the_winning_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, keys) = fresh(dir.path());
+        let params = Params::testnet_provisional();
+        let unit = params.tier_d_sats + params.delta_fee_sats;
+        add_deposit(&mut ledger, &keys, outpoint(1), 2 * unit + 50_000, true);
+
+        let plan1 = ledger.split_deposit(outpoint(1), &params, 1_000, &keys).unwrap();
+        let plan2 = ledger.bump_split_fee(outpoint(1), 5_000, &params, &keys).unwrap();
+        assert_ne!(plan1.txid, plan2.txid);
+
+        // The LOWER-fee attempt 1 wins the race and confirms.
+        ledger.confirm_split(plan1.txid, 500, &FixedClock(1_700_000_000)).unwrap();
+
+        let dep = ledger.find(&outpoint(1)).unwrap();
+        assert_eq!(dep.state, CoinState::Spent);
+        let retained: bitcoin::Transaction =
+            bitcoin::consensus::encode::deserialize(dep.split_tx.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            retained.compute_txid(),
+            plan1.txid,
+            "the retained rebroadcast artifact must be the CONFIRMED attempt, not the latest"
+        );
+        // The winner's children are live at the winner's outpoints...
+        let active: Vec<_> = ledger
+            .coins()
+            .iter()
+            .filter(|c| c.outpoint.txid == plan1.txid && c.state == CoinState::Unspent)
+            .collect();
+        assert_eq!(active.len(), 3, "2 pre-enc + 1 change from the confirmed attempt");
+        // ...and the losing (latest) attempt's children are gone.
+        assert!(ledger.coins().iter().all(|c| c.outpoint.txid != plan2.txid));
+    }
+
+    /// Audit B1+B4: a faulted wall clock AT CONFIRMATION (absurd-future,
+    /// absurd-past, or SystemClock's unwrap_or(0)) must not be trusted into the
+    /// once-written eligibility anchor. An out-of-window reading collapses to
+    /// the sane floor: the coin is NOT frozen until an absurd date (B1), and
+    /// the HEIGHT anchor still enforces the delay in block time (B4).
+    #[test]
+    fn clock_faults_at_confirmation_are_collapsed_not_trusted() {
+        let params = Params::testnet_provisional();
+        let unit = params.tier_d_sats + params.delta_fee_sats;
+
+        // --- absurd-FUTURE clock at confirmation: coin must not freeze. ---
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, keys) = fresh(dir.path());
+        add_deposit(&mut ledger, &keys, outpoint(1), unit + 2_000, true);
+        let plan = ledger.split_deposit(outpoint(1), &params, 2_000, &keys).unwrap();
+        ledger.confirm_split(plan.txid, 105, &FixedClock(u64::MAX)).unwrap();
+        let coin = ledger
+            .coins()
+            .iter()
+            .find(|c| c.class == CoinClass::PreEncumbrance)
+            .unwrap()
+            .clone();
+        let e = coin.eligibility_unix().unwrap();
+        assert!(
+            e <= SANE_CLOCK_MIN_UNIX + 73 * 3600,
+            "a faulted future clock must collapse to the sane floor, got {e}"
+        );
+        // Leasable with a REALISTIC clock once both anchors pass — not frozen.
+        let realistic = FixedClock(1_700_000_000);
+        let leased = ledger
+            .lease_pre_encumbrance(unit, &realistic, coin.eligible_height, LESSEE)
+            .unwrap();
+        assert!(leased.is_some(), "the coin must be recoverable under a corrected clock");
+
+        // --- absurd-PAST clock (SystemClock's unwrap_or(0) shape): the wall
+        // half degrades, but the HEIGHT anchor still enforces the delay. ---
+        let dir2 = tempfile::tempdir().unwrap();
+        let (mut ledger2, keys2) = fresh(dir2.path());
+        add_deposit(&mut ledger2, &keys2, outpoint(2), unit + 2_000, true);
+        let plan2 = ledger2.split_deposit(outpoint(2), &params, 2_000, &keys2).unwrap();
+        ledger2.confirm_split(plan2.txid, 105, &FixedClock(0)).unwrap();
+        let coin2 = ledger2
+            .coins()
+            .iter()
+            .find(|c| c.class == CoinClass::PreEncumbrance)
+            .unwrap()
+            .clone();
+        assert!(coin2.eligible_height > 105, "height anchor set from confirmation");
+        // Wall passed (huge clock) but chain NOT: still gated — the height
+        // anchor is the load-bearing half under a faulted clock.
+        assert!(matches!(
+            ledger2.lease_pre_encumbrance(
+                unit,
+                &FixedClock(u64::MAX),
+                coin2.eligible_height - 1,
+                LESSEE
+            ),
+            Err(Error::Deadline(_))
+        ));
+        // Both passed: leases.
+        assert!(ledger2
+            .lease_pre_encumbrance(unit, &FixedClock(u64::MAX), coin2.eligible_height, LESSEE)
+            .unwrap()
+            .is_some());
+    }
+
+    /// Audit G1+G7: a fee bump that COLLAPSES k (the higher fee eats a whole
+    /// unit) mints a change output where the previous attempt had none — with a
+    /// FRESH OnboardingChange key — and both attempts conserve value exactly
+    /// (deposit = outputs + effective fee; no sat created or destroyed).
+    #[test]
+    fn bump_that_collapses_k_mints_fresh_change_and_conserves_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, keys) = fresh(dir.path());
+        let params = Params::testnet_provisional();
+        let unit = params.tier_d_sats + params.delta_fee_sats;
+        let deposit_amt = 2 * unit + 1_000;
+        add_deposit(&mut ledger, &keys, outpoint(1), deposit_amt, true);
+
+        // Attempt 1: fee 1_000 -> spendable = 2*unit exactly -> k=2, NO change.
+        let plan1 = ledger.split_deposit(outpoint(1), &params, 1_000, &keys).unwrap();
+        assert_eq!(plan1.pre_encumbrance_count, 2);
+        assert_eq!(plan1.change_sats, 0);
+        let tx1: bitcoin::Transaction =
+            bitcoin::consensus::encode::deserialize(&plan1.tx_bytes).unwrap();
+        let out1: u64 = tx1.output.iter().map(|o| o.value.to_sat()).sum();
+        assert_eq!(out1 + 1_000, deposit_amt, "attempt 1 conserves value");
+        assert_eq!(tx1.output.len(), 2, "no change output on attempt 1");
+
+        // Attempt 2: fee 5_000 -> spendable = 2*unit - 4_000 -> k COLLAPSES to 1
+        // and a large change output appears, under a FRESH change key.
+        let plan2 = ledger.bump_split_fee(outpoint(1), 5_000, &params, &keys).unwrap();
+        assert_eq!(plan2.pre_encumbrance_count, 1, "the higher fee ate a unit");
+        assert_eq!(plan2.change_sats, unit - 4_000);
+        let tx2: bitcoin::Transaction =
+            bitcoin::consensus::encode::deserialize(&plan2.tx_bytes).unwrap();
+        let out2: u64 = tx2.output.iter().map(|o| o.value.to_sat()).sum();
+        assert_eq!(out2 + 5_000, deposit_amt, "attempt 2 conserves value");
+        // The minted change spk is FRESH — not any spk attempt 1 used.
+        let spks1: std::collections::HashSet<_> =
+            tx1.output.iter().map(|o| o.script_pubkey.clone()).collect();
+        let change_out = tx2
+            .output
+            .iter()
+            .find(|o| o.value.to_sat() == unit - 4_000)
+            .expect("change output present");
+        assert!(
+            !spks1.contains(&change_out.script_pubkey),
+            "collapsed-k bump must mint a FRESH change key"
+        );
+        // Confirming the collapsed attempt activates exactly its 2 outputs.
+        ledger.confirm_split(plan2.txid, 500, &FixedClock(1_700_000_000)).unwrap();
+        let active: Vec<_> = ledger
+            .coins()
+            .iter()
+            .filter(|c| c.state == CoinState::Unspent && c.outpoint.txid == plan2.txid)
+            .collect();
+        assert_eq!(active.len(), 2, "1 pre-enc + 1 change");
+    }
+
+    /// Audit B3: hostile Params whose tier + delta_fee overflows u64 can pass
+    /// `Params::validate` (which bounds the tier only from below), so the unit
+    /// computation must be CHECKED in BOTH split paths — an unchecked add
+    /// would wrap in release (minting absurd outputs) or panic under
+    /// overflow-checks.
+    #[test]
+    fn hostile_tier_overflow_params_are_rejected_not_wrapped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, keys) = fresh(dir.path());
+        let params = Params::testnet_provisional();
+        let unit = params.tier_d_sats + params.delta_fee_sats;
+        let mut hostile = params.clone();
+        hostile.tier_d_sats = u64::MAX;
+        // Precondition: validate() admits the max-tier params — the checked
+        // unit computation is the only line of defense.
+        assert!(hostile.validate().is_ok(), "precondition: validate admits max-tier params");
+
+        // split_deposit arm.
+        add_deposit(&mut ledger, &keys, outpoint(1), 2 * unit + 50_000, true);
+        let err = ledger.split_deposit(outpoint(1), &hostile, 1_000, &keys).unwrap_err();
+        assert!(
+            matches!(err, Error::Validation(m) if m.contains("tier overflow")),
+            "got {err:?}"
+        );
+
+        // bump_split_fee arm: a legitimate pending split, then a hostile bump.
+        ledger.split_deposit(outpoint(1), &params, 1_000, &keys).unwrap();
+        let err = ledger.bump_split_fee(outpoint(1), 5_000, &hostile, &keys).unwrap_err();
+        assert!(
+            matches!(err, Error::Validation(m) if m.contains("tier overflow")),
+            "got {err:?}"
+        );
+    }
+
+    /// Audit G2+G5: promote_change_to_reserve's guards (only UNSPENT
+    /// ONBOARDING-CHANGE is promotable — promoting a delayed pre-encumbrance
+    /// coin would BYPASS its onboarding delay, since reserve leasing has no
+    /// eligibility gate), and the promoted coin's class/purpose divergence
+    /// (class Reserve, purpose OnboardingChange) survives a reopen.
+    #[test]
+    fn promote_guards_hold_and_promoted_reserve_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let params = Params::testnet_provisional();
+        let unit = params.tier_d_sats + params.delta_fee_sats;
+        let change_op;
+        {
+            let (mut ledger, keys) = fresh(dir.path());
+            add_deposit(&mut ledger, &keys, outpoint(1), unit + 10_000, true);
+            let plan = ledger.split_deposit(outpoint(1), &params, 1_000, &keys).unwrap();
+            assert_eq!(plan.change_sats, 9_000);
+            ledger.confirm_split(plan.txid, 105, &FixedClock(1_700_000_000)).unwrap();
+            let pre_op = ledger
+                .coins()
+                .iter()
+                .find(|c| c.class == CoinClass::PreEncumbrance)
+                .unwrap()
+                .outpoint;
+            change_op = ledger
+                .coins()
+                .iter()
+                .find(|c| c.class == CoinClass::OnboardingChange)
+                .unwrap()
+                .outpoint;
+
+            // G5 negatives: a pre-encumbrance coin (delay-carrying) must not be
+            // promotable — that would bypass its onboarding delay entirely.
+            assert!(matches!(
+                ledger.promote_change_to_reserve(pre_op).unwrap_err(),
+                Error::Ordering(_)
+            ));
+            // Unknown outpoint refused.
+            assert!(matches!(
+                ledger.promote_change_to_reserve(outpoint(99)).unwrap_err(),
+                Error::Validation(_)
+            ));
+
+            // The legal promotion: class flips, key purpose is RETAINED.
+            ledger.promote_change_to_reserve(change_op).unwrap();
+            let c = ledger.find(&change_op).unwrap();
+            assert_eq!(c.class, CoinClass::Reserve);
+            assert_eq!(c.key_purpose, KeyPurpose::OnboardingChange);
+            // Double-promotion refused (no longer OnboardingChange class).
+            assert!(ledger.promote_change_to_reserve(change_op).is_err());
+        } // drop = restart
+
+        // G2: the divergence survives persist/open — the coin still signs under
+        // its ORIGINAL purpose, and it counts as leasable reserve.
+        let mut ledger = Ledger::open(dir.path(), &ModeledEnclave).unwrap();
+        let c = ledger.find(&change_op).unwrap();
+        assert_eq!(c.class, CoinClass::Reserve, "promotion survives reopen");
+        assert_eq!(
+            c.key_purpose,
+            KeyPurpose::OnboardingChange,
+            "the promoted coin must keep signing under its issuance purpose"
+        );
+        assert!(ledger.has_leasable_reserve(9_000));
+        let leased = ledger
+            .lease_reserve(BumpTarget::Refund, 9_000, None, LESSEE)
+            .unwrap()
+            .expect("promoted reserve leases");
+        assert_eq!(leased.outpoint, change_op);
+    }
+
+    /// Audit G9+G11: the eligibility gate is INCLUSIVE at both exact anchors
+    /// (one second / one block earlier is gated), and lease selection is a
+    /// trichotomy — no coin of the size at all is Ok(None), an existing but
+    /// immature coin is Err(Deadline), a mature one leases.
+    #[test]
+    fn eligibility_boundaries_are_exact_and_selection_trichotomy_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, keys) = fresh(dir.path());
+        let params = Params::testnet_provisional();
+        let unit = params.tier_d_sats + params.delta_fee_sats;
+        add_deposit(&mut ledger, &keys, outpoint(1), unit + 2_000, true);
+        let plan = ledger.split_deposit(outpoint(1), &params, 2_000, &keys).unwrap();
+        ledger.confirm_split(plan.txid, 105, &FixedClock(1_700_000_000)).unwrap();
+        let coin = ledger
+            .coins()
+            .iter()
+            .find(|c| c.class == CoinClass::PreEncumbrance)
+            .unwrap()
+            .clone();
+        let e = coin.eligibility_unix().unwrap();
+        let eh = coin.eligible_height;
+
+        // G11 trichotomy arm 1: no coin of THAT size exists -> Ok(None).
+        assert!(ledger
+            .lease_pre_encumbrance(unit + 1, &FixedClock(u64::MAX), u32::MAX, LESSEE)
+            .unwrap()
+            .is_none());
+        // Arm 2: exists but immature -> Err(Deadline), on EITHER anchor.
+        assert!(matches!(
+            ledger.lease_pre_encumbrance(unit, &FixedClock(e - 1), eh, LESSEE),
+            Err(Error::Deadline(_))
+        ));
+        assert!(matches!(
+            ledger.lease_pre_encumbrance(unit, &FixedClock(e), eh - 1, LESSEE),
+            Err(Error::Deadline(_))
+        ));
+        // Arm 3 + G9 boundary: EXACTLY at both anchors -> leases (inclusive).
+        assert!(ledger
+            .lease_pre_encumbrance(unit, &FixedClock(e), eh, LESSEE)
+            .unwrap()
+            .is_some());
+    }
+
+    /// Audit G3: the transact() rollback — a mutation whose PERSIST fails must
+    /// leave the in-memory state exactly as before (memory and disk never
+    /// diverge), and the same mutation must succeed once persistence recovers.
+    #[test]
+    fn transact_rolls_back_in_memory_state_when_persist_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, keys) = fresh(dir.path());
+        add_deposit(&mut ledger, &keys, outpoint(1), 5_000_000, true);
+        assert_eq!(ledger.find(&outpoint(1)).unwrap().state, CoinState::Unspent);
+
+        // Block persistence: a DIRECTORY at the tmp path makes File::create fail.
+        let tmp_block = dir.path().join("ledger.bin.tmp");
+        std::fs::create_dir(&tmp_block).unwrap();
+        let err = ledger.mark_spent(outpoint(1)).unwrap_err();
+        assert!(matches!(err, Error::Abort(_)), "persist failure surfaces, got {err:?}");
+        assert_eq!(
+            ledger.find(&outpoint(1)).unwrap().state,
+            CoinState::Unspent,
+            "the failed transact must roll the in-memory state back"
+        );
+
+        // Persistence recovers: the same mutation now lands, and survives reopen.
+        std::fs::remove_dir(&tmp_block).unwrap();
+        ledger.mark_spent(outpoint(1)).unwrap();
+        assert_eq!(ledger.find(&outpoint(1)).unwrap().state, CoinState::Spent);
+        drop(ledger);
+        let ledger = Ledger::open(dir.path(), &ModeledEnclave).unwrap();
+        assert_eq!(ledger.find(&outpoint(1)).unwrap().state, CoinState::Spent);
+    }
+
+    /// Audit G12: parse_ledger is TOTAL — malformed (but correctly SEALED)
+    /// plaintext must fail closed with Err, never panic, for truncations,
+    /// wrong versions, bad enums, absurd counts, and trailing bytes.
+    #[test]
+    fn parse_ledger_is_total_on_malformed_plaintext() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.bin");
+        let tek = crate::crypto::storage::derive_tek(
+            &ModeledEnclave.platform_key(),
+            &ledger_salt(),
+        );
+        let cases: Vec<Vec<u8>> = vec![
+            vec![],                            // empty
+            vec![3],                           // header truncated
+            vec![2, 1, 0, 0, 0, 0, 0, 0, 0, 0], // old version (v2) rejected
+            vec![3, 7, 0, 0, 0, 0, 0, 0, 0, 0], // malformed ack flag
+            {
+                // count says 5 coins, none present.
+                let mut v = vec![3, 1];
+                v.extend_from_slice(&0u32.to_le_bytes());
+                v.extend_from_slice(&5u32.to_le_bytes());
+                v
+            },
+            {
+                // one coin with an unknown class byte.
+                let mut v = vec![3, 1];
+                v.extend_from_slice(&0u32.to_le_bytes());
+                v.extend_from_slice(&1u32.to_le_bytes());
+                v.extend_from_slice(&[0u8; 36]); // outpoint
+                v.extend_from_slice(&1_000u64.to_le_bytes());
+                v.push(0xFF); // class: invalid
+                v
+            },
+            {
+                // valid empty ledger, then trailing junk.
+                let mut v = vec![3, 1];
+                v.extend_from_slice(&0u32.to_le_bytes());
+                v.extend_from_slice(&0u32.to_le_bytes());
+                v.push(0xAA);
+                v
+            },
+            {
+                // v3 attempt with an absurd length prefix — the attempt-bytes
+                // parser must Err on truncation/overflow, never panic.
+                let mut v = vec![3, 1];
+                v.extend_from_slice(&0u32.to_le_bytes());
+                v.extend_from_slice(&1u32.to_le_bytes());
+                v.extend_from_slice(&[0u8; 36]); // outpoint
+                v.extend_from_slice(&1_000u64.to_le_bytes());
+                v.push(0); // class: Deposit
+                v.push(0); // state: Unspent
+                v.push(0); // purpose: Deposit
+                v.extend_from_slice(&0u32.to_le_bytes()); // key_index
+                v.extend_from_slice(&0u32.to_le_bytes()); // created_height
+                v.extend_from_slice(&0u64.to_le_bytes()); // delay
+                v.extend_from_slice(&0u32.to_le_bytes()); // eligible_height
+                v.push(16); // flags: attempts present
+                v.push(1); // one attempt
+                v.extend_from_slice(&[0u8; 32]); // attempt txid
+                v.extend_from_slice(&u32::MAX.to_le_bytes()); // absurd length
+                v
+            },
+        ];
+        for (i, pt) in cases.iter().enumerate() {
+            let sealed = crate::crypto::storage::seal(&tek, pt).unwrap();
+            std::fs::write(&path, &sealed).unwrap();
+            match Ledger::open(dir.path(), &ModeledEnclave) {
+                Err(Error::Abort(_)) | Err(Error::Validation(_)) => {}
+                Err(e) => panic!("case {i}: wrong error class {e:?}"),
+                Ok(_) => panic!("case {i}: malformed ledger must fail closed"),
+            }
+        }
+    }
+
+    /// Audit G8+G13: recording a coin at a CALLER-SUPPLIED key index must raise
+    /// the monotonic issuance floor past it — otherwise a later issue_key would
+    /// re-issue the same (purpose, index) on-chain (address/key reuse). The
+    /// raised floor survives reopen.
+    #[test]
+    fn caller_supplied_key_indices_raise_the_issuance_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, keys) = fresh(dir.path());
+        let (i1, _) = ledger.next_deposit_address(&keys).unwrap();
+
+        // record_swapped_output at a far-ahead index.
+        ledger
+            .record_swapped_output(outpoint(9), 1_000, i1 + 50, 42, false)
+            .unwrap();
+        let (i2, _) = ledger.next_swap_destination(&keys).unwrap();
+        assert!(i2 > i1 + 50, "issuance floor must clear the recorded index, got {i2}");
+
+        // register_deposit at a far-ahead (but correctly bound) index.
+        let far = i2 + 100;
+        let derived = keys.derive_xonly(KeyPurpose::Deposit, far).unwrap();
+        let spk = crate::tx::setup::pre_encumbrance_spk(derived).unwrap();
+        ledger
+            .register_deposit(outpoint(10), 2_000, 100, far, &spk, &keys, Some(ack()))
+            .unwrap();
+        let (i3, _) = ledger.next_deposit_address(&keys).unwrap();
+        assert!(i3 > far, "deposit registration must raise the floor, got {i3}");
+
+        // The floor survives restart.
+        drop(ledger);
+        let mut ledger = Ledger::open(dir.path(), &ModeledEnclave).unwrap();
+        let (i4, _) = ledger.next_deposit_address(&keys).unwrap();
+        assert!(i4 > i3, "the raised floor must persist across reopen");
     }
 
     #[test]
