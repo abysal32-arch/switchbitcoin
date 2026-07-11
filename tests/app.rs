@@ -761,6 +761,170 @@ fn awaiting_verification_escalates_to_refund_at_maturity() {
     );
 }
 
+/// The record-less crash shape (review finding on 0e0ec64/128a22a, HIGH): the
+/// caller broadcast its Setup but crashed BEFORE `setup_broadcast` — no flag,
+/// no record — and the restarted app then hits a terminal abort. The funded
+/// discriminator must fall through to the CHAIN (our escrow is authoritatively
+/// confirmed), classify `Refunding` (never a false clean `Aborted`), and write
+/// the early record it found missing so `recover()` is not blind.
+///
+/// Both live routes are driven: (A) Block-X passing with the counterparty
+/// never funded; (B) the AwaitingVerification escalation at refund maturity
+/// under a lying source (the Second-funder shape, where the coordinator never
+/// re-issues `BroadcastSetup`, so the documented setup_broadcast heal can
+/// never run).
+#[test]
+fn record_less_funded_abort_classifies_refunding_via_the_chain() {
+    let params = Params::testnet_provisional();
+    let escrow_amt = params.escrow_amount_sats();
+    let d = params.tier_d_sats;
+
+    // ---- Route A: Block-X abort, fresh app over a chain-confirmed escrow. ----
+    let base = 700_000u32;
+    let wallet_dir = tempfile::tempdir().unwrap();
+    let sl_pre = onboard_one_coin(wallet_dir.path(), params.pre_encumbrance_sats(), [0xAAu8; 32]);
+    let (sh, sl) = loop {
+        let a = keypair();
+        let b = keypair();
+        if vp(&a.pk).to_bytes() < vp(&b.pk).to_bytes() {
+            break (b, a);
+        } else if vp(&b.pk).to_bytes() < vp(&a.pk).to_bytes() {
+            break (a, b);
+        }
+    };
+    let internal = canonical_internal_key(sh.pk, sl.pk).unwrap();
+    let e_ours = Escrow::new(&internal, &sl.pk, params.delta_early).unwrap();
+    let e_theirs = Escrow::new(&internal, &sh.pk, params.delta_early).unwrap();
+    let chain = SimChain::new(base);
+    let (sl_setup, our_op) = build_real_setup(&chain, &params, sl_pre, base, &e_ours, &sl.sk);
+    let (_x, their_op) =
+        build_real_setup(&chain, &params, OutPoint::new(txid_from(0xB4), 0), base, &e_theirs, &sh.sk);
+
+    // Pre-crash session: the Setup goes on the wire and CONFIRMS; the process
+    // dies before setup_broadcast — no record, and the fresh app has no flag.
+    chain.broadcast(&sl_setup).unwrap();
+    chain.mine();
+
+    let dest = e_ours.funding_script_pubkey().clone();
+    let comp = build_completion(&e_ours, our_op, escrow_amt, dest.clone(), d, params.anchor_sats).unwrap();
+    let refund =
+        PreArmedRefund::arm(&e_ours, our_op, escrow_amt, &sl.sk, dest, d, params.anchor_sats, base).unwrap();
+    let receipt = confirm_watchtower_handoff(&refund, refund.fingerprint()).unwrap();
+    let (mut engine, _) = SwapEngine::open(
+        wallet_dir.path(),
+        &ModeledEnclave,
+        Box::new(ModeledKeySource::new(&ModeledEnclave)),
+        &ModeledTrustRoot,
+    )
+    .unwrap();
+    let lease = tempfile::tempdir().unwrap();
+    let possession = tempfile::tempdir().unwrap();
+    let ctx = make_ctx(
+        sl.sk, sh.pk, our_op, their_op, escrow_amt, comp.sighash, comp.sighash, refund, None,
+        e_ours.merkle_root(), e_theirs.merkle_root(), e_ours.output_key_xonly(),
+        e_theirs.output_key_xonly(), lease.path().to_path_buf(), possession.path().to_path_buf(),
+        receipt, sl_pre,
+    );
+    let sid = SwapEngine::swap_session_id(&ctx).unwrap();
+    let block_x = base + 40;
+    let mut app = SwapApp::begin(&engine, ctx, PeerSession::new([0u8; 32], Box::new(DeadEnd)), block_x, 0).unwrap();
+    assert!(engine.store().get(&sid).unwrap().is_none(), "record-less by construction");
+
+    // Block-X passes with the counterparty never funded → the first poll is a
+    // terminal abort — which must read the CHAIN and classify Refunding.
+    while chain.tip_height() < block_x {
+        chain.mine();
+    }
+    match app.poll(&mut engine, &chain).unwrap() {
+        AppTick::Refunding(reason) => assert!(reason.contains("Block X"), "got {reason:?}"),
+        other => panic!("a chain-funded record-less abort must be Refunding, got {other:?}"),
+    }
+    // ...and recover() is no longer blind: the record was written and advanced.
+    assert_eq!(
+        engine.store().get(&sid).unwrap().unwrap().phase,
+        SwapPhase::AbortRefund,
+        "the terminal wrote the missing early record and advanced it"
+    );
+    let (ticks, _) = SwapApp::recover(&engine, &chain).unwrap();
+    assert_eq!(ticks.len(), 1);
+    assert!(matches!(ticks[0].1, RecoveryTick::Refund(_)), "got {:?}", ticks[0].1);
+
+    // ---- Route B: the AwaitingVerification escalation, record-less. ----
+    // The app must be the SECOND funder here: its broadcast is gated on the
+    // very verification that is stalled, so the coordinator never re-issues
+    // `BroadcastSetup` and the documented setup_broadcast heal cannot run.
+    let base = 710_000u32;
+    let wallet_dir2 = tempfile::tempdir().unwrap();
+    let sl_pre2 = onboard_one_coin(wallet_dir2.path(), params.pre_encumbrance_sats(), [0xABu8; 32]);
+    let (sh, sl) = loop {
+        let a = keypair();
+        let b = keypair();
+        if vp(&a.pk).to_bytes() < vp(&b.pk).to_bytes() {
+            break (a, b); // sl = b (larger = Second funder)
+        } else if vp(&b.pk).to_bytes() < vp(&a.pk).to_bytes() {
+            break (b, a);
+        }
+    };
+    let internal = canonical_internal_key(sh.pk, sl.pk).unwrap();
+    let e_ours = Escrow::new(&internal, &sl.pk, params.delta_early).unwrap();
+    let e_theirs = Escrow::new(&internal, &sh.pk, params.delta_early).unwrap();
+    let truth = SimChain::new(base);
+    let liar = SimChain::new(base);
+    let (sl_setup2, our_op2) = build_real_setup(&truth, &params, sl_pre2, base, &e_ours, &sl.sk);
+    let (sh_setup2, their_op2) =
+        build_real_setup(&truth, &params, OutPoint::new(txid_from(0xB5), 0), base, &e_theirs, &sh.sk);
+    // Both setups confirm ON TRUTH ONLY (pre-crash); the liar never syncs.
+    truth.broadcast(&sl_setup2).unwrap();
+    truth.broadcast(&sh_setup2).unwrap();
+    truth.mine();
+    let view = DualSourceChainView::new(
+        Source::new(truth.clone(), true),
+        Source::new(liar.clone(), false),
+    )
+    .unwrap();
+
+    let dest2 = e_ours.funding_script_pubkey().clone();
+    let comp2 = build_completion(&e_ours, our_op2, escrow_amt, dest2.clone(), d, params.anchor_sats).unwrap();
+    let refund2 =
+        PreArmedRefund::arm(&e_ours, our_op2, escrow_amt, &sl.sk, dest2, d, params.anchor_sats, base).unwrap();
+    let maturity = refund2.csv_maturity_height();
+    let receipt2 = confirm_watchtower_handoff(&refund2, refund2.fingerprint()).unwrap();
+    let (mut engine2, _) = SwapEngine::open(
+        wallet_dir2.path(),
+        &ModeledEnclave,
+        Box::new(ModeledKeySource::new(&ModeledEnclave)),
+        &ModeledTrustRoot,
+    )
+    .unwrap();
+    let lease2 = tempfile::tempdir().unwrap();
+    let possession2 = tempfile::tempdir().unwrap();
+    let ctx2 = make_ctx(
+        sl.sk, sh.pk, our_op2, their_op2, escrow_amt, comp2.sighash, comp2.sighash, refund2, None,
+        e_ours.merkle_root(), e_theirs.merkle_root(), e_ours.output_key_xonly(),
+        e_theirs.output_key_xonly(), lease2.path().to_path_buf(), possession2.path().to_path_buf(),
+        receipt2, sl_pre2,
+    );
+    let sid2 = SwapEngine::swap_session_id(&ctx2).unwrap();
+    let mut app2 = SwapApp::begin(&engine2, ctx2, PeerSession::new([0u8; 32], Box::new(DeadEnd)), base + 500, 0).unwrap();
+
+    // The stall is live (advisory) pre-maturity, regardless of funding order.
+    assert_eq!(app2.poll(&mut engine2, &view).unwrap(), AppTick::AwaitingVerification);
+    while truth.tip_height() < maturity {
+        truth.mine();
+    }
+    match app2.poll(&mut engine2, &view).unwrap() {
+        AppTick::Refunding(reason) => {
+            assert!(reason.contains("verification stall"), "got {reason:?}")
+        }
+        other => panic!("a record-less matured stall must be Refunding, got {other:?}"),
+    }
+    assert_eq!(
+        engine2.store().get(&sid2).unwrap().unwrap().phase,
+        SwapPhase::AbortRefund,
+        "escalation wrote the missing record and advanced it"
+    );
+}
+
 // ============================================================================
 // Early Funding record: crash between Setup broadcast and Proceed is durable.
 // ============================================================================

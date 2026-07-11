@@ -54,7 +54,18 @@
 //! unrecorded stretch is only the caller-side gap between its actual broadcast
 //! and its `setup_broadcast` call; a re-driven restart heals it (the fresh
 //! driver re-issues `BroadcastSetup`, the re-broadcast is idempotent, and
-//! `setup_broadcast` re-runs).
+//! `setup_broadcast` re-runs), and even inside that gap a pre-funding ABORT
+//! cannot mislabel: `terminate_abort` also consults the chain's authoritative
+//! funding reading, classifies funded, and writes the record it found missing.
+//!
+//! Known residual (LOW, documented — not fund-loss): a funded-classified abort
+//! whose Setup later falls out of every mempool and NEVER confirms leaves its
+//! `AbortRefund` record permanently non-terminal (the refund spends an escrow
+//! outpoint that never came to exist, so it can never confirm) and the
+//! pre-encumbrance coin `Leased` to a swap that will never settle. The coin is
+//! untouched ON-CHAIN (recoverable by rescan); retiring such a record needs
+//! either the signed Setup bytes persisted for rebroadcast (a store schema
+//! bump) or a provable-nonexistence recovery arm — tracked in RESUME.md.
 
 use bitcoin::OutPoint;
 
@@ -158,12 +169,20 @@ pub struct SwapApp {
     /// refund + escrow + G2 receipt; re-entrant (`tick` re-reads chain state).
     backstop: BackstopDriver,
     phase: AppPhase,
-    /// Whether we have signalled the caller to broadcast our Setup. Mirrors the
-    /// FundingDriver's own flag and is the discriminator for a pre-funding abort:
-    /// with our Setup on the wire our escrow is (being) funded, so an abort must
-    /// route to `Refunding` (keep the backstop guarding the refund); without it
-    /// nothing is locked, so the abort is a clean `Aborted`.
+    /// Whether we have signalled the caller to broadcast our Setup. One of the
+    /// funded-abort discriminators (see `terminate_abort` — the flag, the early
+    /// record, a store read failure, and the chain's own authoritative funding
+    /// reading all classify an abort as FUNDED; only their joint absence is a
+    /// clean "nothing locked" `Aborted`).
     our_setup_broadcast: bool,
+    /// The params snapshot taken at [`begin`](SwapApp::begin) — the SAME
+    /// manifest the FundingDriver's coordinator gates escrow amounts under, and
+    /// the value the early `Funding` record pins. Snapshotting at begin (not at
+    /// `setup_broadcast`) means a manifest bump ANYWHERE inside the swap's
+    /// lifetime trips `record_funding`'s manifest-equality check against the
+    /// store's pinned copy — a hard error, never a silent desync from the
+    /// on-chain amounts the coordinator verified.
+    params: crate::settlement::params::Params,
 }
 
 impl SwapApp {
@@ -208,11 +227,36 @@ impl SwapApp {
         let backstop = BackstopDriver::arm(tower);
 
         Ok(Self {
+            params: manifest.params().clone(),
             ctx,
             backstop,
             phase: AppPhase::Funding { driver: Box::new(driver), peer: Some(peer) },
             our_setup_broadcast: false,
         })
+    }
+
+    /// The early provisional-role `Funding` record (see the module docs' crash
+    /// story): everything a crash-recovery needs about this swap, buildable
+    /// from the ctx + the begin-time params snapshot alone. Written by
+    /// [`setup_broadcast`](SwapApp::setup_broadcast) the moment our Setup is on
+    /// the wire, and by `terminate_abort` when the CHAIN proves our escrow
+    /// funded but the record is missing (the record-less crash shape).
+    fn early_record(&self, sid: [u8; 32]) -> SwapRecord {
+        SwapRecord {
+            swap_session_id: sid,
+            // Provisional — the Proceed handoff corrects it once txids + S fix
+            // the real role (the store permits this while still `Funding`).
+            role: Role::SecretHolder,
+            phase: SwapPhase::Funding,
+            params: self.params.clone(),
+            s_height: 0,
+            sweep_escrow_height: 0,
+            our_escrow_outpoint: Some(self.ctx.our_escrow_op),
+            their_escrow_outpoint: Some(self.ctx.their_escrow_op),
+            pre_armed_refund: Some(self.ctx.pre_armed_refund.clone()),
+            completion_tx: None,
+            possession_record: None,
+        }
     }
 
     /// The counterparty-agreed funding order (who funds first), while still in
@@ -266,26 +310,12 @@ impl SwapApp {
         }
         let sid = SwapEngine::swap_session_id(&self.ctx)?;
         if engine.store().get(&sid)?.is_none() {
-            engine.store().put(&SwapRecord {
-                swap_session_id: sid,
-                // Provisional (see above) — deterministic placeholder the
-                // Proceed handoff corrects once txids + S fix the real role.
-                role: Role::SecretHolder,
-                phase: SwapPhase::Funding,
-                // Snapshot the manifest params NOW. `record_funding` at Proceed
-                // re-puts the live manifest's params; the store pins the
-                // snapshot, so a mid-swap manifest bump becomes a hard error
-                // there instead of a silent desync from the on-chain amounts
-                // the coordinator gated under the old params.
-                params: engine.manifest().current().params().clone(),
-                s_height: 0,
-                sweep_escrow_height: 0,
-                our_escrow_outpoint: Some(self.ctx.our_escrow_op),
-                their_escrow_outpoint: Some(self.ctx.their_escrow_op),
-                pre_armed_refund: Some(self.ctx.pre_armed_refund.clone()),
-                completion_tx: None,
-                possession_record: None,
-            })?;
+            // The record pins the BEGIN-time params snapshot — the same
+            // manifest the coordinator gates escrow amounts under — so any
+            // manifest bump inside the swap's lifetime becomes a hard error
+            // at `record_funding` (params-vs-pinned-record mismatch), never a
+            // silent desync from the amounts verified on chain.
+            engine.store().put(&self.early_record(sid))?;
         }
         Ok(())
     }
@@ -336,6 +366,7 @@ impl SwapApp {
                 if chain.tip_height() >= self.ctx.pre_armed_refund.csv_maturity_height() {
                     Ok(self.terminate_abort(
                         engine,
+                        chain,
                         "verification stall outlived the refund maturity; the pre-armed refund is the exit",
                     ))
                 } else {
@@ -343,7 +374,7 @@ impl SwapApp {
                 }
             }
             FundingTick::BroadcastOurSetup => Ok(AppTick::BroadcastSetup),
-            FundingTick::Abort(reason) => Ok(self.terminate_abort(engine, reason)),
+            FundingTick::Abort(reason) => Ok(self.terminate_abort(engine, chain, reason)),
             FundingTick::Proceed { .. } => self.cross_into_settlement(engine, chain),
         }
     }
@@ -442,7 +473,7 @@ impl SwapApp {
                     // A terminal refusal (sticky abort, Block-X, wrong amount,
                     // scriptPubKey mismatch): end the swap, routed by whether our
                     // escrow is locked.
-                    Error::Abort(reason) => Ok(self.terminate_abort(engine, reason)),
+                    Error::Abort(reason) => Ok(self.terminate_abort(engine, chain, reason)),
                     // A benign re-drive refusal (no go-signal yet, unverifiable
                     // counterparty escrow): keep the restored phase and re-poll.
                     _ => Ok(AppTick::Wait),
@@ -506,32 +537,65 @@ impl SwapApp {
         Ok(tick)
     }
 
-    /// Classify a pre-funding abort into a terminal: with our Setup on the wire
-    /// our escrow is (being) funded, so the pre-armed refund is the sink
-    /// (`Refunding`); otherwise nothing is locked (`Aborted`).
+    /// Classify a pre-funding abort into a terminal: with our escrow funded (or
+    /// possibly funded) the pre-armed refund is the sink (`Refunding`); only
+    /// when NOTHING indicates a locked coin is the abort a clean `Aborted`.
     ///
-    /// The discriminator is the in-memory flag OR the early record: the flag
-    /// does not survive a restart, but the record does — a record existing for
-    /// this swap means our Setup went on the wire in SOME session, so a
-    /// restarted app that aborts before the caller re-confirms its idempotent
-    /// re-broadcast still classifies as a FUNDED abort, never a clean
-    /// "nothing locked" `Aborted`.
+    /// The funded discriminator is deliberately redundant — any ONE of these
+    /// classifies as funded:
+    /// - the in-memory broadcast flag (lost on restart),
+    /// - the early `Funding` record (survives restarts, but not a crash in the
+    ///   caller-side broadcast→`setup_broadcast` gap),
+    /// - a store READ FAILURE (unknown must fail safe: a false `Refunding` on
+    ///   an unfunded swap is harmless — recovery's Funding arm yields no
+    ///   refund action and the tower needs a funding height — while a false
+    ///   `Aborted` on a funded one abandons the guard),
+    /// - the CHAIN's authoritative funding reading of our escrow (outranks
+    ///   everything: it directly observes the record-less crash shape, and it
+    ///   is what makes the `AwaitingVerification` escalation — whose
+    ///   precondition already implies both escrows are authoritatively
+    ///   confirmed — always classify as a funded abort).
     ///
-    /// A funded abort also advances the early `Funding` record to `AbortRefund`
-    /// (best-effort, mirroring `SwapEngine::abort` — the terminal classification
-    /// itself must not fail on a store hiccup; the live backstop and the G2
-    /// watchtower still guard the refund regardless), so a crash after this
-    /// terminal is re-entered by [`recover`](SwapApp::recover) as the
-    /// completion-supersedes refund decision.
-    fn terminate_abort(&mut self, engine: &SwapEngine, reason: &'static str) -> AppTick {
-        let record = SwapEngine::swap_session_id(&self.ctx)
-            .ok()
-            .and_then(|sid| engine.store().get(&sid).ok().flatten());
-        let tick = if self.our_setup_broadcast || record.is_some() {
-            if let Some(mut rec) = record {
-                if rec.phase == SwapPhase::Funding {
-                    rec.phase = SwapPhase::AbortRefund;
-                    let _ = engine.store().put(&rec);
+    /// A funded abort is also made DURABLE (best-effort, mirroring
+    /// `SwapEngine::abort` — the terminal classification itself must not fail
+    /// on a store hiccup; the live backstop and the G2 watchtower still guard
+    /// the refund regardless): if the chain proved funding but no record
+    /// exists, the early `Funding` record is written here — recover() must not
+    /// stay blind to a chain-confirmed escrow — and then advanced
+    /// `Funding → AbortRefund` so recovery drives the completion-supersedes
+    /// refund decision.
+    fn terminate_abort(
+        &mut self,
+        engine: &SwapEngine,
+        chain: &impl ChainView,
+        reason: &'static str,
+    ) -> AppTick {
+        // Three-state record read: Some / None / unreadable — an Err must
+        // never collapse into "no record" (the clean-abort arm).
+        let (sid, record, read_err) = match SwapEngine::swap_session_id(&self.ctx) {
+            Ok(sid) => match engine.store().get(&sid) {
+                Ok(rec) => (Some(sid), rec, false),
+                Err(_) => (Some(sid), None, true),
+            },
+            Err(_) => (None, None, true),
+        };
+        let chain_funded =
+            chain.authoritative_funding_height(self.ctx.our_escrow_op).is_some();
+        let funded = self.our_setup_broadcast || record.is_some() || read_err || chain_funded;
+        let tick = if funded {
+            if let Some(sid) = sid {
+                let mut rec = record;
+                if rec.is_none() && chain_funded && !read_err {
+                    let early = self.early_record(sid);
+                    if engine.store().put(&early).is_ok() {
+                        rec = Some(early);
+                    }
+                }
+                if let Some(mut rec) = rec {
+                    if rec.phase == SwapPhase::Funding {
+                        rec.phase = SwapPhase::AbortRefund;
+                        let _ = engine.store().put(&rec);
+                    }
                 }
             }
             AppTick::Refunding(reason)
