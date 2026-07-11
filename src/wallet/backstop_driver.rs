@@ -540,6 +540,7 @@ mod tests {
             their_escrow_outpoint: their_escrow,
             pre_armed_refund: None,
             completion_tx: None,
+            setup_tx: None,
             possession_record: None,
         }
     }

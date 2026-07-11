@@ -343,7 +343,7 @@ fn swap_app_runs_a_full_swap_to_completed() {
             match app.poll(&mut engine, &chain).unwrap() {
                 AppTick::BroadcastSetup => {
                     chain.broadcast(&sl_setup).expect("idempotent re-broadcast");
-                    app.setup_broadcast(&engine).unwrap();
+                    app.setup_broadcast(&engine, &sl_setup).unwrap();
                 }
                 AppTick::Wait => {}
                 AppTick::AwaitingReveal => {
@@ -455,7 +455,7 @@ fn swap_app_routes_to_refunding_when_phase_a_fails() {
         match app.poll(&mut engine, &chain).unwrap() {
             AppTick::BroadcastSetup => {
                 chain.broadcast(&sl_setup).unwrap();
-                app.setup_broadcast(&engine).unwrap();
+                app.setup_broadcast(&engine, &sl_setup).unwrap();
             }
             AppTick::Wait => {}
             AppTick::Refunding(reason) => {
@@ -600,7 +600,7 @@ fn swap_app_funded_abort_routes_to_refunding() {
     // WRONG amount → a funded abort → Refunding.
     assert_eq!(app.poll(&mut engine, &chain).unwrap(), AppTick::BroadcastSetup);
     chain.broadcast(&sl_setup).unwrap();
-    app.setup_broadcast(&engine).unwrap();
+    app.setup_broadcast(&engine, &sl_setup).unwrap();
     // The early Funding record is durable the moment our Setup is on the wire.
     assert_eq!(
         engine.store().get(&sid).unwrap().unwrap().phase,
@@ -723,7 +723,7 @@ fn awaiting_verification_escalates_to_refund_at_maturity() {
     // Fund both escrows ON TRUTH ONLY — the stall premise.
     assert_eq!(app.poll(&mut engine, &view).unwrap(), AppTick::BroadcastSetup);
     truth.broadcast(&sl_setup).unwrap();
-    app.setup_broadcast(&engine).unwrap();
+    app.setup_broadcast(&engine, &sl_setup).unwrap();
     truth.broadcast(&sh_setup).unwrap();
     truth.mine();
 
@@ -1003,13 +1003,13 @@ fn early_funding_record_survives_crash_and_recovers() {
     // Broadcast our Setup; the early record lands the moment we confirm it.
     assert_eq!(app.poll(&mut engine, &chain).unwrap(), AppTick::BroadcastSetup);
     chain.broadcast(&sl_setup).unwrap();
-    app.setup_broadcast(&engine).unwrap();
+    app.setup_broadcast(&engine, &sl_setup).unwrap();
     let rec = engine.store().get(&sid).unwrap().expect("early record persisted");
     assert_eq!(rec.phase, SwapPhase::Funding);
     assert_eq!(rec.our_escrow_outpoint, Some(our_op));
     assert!(rec.pre_armed_refund.is_some(), "G2: the refund rides in the early record");
     // Idempotent re-confirm (a restarted caller re-broadcasting).
-    app.setup_broadcast(&engine).unwrap();
+    app.setup_broadcast(&engine, &sl_setup).unwrap();
 
     chain.mine(); // our escrow confirms; counterparty never funds
 
@@ -1163,6 +1163,7 @@ fn swap_app_backstop_tick_is_idle_pre_record_then_delegates() {
         their_escrow_outpoint: Some(e_sl),
         pre_armed_refund: Some(refund.clone()),
         completion_tx,
+        setup_tx: None,
         possession_record: None,
     };
     engine.store().put(&rec(SwapPhase::Funding, None)).unwrap();
@@ -1225,6 +1226,7 @@ fn swap_app_recover_delegates_to_recovery_driver() {
         their_escrow_outpoint: Some(OutPoint::new(txid_from(0x91), 0)),
         pre_armed_refund: Some(refund.clone()),
         completion_tx: None,
+        setup_tx: None,
         possession_record: None,
     };
     engine.store().put(&rec(SwapPhase::Funding)).unwrap();

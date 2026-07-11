@@ -148,6 +148,7 @@ fn sl_crash_in_g1_window_recovers_from_store_and_claims() {
         their_escrow_outpoint: Some(op_comp_sl),
         pre_armed_refund: Some(sl_refund.clone()),
         completion_tx: None,
+        setup_tx: None,
         possession_record: None,
     };
     store.put(&rec).unwrap();
@@ -310,6 +311,7 @@ fn crash_mid_signing_reclaims_via_persisted_refund() {
             their_escrow_outpoint: Some(op_theirs),
             pre_armed_refund: Some(refund),
             completion_tx: None,
+            setup_tx: None,
             possession_record: None,
         };
         store.put(&rec).unwrap();

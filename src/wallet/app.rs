@@ -58,14 +58,19 @@
 //! cannot mislabel: `terminate_abort` also consults the chain's authoritative
 //! funding reading, classifies funded, and writes the record it found missing.
 //!
-//! Known residual (LOW, documented — not fund-loss): a funded-classified abort
-//! whose Setup later falls out of every mempool and NEVER confirms leaves its
+//! Never-confirming-Setup handling: a funded-classified abort whose Setup later
+//! falls out of every mempool and NEVER confirms would otherwise leave its
 //! `AbortRefund` record permanently non-terminal (the refund spends an escrow
-//! outpoint that never came to exist, so it can never confirm) and the
-//! pre-encumbrance coin `Leased` to a swap that will never settle. The coin is
-//! untouched ON-CHAIN (recoverable by rescan); retiring such a record needs
-//! either the signed Setup bytes persisted for rebroadcast (a store schema
-//! bump) or a provable-nonexistence recovery arm — tracked in RESUME.md.
+//! outpoint that never came to exist, so it can never confirm) with the
+//! pre-encumbrance coin `Leased` to a swap that can never settle. This is now
+//! retired for the common case: [`setup_broadcast`](SwapApp::setup_broadcast)
+//! persists the signed Setup bytes (record `setup_tx`, store v4), and
+//! [`RecoveryDriver`] re-submits them idempotently whenever our escrow is still
+//! unconfirmed — so the escrow confirms and the ordinary refund path becomes
+//! reachable. The only remaining residual is the record-less crash shape (a
+//! crash in the caller-side broadcast→`setup_broadcast` gap on a swap the fresh
+//! instance never re-drives): no bytes were captured, so there is nothing to
+//! re-submit and a rescan of the untouched-on-chain coin is the fallback.
 
 use bitcoin::OutPoint;
 
@@ -205,6 +210,13 @@ pub struct SwapApp {
     /// reading all classify an abort as FUNDED; only their joint absence is a
     /// clean "nothing locked" `Aborted`).
     our_setup_broadcast: bool,
+    /// The signed Setup bytes the caller handed to
+    /// [`setup_broadcast`](SwapApp::setup_broadcast) — persisted into the early
+    /// `Funding`/`AbortRefund` record so recovery can idempotently re-submit a
+    /// Setup that fell out of every mempool and never confirmed (the
+    /// never-confirming-Setup residual). `None` until `setup_broadcast` runs on
+    /// THIS instance.
+    our_setup_tx: Option<Vec<u8>>,
     /// The params snapshot taken at [`begin`](SwapApp::begin) — the SAME
     /// manifest the FundingDriver's coordinator gates escrow amounts under, and
     /// the value the early `Funding` record pins. Snapshotting at begin (not at
@@ -262,6 +274,7 @@ impl SwapApp {
             backstop,
             phase: AppPhase::Funding { driver: Box::new(driver), peer: Some(peer) },
             our_setup_broadcast: false,
+            our_setup_tx: None,
         })
     }
 
@@ -285,6 +298,12 @@ impl SwapApp {
             their_escrow_outpoint: Some(self.ctx.their_escrow_op),
             pre_armed_refund: Some(self.ctx.pre_armed_refund.clone()),
             completion_tx: None,
+            // The signed Setup bytes the caller broadcast (Some once
+            // `setup_broadcast` has run on THIS instance; None for the
+            // record-less crash shape, where a fresh instance never saw them).
+            // Lets recovery re-submit a Setup that fell out of every mempool and
+            // never confirmed instead of stranding the swap forever.
+            setup_tx: self.our_setup_tx.clone(),
             possession_record: None,
         }
     }
@@ -322,6 +341,12 @@ impl SwapApp {
     /// here; the store permits correcting it while the record is still
     /// `Funding`, and the `Proceed` handoff re-persists the derived role.
     ///
+    /// `setup_tx` is the fully-signed Setup the caller just put on the wire.
+    /// It is persisted into the early record (`setup_tx` field) so recovery can
+    /// idempotently re-submit it if it falls out of every mempool and never
+    /// confirms — retiring the never-confirming-Setup residual instead of
+    /// stranding a permanently non-terminal `AbortRefund`.
+    ///
     /// Idempotent: an existing record is left untouched (a restarted caller
     /// re-confirming its idempotent re-broadcast), and an `Err` from the store
     /// is retryable by calling this again. Call this IMMEDIATELY after the
@@ -330,10 +355,11 @@ impl SwapApp {
     /// re-issues `BroadcastSetup` → re-broadcast is idempotent → this re-runs).
     ///
     /// No-op outside the pre-funding phase.
-    pub fn setup_broadcast(&mut self, engine: &SwapEngine) -> Result<()> {
+    pub fn setup_broadcast(&mut self, engine: &SwapEngine, setup_tx: &[u8]) -> Result<()> {
         match &mut self.phase {
             AppPhase::Funding { driver, .. } => {
                 self.our_setup_broadcast = true;
+                self.our_setup_tx = Some(setup_tx.to_vec());
                 driver.setup_broadcast();
             }
             _ => return Ok(()),

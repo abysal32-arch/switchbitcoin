@@ -226,6 +226,17 @@ pub struct SwapRecord {
     /// fresh process can rebroadcast/babysit it. Required at `Completing`.
     /// Write-once.
     pub completion_tx: Option<Vec<u8>>,
+    /// The signed Setup tx WE broadcast (spends the pre-encumbrance coin into
+    /// our escrow), persisted at `setup_broadcast` so recovery can idempotently
+    /// re-submit it if it fell out of every mempool and never confirmed — the
+    /// stranded never-confirming-Setup residual (a permanently non-terminal
+    /// `AbortRefund` whose refund spends an escrow outpoint that never came to
+    /// exist). Present ONLY while pre-`Proceed` (`Funding`/`AbortRefund`): the
+    /// funding handoff clears it once both escrows confirm, since a confirmed
+    /// escrow's Setup can never need re-broadcast. NOT write-once (it is cleared
+    /// at the handoff) but it may never be SWAPPED to a different tx — see
+    /// `check_against` — so recovery's rebroadcast can never be redirected.
+    pub setup_tx: Option<Vec<u8>>,
     /// SL only: path of the sealed possession record (G1 artifact) that
     /// `Possessing::restore_secret_learner` rebuilds from. REGISTERED AT
     /// `put(Signing)` TIME (the path is deterministic before the file
@@ -298,6 +309,9 @@ impl SwapRecord {
         if self.completion_tx.as_ref().is_some_and(|t| t.is_empty()) {
             return Err(Error::Validation("completion tx must not be empty"));
         }
+        if self.setup_tx.as_ref().is_some_and(|t| t.is_empty()) {
+            return Err(Error::Validation("setup tx must not be empty"));
+        }
         // Reject paths that cannot round-trip losslessly through UTF-8.
         if let Some(p) = &self.possession_record {
             if p.to_str().is_none() {
@@ -361,6 +375,17 @@ impl SwapRecord {
             &existing.completion_tx,
             "completion tx is write-once",
         )?;
+        // setup_tx is a rebroadcast aid, not a money-bearing artifact: it is
+        // ADDED at setup_broadcast and CLEARED once funding confirms (the
+        // funding handoff writes None), so — unlike the write-once fields above
+        // — a None-over-Some transition is legal. But it can NEVER be swapped to
+        // a DIFFERENT tx: a same-platform-key rewrite must not be able to
+        // redirect recovery's idempotent Setup re-submission at a foreign tx.
+        if let (Some(o), Some(n)) = (&existing.setup_tx, &self.setup_tx) {
+            if o != n {
+                return Err(Error::Ordering("setup tx cannot be swapped to a different tx"));
+            }
+        }
         // PreArmedRefund has no PartialEq; a refund is armed exactly once,
         // so pin by fingerprint.
         match (&existing.pre_armed_refund, &self.pre_armed_refund) {
@@ -385,24 +410,26 @@ impl SwapRecord {
         Ok(())
     }
 
-    // ---- serialization (record format v3, all integers LE) ----
+    // ---- serialization (record format v4, all integers LE) ----
     //
-    // [1 version=3][32 swap_session_id][1 role][1 phase]
+    // [1 version=4][32 swap_session_id][1 role][1 phase]
     // [60 params: tier(8) fee(8) anchor(8) setup_fee(8) early(4) margin(4)
     //             buffer(4) allowance(4) cofund(4) onboard_lo(4) onboard_hi(4)]
     // [4 s_height][4 sweep_escrow_height][1 flags]
-    // (v3 added the scheme-(a) fee components; v2 records are rejected —
-    // no deployed data predates this.)
+    // (v3 added the scheme-(a) fee components; v4 added the optional setup_tx
+    // for the never-confirming-Setup recovery arm. Earlier versions are
+    // rejected — no deployed data predates this.)
     // flags bit0: our_outpoint    -> [32 txid][4 vout]
     // flags bit1: their_outpoint  -> [32 txid][4 vout]
     // flags bit2: refund          -> [4 csv_maturity][4 len][len tx bytes]
     // flags bit3: possession path -> [4 len][len utf8]
     // flags bit4: completion tx   -> [4 len][len tx bytes]
+    // flags bit5: setup tx        -> [4 len][len tx bytes]
     // Fixed field order, no extension/blob field.
 
     fn to_bytes(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(256);
-        v.push(3u8);
+        v.push(4u8);
         v.extend_from_slice(&self.swap_session_id);
         v.push(match self.role {
             Role::SecretHolder => 0,
@@ -438,6 +465,9 @@ impl SwapRecord {
         if self.completion_tx.is_some() {
             flags |= 16;
         }
+        if self.setup_tx.is_some() {
+            flags |= 32;
+        }
         v.push(flags);
         for op in [&self.our_escrow_outpoint, &self.their_escrow_outpoint]
             .into_iter()
@@ -461,6 +491,10 @@ impl SwapRecord {
             v.extend_from_slice(&(t.len() as u32).to_le_bytes());
             v.extend_from_slice(t);
         }
+        if let Some(t) = &self.setup_tx {
+            v.extend_from_slice(&(t.len() as u32).to_le_bytes());
+            v.extend_from_slice(t);
+        }
         v
     }
 
@@ -470,7 +504,7 @@ impl SwapRecord {
     fn from_bytes(b: &[u8]) -> Result<SwapRecord> {
         let mut at = 0usize;
         let version = take_arr::<1>(b, &mut at)?[0];
-        if version != 3 {
+        if version != 4 {
             return Err(Error::Validation("swap record: unknown version"));
         }
         let swap_session_id = take_arr::<32>(b, &mut at)?;
@@ -495,7 +529,7 @@ impl SwapRecord {
         let s_height = take_le_u32(b, &mut at)?;
         let sweep_escrow_height = take_le_u32(b, &mut at)?;
         let flags = take_arr::<1>(b, &mut at)?[0];
-        if flags & !0x1f != 0 {
+        if flags & !0x3f != 0 {
             return Err(Error::Validation("swap record: unknown flag bits"));
         }
         let mut outpoint = |set: bool| -> Result<Option<OutPoint>> {
@@ -528,6 +562,11 @@ impl SwapRecord {
         } else {
             None
         };
+        let setup_tx = if flags & 32 != 0 {
+            Some(take_len_prefixed(b, &mut at, "setup")?)
+        } else {
+            None
+        };
         if at != b.len() {
             return Err(Error::Validation("swap record: trailing bytes"));
         }
@@ -542,6 +581,7 @@ impl SwapRecord {
             their_escrow_outpoint,
             pre_armed_refund,
             completion_tx,
+            setup_tx,
             possession_record,
         };
         // Loaded records must satisfy the same structural invariants as
@@ -874,6 +914,7 @@ fn take_len_prefixed(b: &[u8], at: &mut usize, what: &'static str) -> Result<Vec
     let s = b.get(*at..end).ok_or(match what {
         "refund" => Error::Validation("swap record truncated (refund)"),
         "path" => Error::Validation("swap record truncated (path)"),
+        "setup" => Error::Validation("swap record truncated (setup)"),
         _ => Error::Validation("swap record truncated (completion)"),
     })?;
     *at = end;
@@ -914,6 +955,7 @@ mod tests {
             their_escrow_outpoint: Some(outpoint(2)),
             pre_armed_refund: Some(refund()),
             completion_tx: None,
+            setup_tx: None,
             possession_record: Some(PathBuf::from("possession/never-written")),
         }
     }
@@ -943,6 +985,7 @@ mod tests {
 
         let mut rec = base_record(7, SwapPhase::Funding);
         rec.completion_tx = Some(vec![0xcd; 80]);
+        rec.setup_tx = Some(vec![0x5e; 120]);
         store.put(&rec).expect("put");
 
         let got = store.get(&sid(7)).expect("get").expect("present");
@@ -963,6 +1006,7 @@ mod tests {
             rec.pre_armed_refund.as_ref().unwrap().csv_maturity_height()
         );
         assert_eq!(got.completion_tx, rec.completion_tx);
+        assert_eq!(got.setup_tx, rec.setup_tx);
         assert_eq!(got.possession_record, rec.possession_record);
         let (recs, failed) = store.list().unwrap();
         assert_eq!(recs.len(), 1);
@@ -1208,6 +1252,52 @@ mod tests {
         let mut re_s = rec.clone();
         re_s.s_height += 1;
         assert!(matches!(store.put(&re_s).unwrap_err(), Error::Ordering(_)));
+    }
+
+    /// setup_tx is the ONE non-write-once payload: it may be ADDED at
+    /// setup_broadcast and CLEARED at the funding handoff (None-over-Some), but
+    /// never SWAPPED to a different tx — so recovery's idempotent Setup
+    /// re-submission can never be redirected by a same-key rewrite.
+    #[test]
+    fn setup_tx_is_addable_clearable_but_never_swapped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = open_store(dir.path());
+
+        // Add at Funding.
+        let mut rec = base_record(22, SwapPhase::Funding);
+        rec.setup_tx = Some(vec![0x5e; 64]);
+        store.put(&rec).unwrap();
+        assert_eq!(store.get(&sid(22)).unwrap().unwrap().setup_tx, Some(vec![0x5e; 64]));
+
+        // Swapping to a DIFFERENT tx is refused (would redirect recovery).
+        let mut swapped = rec.clone();
+        swapped.setup_tx = Some(vec![0x11; 64]);
+        assert!(
+            matches!(store.put(&swapped).unwrap_err(), Error::Ordering(_)),
+            "setup_tx must not be swappable to a different tx"
+        );
+
+        // Re-putting the SAME bytes is fine (idempotent).
+        store.put(&rec).unwrap();
+
+        // Clearing to None (the funding handoff) is allowed…
+        let mut cleared = rec.clone();
+        cleared.setup_tx = None;
+        store.put(&cleared).unwrap();
+        assert_eq!(store.get(&sid(22)).unwrap().unwrap().setup_tx, None);
+
+        // …and once cleared, a fresh Setup value can be re-added (None-over-None
+        // and None-old are both unconstrained — the swap-guard only bites
+        // Some→different-Some).
+        let mut readd = cleared.clone();
+        readd.setup_tx = Some(vec![0x22; 64]);
+        store.put(&readd).unwrap();
+        assert_eq!(store.get(&sid(22)).unwrap().unwrap().setup_tx, Some(vec![0x22; 64]));
+
+        // Empty setup bytes are rejected structurally (like an empty completion).
+        let mut empty = readd.clone();
+        empty.setup_tx = Some(vec![]);
+        assert!(matches!(store.put(&empty).unwrap_err(), Error::Validation(_)));
     }
 
     /// The provisional-role rule: role is CORRECTABLE while the on-disk record

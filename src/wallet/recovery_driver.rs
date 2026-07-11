@@ -86,6 +86,14 @@ pub enum RecoveryTick {
     /// record with G1 possession whose reveal is already observable EXECUTES
     /// the take-the-swap arm instead, surfacing as [`Extract`](Self::Extract)).
     Refund(AbortAction),
+    /// The never-confirming-Setup recovery arm (store v4 `setup_tx`): our
+    /// escrow's Setup was broadcast and persisted but fell out of every mempool
+    /// without ever confirming, so the record is non-terminal with no reachable
+    /// exit (the pre-armed refund spends an escrow outpoint that never came to
+    /// exist). Re-submit the persisted signed Setup — idempotent — so the escrow
+    /// can confirm and the ordinary refund/settlement path becomes reachable
+    /// instead of stranding. The caller performs the broadcast (engine boundary).
+    RebroadcastSetup { setup_tx: Vec<u8> },
 }
 
 /// The result of a whole-store recovery scan: one `(swap_session_id, tick)`
@@ -202,7 +210,39 @@ impl RecoveryDriver {
                 }
             }
         }
+        // Never-confirming-Setup arm: a pre-funding abort whose Setup never
+        // confirmed has no reachable exit (the refund spends an outpoint that
+        // never came to exist). Re-submit the persisted Setup so the escrow can
+        // confirm and the refund below becomes reachable. Ranks ABOVE the refund
+        // decision precisely because the refund is unbroadcastable until then.
+        if let Some(tick) = Self::rebroadcast_setup_if_unconfirmed(rec, chain) {
+            return Ok(tick);
+        }
         Ok(RecoveryTick::Refund(Self::abort_action(rec, chain)?))
+    }
+
+    /// The never-confirming-Setup recovery arm: if our escrow is NOT yet
+    /// confirmed on chain and we persisted the signed Setup bytes (store v4),
+    /// re-submit them (idempotent) so the escrow can confirm. Returns `None`
+    /// (fall through to the normal per-phase decision) when the escrow is
+    /// already confirmed or no Setup was retained (the record-less crash shape).
+    ///
+    /// The confirmation read is the AUTHORITATIVE (self-verifying) source, not
+    /// the agreement-required `funding_height`: a lying source that hides a real
+    /// confirmation must not be able to force a needless re-submission (or, when
+    /// the escrow genuinely confirmed on truth alone, keep us from the ordinary
+    /// refund path). Same reasoning as `terminate_abort`'s funded discriminator.
+    fn rebroadcast_setup_if_unconfirmed(
+        rec: &SwapRecord,
+        chain: &dyn AuthoritativeChainView,
+    ) -> Option<RecoveryTick> {
+        let escrow = rec.our_escrow_outpoint?;
+        let setup_tx = rec.setup_tx.as_ref()?;
+        // Confirmed already ⇒ nothing to re-submit (the ordinary paths apply).
+        if chain.authoritative_funding_height(escrow).is_some() {
+            return None;
+        }
+        Some(RecoveryTick::RebroadcastSetup { setup_tx: setup_tx.clone() })
     }
 
     /// Restore the SL possession record and complete the claim from an observed
@@ -236,12 +276,27 @@ impl RecoveryDriver {
     /// refund is the exit (a stuck funding still unwinds safely); otherwise
     /// nothing is locked and resuming needs a fresh driver + transport.
     fn reenter_funding(rec: &SwapRecord, chain: &dyn AuthoritativeChainView) -> Result<RecoveryTick> {
+        // AUTHORITATIVE read (matching the rebroadcast arm below, `terminate_abort`,
+        // and this module's stated intent): a lying source that HIDES a real
+        // confirmation must not be able to suppress our standing pre-armed refund.
+        // On the agreement-required `funding_height` a single untrusted explorer
+        // disagreeing would collapse a genuinely-funded escrow to `None` and
+        // report "nothing locked", leaving the automatic refund unsurfaced.
         let refund = match rec.our_escrow_outpoint {
-            Some(escrow) if chain.funding_height(escrow).is_some() => {
+            Some(escrow) if chain.authoritative_funding_height(escrow).is_some() => {
                 Some(Self::abort_action(rec, chain)?)
             }
             _ => None,
         };
+        // Escrow not confirmed: if the persisted Setup exists but never
+        // confirmed, re-submit it (idempotent) rather than reporting a bare
+        // "nothing locked" that needs a fresh driver — the same
+        // never-confirming-Setup arm the `AbortRefund` path uses.
+        if refund.is_none() {
+            if let Some(tick) = Self::rebroadcast_setup_if_unconfirmed(rec, chain) {
+                return Ok(tick);
+            }
+        }
         Ok(RecoveryTick::Funding { refund })
     }
 

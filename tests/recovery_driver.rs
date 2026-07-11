@@ -7,7 +7,7 @@
 //! funding-phase swap whose transport is gone.
 
 use bitcoin::{OutPoint, Txid};
-use swapkey::chain::{ChainView, SimChain, SpendStatus};
+use swapkey::chain::{ChainView, DualSourceChainView, SimChain, Source, SpendStatus};
 use swapkey::crypto::adaptor::AdaptorSecret;
 use swapkey::crypto::ValidatedPoint;
 use swapkey::settlement::params::Params;
@@ -16,6 +16,7 @@ use swapkey::settlement::state_machine::{
     swap_session_id, ExchangeInputs, Funding, PeerSession, Role, Transport,
 };
 use swapkey::tx::escrow::Escrow;
+use swapkey::tx::setup::build_setup;
 use swapkey::tx::txbuild::{build_completion, finalize_key_spend, SpendTx};
 use swapkey::wallet::orchestrator::AbortAction;
 use swapkey::wallet::{
@@ -147,6 +148,7 @@ fn released_swap() -> ReleasedSwap {
         their_escrow_outpoint: Some(op_comp_sl),
         pre_armed_refund: Some(sl_refund.clone()),
         completion_tx: None,
+        setup_tx: None,
         possession_record: None,
     };
     store.put(&rec).unwrap();
@@ -395,6 +397,7 @@ fn abort_and_funding_records_route_correctly() {
         their_escrow_outpoint: Some(OutPoint::new(txid_from(0x99), 0)),
         pre_armed_refund: escrow.map(|_| refund.clone()),
         completion_tx: None,
+        setup_tx: None,
         possession_record: None,
     };
 
@@ -443,6 +446,276 @@ fn abort_and_funding_records_route_correctly() {
     assert_eq!(ticks.len(), 3, "three records scanned");
     assert!(ticks.iter().any(|(sid, t)| *sid == sid_abort && matches!(t, RecoveryTick::Refund(_))));
     assert!(ticks.iter().any(|(sid, t)| *sid == sid_unfunded && matches!(t, RecoveryTick::Funding { refund: None })));
+}
+
+/// Task 1 (never-confirming-Setup residual): a pre-funding abort whose Setup was
+/// broadcast + persisted (store v4 `setup_tx`) but fell out of every mempool and
+/// NEVER confirmed leaves an `AbortRefund` whose pre-armed refund spends an
+/// escrow outpoint that never came to exist — permanently non-terminal. Recovery
+/// must RE-SUBMIT the persisted Setup (idempotent) so the escrow confirms and the
+/// ordinary refund path becomes reachable, instead of stranding.
+#[test]
+fn never_confirming_setup_is_rebroadcast_until_the_escrow_confirms() {
+    let params = Params::testnet_provisional();
+    let s_height = 640_000u32;
+    let escrow_amt = params.escrow_amount_sats();
+    let d = params.tier_d_sats;
+
+    let a = keypair();
+    let b = keypair();
+    let internal = swapkey::settlement::state_machine::canonical_internal_key(a.pk, b.pk).unwrap();
+    let escrow = Escrow::new(&internal, &a.pk, params.delta_early).unwrap();
+
+    // A funded pre-encumbrance coin + the REAL signed Setup that spends it into
+    // our escrow. The Setup is NOT broadcast here — it "fell out of the mempool".
+    let chain = SimChain::new(s_height);
+    let pre_op = OutPoint::new(txid_from(0x50), 0);
+    chain.fund_with_amount(pre_op, s_height, params.pre_encumbrance_sats());
+    let (setup_bytes, our_escrow) = build_setup(
+        pre_op,
+        params.pre_encumbrance_sats(),
+        escrow_amt,
+        params.anchor_sats,
+        &escrow,
+        &a.sk,
+    )
+    .unwrap();
+
+    // The escrow does not yet exist on chain (the Setup never confirmed).
+    assert!(chain.funding_height(our_escrow).is_none());
+
+    let dest = escrow.funding_script_pubkey().clone();
+    let refund = PreArmedRefund::arm(
+        &escrow, our_escrow, escrow_amt, &a.sk, dest, d, params.anchor_sats, s_height,
+    )
+    .unwrap();
+
+    // Persist the pre-funding abort record carrying the Setup bytes (Funding ->
+    // AbortRefund, exactly as SwapApp::terminate_abort advances the early record).
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _) = SwapStore::open(dir.path(), &ModeledEnclave).unwrap();
+    let sid = [0x5au8; 32];
+    let mut rec = SwapRecord {
+        swap_session_id: sid,
+        role: Role::SecretHolder,
+        phase: SwapPhase::Funding,
+        params: params.clone(),
+        s_height: 0,
+        sweep_escrow_height: 0,
+        our_escrow_outpoint: Some(our_escrow),
+        their_escrow_outpoint: Some(OutPoint::new(txid_from(0x51), 0)),
+        pre_armed_refund: Some(refund.clone()),
+        completion_tx: None,
+        setup_tx: Some(setup_bytes.clone()),
+        possession_record: None,
+    };
+    store.put(&rec).unwrap();
+    rec.phase = SwapPhase::AbortRefund;
+    store.put(&rec).unwrap();
+
+    // Recovery on the stranded record: the escrow is unconfirmed and the Setup
+    // is retained, so re-submit it rather than stranding on an unbroadcastable
+    // refund.
+    match RecoveryDriver::reenter_one(&store, &store.get(&sid).unwrap().unwrap(), &chain).unwrap() {
+        RecoveryTick::RebroadcastSetup { setup_tx } => {
+            assert_eq!(setup_tx, setup_bytes, "recovery hands back the persisted Setup");
+            // The caller performs the broadcast (engine boundary).
+            chain.broadcast(&setup_tx).expect("the evicted Setup re-enters the mempool");
+        }
+        other => panic!("a never-confirming Setup must be rebroadcast, got {other:?}"),
+    }
+
+    // Mine: the escrow now confirms, so the record is no longer stranded — the
+    // ordinary refund decision is reachable (immature => Wait).
+    chain.mine();
+    assert!(chain.funding_height(our_escrow).is_some(), "the escrow confirmed");
+    match RecoveryDriver::reenter_one(&store, &store.get(&sid).unwrap().unwrap(), &chain).unwrap() {
+        RecoveryTick::Refund(AbortAction::Wait) => {}
+        other => panic!("a confirmed escrow's abort must reach the refund path, got {other:?}"),
+    }
+
+    // And once the CSV matures, that refund is broadcastable (the exit exists).
+    while chain.tip_height() < refund.csv_maturity_height() {
+        chain.mine();
+    }
+    match RecoveryDriver::reenter_one(&store, &store.get(&sid).unwrap().unwrap(), &chain).unwrap() {
+        RecoveryTick::Refund(AbortAction::BroadcastRefund) => {}
+        other => panic!("matured refund must be broadcastable now the escrow exists, got {other:?}"),
+    }
+}
+
+/// Task 1 (review finding 2): the never-confirming-Setup arm also fires from the
+/// FUNDING phase — a crash during the ordinary funding wait (before any abort is
+/// classified) leaves a Funding record carrying setup_tx over an unconfirmed
+/// escrow, which must re-submit the Setup rather than report "nothing locked".
+#[test]
+fn funding_phase_never_confirming_setup_is_rebroadcast() {
+    let params = Params::testnet_provisional();
+    let s_height = 645_000u32;
+    let escrow_amt = params.escrow_amount_sats();
+    let d = params.tier_d_sats;
+
+    let a = keypair();
+    let b = keypair();
+    let internal = swapkey::settlement::state_machine::canonical_internal_key(a.pk, b.pk).unwrap();
+    let escrow = Escrow::new(&internal, &a.pk, params.delta_early).unwrap();
+    let chain = SimChain::new(s_height);
+    let pre_op = OutPoint::new(txid_from(0x52), 0);
+    chain.fund_with_amount(pre_op, s_height, params.pre_encumbrance_sats());
+    let (setup_bytes, our_escrow) = build_setup(
+        pre_op, params.pre_encumbrance_sats(), escrow_amt, params.anchor_sats, &escrow, &a.sk,
+    )
+    .unwrap();
+    let dest = escrow.funding_script_pubkey().clone();
+    let refund = PreArmedRefund::arm(
+        &escrow, our_escrow, escrow_amt, &a.sk, dest, d, params.anchor_sats, s_height,
+    )
+    .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _) = SwapStore::open(dir.path(), &ModeledEnclave).unwrap();
+    let sid = [0x52u8; 32];
+    // Funding phase (NOT advanced to AbortRefund): the ordinary post-Setup crash.
+    let rec = SwapRecord {
+        swap_session_id: sid,
+        role: Role::SecretHolder,
+        phase: SwapPhase::Funding,
+        params: params.clone(),
+        s_height: 0,
+        sweep_escrow_height: 0,
+        our_escrow_outpoint: Some(our_escrow),
+        their_escrow_outpoint: Some(OutPoint::new(txid_from(0x53), 0)),
+        pre_armed_refund: Some(refund.clone()),
+        completion_tx: None,
+        setup_tx: Some(setup_bytes.clone()),
+        possession_record: None,
+    };
+    store.put(&rec).unwrap();
+
+    // Escrow unconfirmed + Setup retained ⇒ re-submit rather than "nothing locked".
+    match RecoveryDriver::reenter_one(&store, &store.get(&sid).unwrap().unwrap(), &chain).unwrap() {
+        RecoveryTick::RebroadcastSetup { setup_tx } => {
+            assert_eq!(setup_tx, setup_bytes);
+            chain.broadcast(&setup_tx).expect("the evicted Setup re-enters the mempool");
+        }
+        other => panic!("a funding-phase never-confirming Setup must rebroadcast, got {other:?}"),
+    }
+    chain.mine();
+    // Confirmed now ⇒ the ordinary funded-Funding surface (standing refund).
+    match RecoveryDriver::reenter_one(&store, &store.get(&sid).unwrap().unwrap(), &chain).unwrap() {
+        RecoveryTick::Funding { refund: Some(AbortAction::Wait) } => {}
+        other => panic!("a confirmed funding escrow must surface its refund, got {other:?}"),
+    }
+}
+
+/// Task 1 (review findings 1 + 3): recovery reads the AUTHORITATIVE confirmation,
+/// not the agreement view, for BOTH the rebroadcast arm and the Funding refund
+/// gate. A lying untrusted source that HIDES a real confirmation must neither
+/// force a needless re-submission nor suppress the standing pre-armed refund; a
+/// source that FABRICATES a confirmation it cannot verify must not skip the
+/// re-submission.
+#[test]
+fn recovery_setup_arm_uses_the_authoritative_confirmation_read() {
+    let params = Params::testnet_provisional();
+    let s_height = 646_000u32;
+    let escrow_amt = params.escrow_amount_sats();
+    let d = params.tier_d_sats;
+
+    let a = keypair();
+    let b = keypair();
+    let internal = swapkey::settlement::state_machine::canonical_internal_key(a.pk, b.pk).unwrap();
+    let escrow = Escrow::new(&internal, &a.pk, params.delta_early).unwrap();
+    let dest = escrow.funding_script_pubkey().clone();
+
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _) = SwapStore::open(dir.path(), &ModeledEnclave).unwrap();
+
+    // ---- (i) truth confirms the escrow; the untrusted source HIDES it. ----
+    let truth = SimChain::new(s_height);
+    let liar = SimChain::new(s_height);
+    let pre_op = OutPoint::new(txid_from(0x54), 0);
+    truth.fund_with_amount(pre_op, s_height, params.pre_encumbrance_sats());
+    let (setup_bytes, our_escrow) = build_setup(
+        pre_op, params.pre_encumbrance_sats(), escrow_amt, params.anchor_sats, &escrow, &a.sk,
+    )
+    .unwrap();
+    let refund = PreArmedRefund::arm(
+        &escrow, our_escrow, escrow_amt, &a.sk, dest.clone(), d, params.anchor_sats, s_height,
+    )
+    .unwrap();
+    let sid = [0x54u8; 32];
+    let rec = SwapRecord {
+        swap_session_id: sid,
+        role: Role::SecretHolder,
+        phase: SwapPhase::Funding,
+        params: params.clone(),
+        s_height: 0,
+        sweep_escrow_height: 0,
+        our_escrow_outpoint: Some(our_escrow),
+        their_escrow_outpoint: Some(OutPoint::new(txid_from(0x55), 0)),
+        pre_armed_refund: Some(refund.clone()),
+        completion_tx: None,
+        setup_tx: Some(setup_bytes.clone()),
+        possession_record: None,
+    };
+    store.put(&rec).unwrap();
+
+    // The Setup genuinely confirmed on the self-verifying source; the liar never
+    // saw it, so the AGREEMENT view disagrees and reads unconfirmed.
+    truth.broadcast(&setup_bytes).unwrap();
+    truth.mine();
+    let hide = DualSourceChainView::new(
+        Source::self_verifying(truth.clone()),
+        Source::untrusted(liar.clone()),
+    )
+    .unwrap();
+    assert!(hide.funding_height(our_escrow).is_none(), "the agreement view sees the disagreement");
+    // Authoritative = confirmed ⇒ surface the refund, do NOT re-submit.
+    match RecoveryDriver::reenter_one(&store, &store.get(&sid).unwrap().unwrap(), &hide).unwrap() {
+        RecoveryTick::Funding { refund: Some(AbortAction::Wait) } => {}
+        other => panic!("a truth-confirmed escrow hidden by a liar must surface the refund, got {other:?}"),
+    }
+
+    // ---- (ii) an untrusted source FABRICATES a confirmation truth lacks. ----
+    let truth2 = SimChain::new(s_height);
+    let liar2 = SimChain::new(s_height);
+    let fresh_pre = OutPoint::new(txid_from(0x56), 0);
+    let (setup2, our_escrow2) = build_setup(
+        fresh_pre, params.pre_encumbrance_sats(), escrow_amt, params.anchor_sats, &escrow, &a.sk,
+    )
+    .unwrap();
+    // Only the liar "confirms" the escrow; the self-verifying source never saw it.
+    liar2.fund_with_amount(our_escrow2, s_height, escrow_amt);
+    let refund2 = PreArmedRefund::arm(
+        &escrow, our_escrow2, escrow_amt, &a.sk, dest, d, params.anchor_sats, s_height,
+    )
+    .unwrap();
+    let sid2 = [0x56u8; 32];
+    let rec2 = SwapRecord {
+        swap_session_id: sid2,
+        role: Role::SecretHolder,
+        phase: SwapPhase::Funding,
+        params: params.clone(),
+        s_height: 0,
+        sweep_escrow_height: 0,
+        our_escrow_outpoint: Some(our_escrow2),
+        their_escrow_outpoint: Some(OutPoint::new(txid_from(0x57), 0)),
+        pre_armed_refund: Some(refund2),
+        completion_tx: None,
+        setup_tx: Some(setup2.clone()),
+        possession_record: None,
+    };
+    store.put(&rec2).unwrap();
+    let fabricate = DualSourceChainView::new(
+        Source::self_verifying(truth2),
+        Source::untrusted(liar2),
+    )
+    .unwrap();
+    // Authoritative = unconfirmed ⇒ still re-submit (a fabricator cannot skip it).
+    match RecoveryDriver::reenter_one(&store, &store.get(&sid2).unwrap().unwrap(), &fabricate).unwrap() {
+        RecoveryTick::RebroadcastSetup { setup_tx } => assert_eq!(setup_tx, setup2),
+        other => panic!("a fabricated confirmation must not skip re-submission, got {other:?}"),
+    }
 }
 
 /// A standard P2TR-shaped spk and a minimal v3 spend of `outpoint`, so a swept
@@ -504,6 +777,7 @@ fn terminal_records_are_revalidated_against_reorg() {
         their_escrow_outpoint: Some(their_escrow),
         pre_armed_refund: Some(refund.clone()),
         completion_tx: Some(vec![0xcdu8; 64]),
+        setup_tx: None,
         possession_record: None,
     };
 

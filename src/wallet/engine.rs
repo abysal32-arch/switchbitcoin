@@ -263,6 +263,11 @@ impl SwapEngine {
             their_escrow_outpoint: Some(ctx.their_escrow_op),
             pre_armed_refund: Some(ctx.pre_armed_refund.clone()),
             completion_tx: None,
+            // The pre-funding early record (SwapApp::setup_broadcast) is the
+            // only writer of setup_tx; the funding handoff CLEARS it here (both
+            // escrows have confirmed by Proceed, so the Setup can never need
+            // re-broadcast). None-over-Some is the legal clear (check_against).
+            setup_tx: None,
             possession_record: None,
         })
     }
@@ -421,6 +426,10 @@ impl SwapEngine {
             their_escrow_outpoint: Some(ctx.their_escrow_op),
             pre_armed_refund: Some(ctx.pre_armed_refund.clone()),
             completion_tx: None,
+            // Funding has confirmed (this is `Funded`); the Setup can never need
+            // re-broadcast, so the Signing record carries no setup_tx (already
+            // cleared by record_funding at the handoff).
+            setup_tx: None,
             possession_record: match role {
                 Role::SecretLearner => Some(possession_path.clone()),
                 Role::SecretHolder => None,
