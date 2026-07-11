@@ -36,7 +36,7 @@
 //! dead-device refund fire; the bump tx itself is built + bitcoin-side
 //! verified in `tx::backstop`.
 
-use crate::chain::{ChainView, SpendStatus};
+use crate::chain::{AuthoritativeChainView, SpendStatus};
 use crate::settlement::refund::{PreArmedRefund, Watchtower, WatchtowerReceipt};
 use crate::wallet::ledger::{BumpTarget, LinkageAck};
 use crate::Result;
@@ -89,7 +89,13 @@ impl WatchtowerDriver {
 
     /// One poll of the background loop. Idempotent and crash-safe: it
     /// re-reads chain state every call, so a restart just re-evaluates.
-    pub fn tick(&self, chain: &impl ChainView) -> Result<WatchtowerTick> {
+    ///
+    /// Requires an [`AuthoritativeChainView`]: this is the standalone
+    /// second-device watchtower's fund-deciding surface (it decides the
+    /// terminal `StandDown` and fires the pre-armed refund from `spend_status`),
+    /// and a lying explorer fabricating a `Confirmed` spend must never be able
+    /// to stand the tower down on a still-unspent escrow.
+    pub fn tick(&self, chain: &impl AuthoritativeChainView) -> Result<WatchtowerTick> {
         match chain.spend_status(self.escrow_outpoint) {
             // A completion won or our own refund already confirmed: terminal.
             SpendStatus::Confirmed(_) => Ok(WatchtowerTick::StandDown),
@@ -240,7 +246,7 @@ pub fn bump_target(kind: StalledTx) -> BumpTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chain::SimChain;
+    use crate::chain::{ChainView, SimChain};
     use crate::settlement::refund::confirm_watchtower_handoff;
     use crate::wallet::ledger::{acknowledge_linkage, LINKAGE_WARNING};
 

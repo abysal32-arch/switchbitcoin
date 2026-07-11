@@ -26,8 +26,8 @@ fn dual(chain: &SimChain) -> DualSourceChainView<Source<SimChain>, Source<SimCha
     // Both sources back the same sim; one is labeled self-verifying (the
     // real deployment pairs a BIP157/158 client with an explorer).
     DualSourceChainView::new(
-        Source::new(chain.clone(), true),
-        Source::new(chain.clone(), false),
+        Source::self_verifying(chain.clone()),
+        Source::untrusted(chain.clone()),
     )
     .unwrap()
 }
@@ -255,8 +255,8 @@ fn lying_explorer_delays_but_cannot_force_abort() {
     liar.fund_with_amount(their_escrow, s, unit + 1);
 
     let view = DualSourceChainView::new(
-        Source::new(honest.clone(), true),  // self-verifying = truth
-        Source::new(liar.clone(), false),   // explorer = lying
+        Source::self_verifying(honest.clone()),  // self-verifying = truth
+        Source::untrusted(liar.clone()),   // explorer = lying
     )
     .unwrap();
 
@@ -301,8 +301,8 @@ fn lying_explorer_delays_but_cannot_force_abort() {
     let liar2 = SimChain::new(s);
     liar2.fund_with_amount(their_escrow, s, unit - 500);
     let view2 = DualSourceChainView::new(
-        Source::new(honest2, true),
-        Source::new(liar2, false),
+        Source::self_verifying(honest2),
+        Source::untrusted(liar2),
     )
     .unwrap();
     assert_eq!(

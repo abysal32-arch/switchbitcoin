@@ -17,8 +17,8 @@ use swapkey::{Error, Result};
 
 fn dual(chain: &SimChain) -> DualSourceChainView<Source<SimChain>, Source<SimChain>> {
     DualSourceChainView::new(
-        Source::new(chain.clone(), true),
-        Source::new(chain.clone(), false),
+        Source::self_verifying(chain.clone()),
+        Source::untrusted(chain.clone()),
     )
     .unwrap()
 }
@@ -252,8 +252,8 @@ fn verification_stall_is_surfaced_not_aborted() {
 
     // Self-verifying source = truth; the other source lies by omission.
     let view = DualSourceChainView::new(
-        Source::new(truth.clone(), true),
-        Source::new(liar.clone(), false),
+        Source::self_verifying(truth.clone()),
+        Source::untrusted(liar.clone()),
     )
     .unwrap();
 

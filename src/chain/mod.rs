@@ -646,16 +646,49 @@ pub trait ChainSource {
     fn is_self_verifying(&self) -> bool;
 }
 
-/// A labeled source over any `ChainView` (e.g. a `SimChain`). The label records
-/// whether this source is the self-verifying one.
+/// A [`ChainView`] that is SELF-VERIFYING at the SOURCE level: it validates
+/// compact-block filters against independently-obtained PoW headers, so it
+/// cannot be made to lie about a confirmation by an eclipse. This is the
+/// honesty claim [`DualSourceChainView`] requires of at least one of its
+/// sources — made a TYPE the compiler checks, never a caller-asserted bool.
+///
+/// Implemented ONLY by views that genuinely carry the property:
+/// - [`SimChain`]: it IS the chain (the model's ground truth), not a remote
+///   claim about one;
+/// - a future BIP157/158 filter client (rank 8) — which must add its own
+///   `impl SelfVerifyingSource for … {}`, a deliberate and reviewable act.
+///
+/// A block-explorer client must NOT implement this. Passing one as the
+/// self-verifying half of a dual view is then a compile error (it lacks the
+/// marker), instead of one unreviewable `true` at the construction seam.
+pub trait SelfVerifyingSource: ChainView {}
+
+impl SelfVerifyingSource for SimChain {}
+
+/// A labeled source over a `ChainView`, tagged with whether it is the
+/// self-verifying one. The tag is NOT a free bool: it can only be set true via
+/// [`Source::self_verifying`], whose bound admits only a [`SelfVerifyingSource`].
 pub struct Source<C: ChainView> {
     view: C,
     self_verifying: bool,
 }
 
 impl<C: ChainView> Source<C> {
-    pub fn new(view: C, self_verifying: bool) -> Self {
-        Source { view, self_verifying }
+    /// An UNTRUSTED source (e.g. a block explorer): the tag is false. Any
+    /// `ChainView` qualifies — an untrusted view makes no honesty claim.
+    pub fn untrusted(view: C) -> Self {
+        Source { view, self_verifying: false }
+    }
+
+    /// A SELF-VERIFYING source: the tag is true. The `SelfVerifyingSource`
+    /// bound is the whole point — only a view that carries the marker (SimChain;
+    /// a future filter client) can be labeled self-verifying, so an explorer
+    /// cannot slip through by asserting a bool.
+    pub fn self_verifying(view: C) -> Self
+    where
+        C: SelfVerifyingSource,
+    {
+        Source { view, self_verifying: true }
     }
 }
 
@@ -1022,12 +1055,12 @@ mod tests {
 
     #[test]
     fn dual_source_requires_at_least_one_self_verifying() {
-        let a = Source::new(SimChain::new(100), false);
-        let b = Source::new(SimChain::new(100), false);
+        let a = Source::untrusted(SimChain::new(100));
+        let b = Source::untrusted(SimChain::new(100));
         assert!(DualSourceChainView::new(a, b).is_err());
 
-        let a = Source::new(SimChain::new(100), true); // self-verifying
-        let b = Source::new(SimChain::new(100), false);
+        let a = Source::self_verifying(SimChain::new(100)); // self-verifying
+        let b = Source::untrusted(SimChain::new(100));
         assert!(DualSourceChainView::new(a, b).is_ok());
     }
 
@@ -1037,8 +1070,8 @@ mod tests {
         let chain = SimChain::new(100);
         chain.fund(op(0), 100);
         let dual = DualSourceChainView::new(
-            Source::new(chain.clone(), true),
-            Source::new(chain.clone(), false),
+            Source::self_verifying(chain.clone()),
+            Source::untrusted(chain.clone()),
         )
         .unwrap();
         assert_eq!(dual.verified_tip_height().unwrap(), 100);
@@ -1055,8 +1088,8 @@ mod tests {
         let other = SimChain::new(100);
         other.fund(op(0), 100); // claims it IS funded
         let dual = DualSourceChainView::new(
-            Source::new(honest, true), // self-verifying, says unconfirmed
-            Source::new(other, false), // explorer, says confirmed
+            Source::self_verifying(honest), // self-verifying, says unconfirmed
+            Source::untrusted(other), // explorer, says confirmed
         )
         .unwrap();
         // verified_* surfaces the disagreement explicitly.
@@ -1077,8 +1110,8 @@ mod tests {
         lying_explorer.mine(); // and pretends a spend confirmed, etc.
 
         let dual = DualSourceChainView::new(
-            Source::new(self_verifying, true),
-            Source::new(lying_explorer, false),
+            Source::self_verifying(self_verifying),
+            Source::untrusted(lying_explorer),
         )
         .unwrap();
 
@@ -1101,7 +1134,7 @@ mod tests {
         liar.mine();
 
         let dual =
-            DualSourceChainView::new(Source::new(sv, true), Source::new(liar, false)).unwrap();
+            DualSourceChainView::new(Source::self_verifying(sv), Source::untrusted(liar)).unwrap();
 
         // The AUTHORITATIVE (self-verifying) reading is Unspent, so the refund
         // subroutine sees the truth and is not suppressed by the liar.

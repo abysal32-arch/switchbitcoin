@@ -32,7 +32,7 @@
 //! guarantee (which would need role pre-commitment) is a spec-resolution
 //! item, not a code bug.
 
-use crate::chain::{ChainView, SpendStatus};
+use crate::chain::{AuthoritativeChainView, SpendStatus};
 use crate::crypto::ValidatedPoint;
 use crate::settlement::params::Params;
 use crate::settlement::refund::PreArmedRefund;
@@ -129,7 +129,7 @@ impl FundingCoordinator {
     #[allow(clippy::too_many_arguments)]
     pub fn next_funding_action(
         &self,
-        chain: &dyn ChainView,
+        chain: &dyn AuthoritativeChainView,
         order: FundingOrder,
         our_escrow: OutPoint,
         their_escrow: OutPoint,
@@ -260,7 +260,7 @@ impl AbortDriver {
     ///   3. refund matured, escrow unspent               → BroadcastRefund
     ///   4. otherwise                                    → Wait
     pub fn next_abort_action(
-        chain: &dyn ChainView,
+        chain: &dyn AuthoritativeChainView,
         our_escrow: OutPoint,
         refund: &PreArmedRefund,
         our_refund_txid: Option<bitcoin::Txid>,
@@ -300,14 +300,14 @@ impl AbortDriver {
 /// view that cannot report it collapses to "not ours" (conservative: we then
 /// treat an unknown spend as a winning completion and take the swap rather
 /// than double-spend).
-fn spend_txid(chain: &dyn ChainView, outpoint: OutPoint) -> Option<bitcoin::Txid> {
+fn spend_txid(chain: &dyn AuthoritativeChainView, outpoint: OutPoint) -> Option<bitcoin::Txid> {
     chain.spend_txid(outpoint)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chain::SimChain;
+    use crate::chain::{ChainView, SimChain};
 
     fn vp(seed: u8) -> ValidatedPoint {
         // A valid point: (seed+1) * G, serialized and re-validated.

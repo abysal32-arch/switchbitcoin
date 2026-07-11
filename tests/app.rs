@@ -689,8 +689,8 @@ fn awaiting_verification_escalates_to_refund_at_maturity() {
     let (sh_setup, their_op) =
         build_real_setup(&truth, &params, OutPoint::new(txid_from(0xB3), 0), base, &e_theirs, &sh.sk);
     let view = DualSourceChainView::new(
-        Source::new(truth.clone(), true),
-        Source::new(liar.clone(), false),
+        Source::self_verifying(truth.clone()),
+        Source::untrusted(liar.clone()),
     )
     .unwrap();
 
@@ -878,8 +878,8 @@ fn record_less_funded_abort_classifies_refunding_via_the_chain() {
     truth.broadcast(&sh_setup2).unwrap();
     truth.mine();
     let view = DualSourceChainView::new(
-        Source::new(truth.clone(), true),
-        Source::new(liar.clone(), false),
+        Source::self_verifying(truth.clone()),
+        Source::untrusted(liar.clone()),
     )
     .unwrap();
 

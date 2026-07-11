@@ -33,7 +33,7 @@
 //! check here is the wallet policy on top of `broadcast_completion`'s hard
 //! Δ_buffer gate.
 
-use crate::chain::{ChainView, SpendStatus};
+use crate::chain::{AuthoritativeChainView, SpendStatus};
 use crate::crypto::ValidatedFinalSig;
 use crate::settlement::state_machine::{CompletionSig, Possessing};
 use crate::wallet::manifest::SignedManifest;
@@ -87,7 +87,7 @@ impl ClaimScheduler {
     /// SL-funded escrow `e_sl` (the escrow SH sweeps). Mempool-first: returns
     /// the 64-byte reveal the moment the completion appears, confirmed or not.
     pub fn observe_reveal(
-        chain: &dyn ChainView,
+        chain: &dyn AuthoritativeChainView,
         e_sl_outpoint: OutPoint,
     ) -> Option<[u8; 64]> {
         match chain.spend_status(e_sl_outpoint) {
@@ -133,7 +133,7 @@ impl ClaimScheduler {
     /// is the txid we broadcast (once we have), so a confirmed sweep by US is
     /// recognized as Done rather than mistaken for someone else.
     pub fn next_broadcast(
-        chain: &dyn ChainView,
+        chain: &dyn AuthoritativeChainView,
         e_sh_outpoint: OutPoint,
         schedule: &ScheduledClaim,
         our_claim_txid: Option<Txid>,
@@ -243,7 +243,7 @@ fn sample_uniform_inclusive(lo: u64, hi: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chain::SimChain;
+    use crate::chain::{ChainView, SimChain};
     use crate::settlement::params::Params;
     use crate::wallet::manifest::ClaimDelayPosture;
 

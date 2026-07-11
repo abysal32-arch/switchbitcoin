@@ -1258,8 +1258,8 @@ fn await_funded_refuses_under_eclipse_but_proceeds_on_agreement() {
     liar.fund(op_a, s);
     liar.fund(op_b, s);
     let eclipsed = DualSourceChainView::new(
-        Source::new(honest, true),
-        Source::new(liar, false),
+        Source::self_verifying(honest),
+        Source::untrusted(liar),
     )
     .unwrap();
     let out = Funding::new(params.clone(), PeerSession::new([1u8; 32], Box::new(duplex().0)))
@@ -1274,8 +1274,8 @@ fn await_funded_refuses_under_eclipse_but_proceeds_on_agreement() {
     truth.fund(op_a, s);
     truth.fund(op_b, s);
     let agreed = DualSourceChainView::new(
-        Source::new(truth.clone(), true),
-        Source::new(truth.clone(), false),
+        Source::self_verifying(truth.clone()),
+        Source::untrusted(truth.clone()),
     )
     .unwrap();
     let funded = Funding::new(params, PeerSession::new([1u8; 32], Box::new(duplex().0)))

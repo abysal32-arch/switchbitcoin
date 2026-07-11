@@ -38,7 +38,7 @@ use std::path::PathBuf;
 
 use bitcoin::Txid;
 
-use crate::chain::{AuthoritativeChainView, ChainView};
+use crate::chain::AuthoritativeChainView;
 use crate::crypto::ValidatedFinalSig;
 use crate::settlement::refund::PreArmedRefund;
 use crate::settlement::state_machine::{Possessing, Role};
@@ -148,7 +148,7 @@ impl RecoveryDriver {
     fn reenter_abort_refund(
         store: &SwapStore,
         rec: &SwapRecord,
-        chain: &dyn ChainView,
+        chain: &dyn AuthoritativeChainView,
     ) -> Result<RecoveryTick> {
         if rec.role == Role::SecretLearner && rec.possession_record.is_some() {
             if let Some(our_escrow) = rec.our_escrow_outpoint {
@@ -167,7 +167,7 @@ impl RecoveryDriver {
     fn restore_and_extract(
         store: &SwapStore,
         rec: &SwapRecord,
-        chain: &dyn ChainView,
+        chain: &dyn AuthoritativeChainView,
         reveal: &[u8; 64],
     ) -> Result<RecoveryTick> {
         let record_path = rec
@@ -190,7 +190,7 @@ impl RecoveryDriver {
     /// `Funding`: if our escrow is confirmed on chain the standing pre-armed
     /// refund is the exit (a stuck funding still unwinds safely); otherwise
     /// nothing is locked and resuming needs a fresh driver + transport.
-    fn reenter_funding(rec: &SwapRecord, chain: &dyn ChainView) -> Result<RecoveryTick> {
+    fn reenter_funding(rec: &SwapRecord, chain: &dyn AuthoritativeChainView) -> Result<RecoveryTick> {
         let refund = match rec.our_escrow_outpoint {
             Some(escrow) if chain.funding_height(escrow).is_some() => {
                 Some(Self::abort_action(rec, chain)?)
@@ -207,7 +207,7 @@ impl RecoveryDriver {
     fn reenter_released(
         store: &SwapStore,
         rec: &SwapRecord,
-        chain: &dyn ChainView,
+        chain: &dyn AuthoritativeChainView,
     ) -> Result<RecoveryTick> {
         // Released is SL-only (see SwapPhase docs); an SH record here is a
         // corrupt/foreign record, not a state we drive.
@@ -258,7 +258,7 @@ impl RecoveryDriver {
     fn reenter_completing(
         store: &SwapStore,
         rec: &SwapRecord,
-        chain: &dyn ChainView,
+        chain: &dyn AuthoritativeChainView,
     ) -> Result<RecoveryTick> {
         let final_sig = completion_sig(rec)?;
         // Our completion spends the counterparty's escrow (the one we sweep).
@@ -276,7 +276,7 @@ impl RecoveryDriver {
 
     /// The completion-supersedes decision on our escrow, shared by the
     /// `AbortRefund` and funded-`Funding` paths.
-    fn abort_action(rec: &SwapRecord, chain: &dyn ChainView) -> Result<AbortAction> {
+    fn abort_action(rec: &SwapRecord, chain: &dyn AuthoritativeChainView) -> Result<AbortAction> {
         let our_escrow = rec
             .our_escrow_outpoint
             .ok_or(Error::Ordering("abort path without our escrow outpoint"))?;
