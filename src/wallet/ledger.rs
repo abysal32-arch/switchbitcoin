@@ -947,6 +947,51 @@ impl Ledger {
         }
     }
 
+    /// Chain-aware reserve reconciliation (review finding): mark Spent any
+    /// Reserve coin the ledger still counts as spendable (Unspent or Leased)
+    /// but whose outpoint is CONFIRMED spent on chain. This is the phantom a
+    /// crash in [`run_cpfp_bump`](crate::wallet::backstop_driver::run_cpfp_bump)'s
+    /// submit→persist window creates: the CPFP child is on chain, the ledger
+    /// persist never ran, and a later [`reconcile_leases`] re-exposes the coin
+    /// as Unspent — where its deterministic `max_by_key` lease selection then
+    /// wins forever and fails every bump at submit, silently disabling the
+    /// backstop pool. Sweeping it here (the caller runs this at startup with
+    /// the authoritative chain) removes the phantom before it is ever selected;
+    /// `run_cpfp_bump` additionally self-heals one on a submit failure. Only
+    /// CONFIRMED spends are swept — an `InMempool` spend may be our own
+    /// still-confirming legitimate bump. Returns the swept outpoints.
+    pub fn sweep_spent_reserves(
+        &mut self,
+        chain: &dyn crate::chain::AuthoritativeChainView,
+    ) -> Result<Vec<OutPoint>> {
+        let targets: Vec<OutPoint> = self
+            .coins
+            .iter()
+            .filter(|c| {
+                c.class == CoinClass::Reserve
+                    && matches!(c.state, CoinState::Unspent | CoinState::Leased)
+                    && matches!(
+                        chain.spend_status(c.outpoint),
+                        crate::chain::SpendStatus::Confirmed(_)
+                    )
+            })
+            .map(|c| c.outpoint)
+            .collect();
+        if targets.is_empty() {
+            return Ok(targets);
+        }
+        self.transact(|l| {
+            for op in &targets {
+                if let Some(c) = l.find_mut(op) {
+                    c.state = CoinState::Spent;
+                    c.lessee = None;
+                }
+            }
+            Ok(())
+        })?;
+        Ok(targets)
+    }
+
     /// Startup reconciliation (the orphaned-lease fix): release every lease
     /// whose lessee is not in the live set (crash between lease and swap-
     /// record creation). Returns the released outpoints.

@@ -191,6 +191,19 @@ impl SwapEngine {
         self.ledger.next_reserve_key(self.keys.as_ref())
     }
 
+    /// Chain-aware reserve reconciliation — run at startup (after `open`) with
+    /// the authoritative chain to sweep any phantom Reserve coin already spent
+    /// on chain but still counted spendable (a crash in a prior bump's
+    /// submit→persist window). See
+    /// [`Ledger::sweep_spent_reserves`](crate::wallet::ledger::Ledger::sweep_spent_reserves).
+    /// Returns the swept outpoints.
+    pub fn reconcile_reserves(
+        &mut self,
+        chain: &dyn crate::chain::AuthoritativeChainView,
+    ) -> Result<Vec<OutPoint>> {
+        self.ledger.sweep_spent_reserves(chain)
+    }
+
     /// Execute a decided CPFP bump against this wallet's ledger + enclave seam
     /// — a borrow-splitting wrapper over
     /// [`run_cpfp_bump`](crate::wallet::backstop_driver::run_cpfp_bump) (an

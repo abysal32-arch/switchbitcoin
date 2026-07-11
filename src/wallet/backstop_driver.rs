@@ -354,10 +354,20 @@ pub fn run_cpfp_bump(
             })
         }
         Err(_) => {
-            // Never strand the reserve: release the lease so it can be retried
-            // (a bigger reserve, or once congestion eases). The swap keeps its
-            // safe fallback in the meantime.
-            ledger.release_lease(reserve.outpoint)?;
+            // Self-heal a PHANTOM reserve (review finding): if the leased
+            // reserve's outpoint is already consumed on chain — a crash in a
+            // PRIOR bump's submit→persist window left it Leased-then-released-
+            // to-Unspent while its child is on the wire — mark it Spent so it
+            // is never re-selected (else its deterministic max_by_key selection
+            // fails every future bump at submit, silently disabling the pool).
+            // A genuine build/undersize failure leaves the outpoint Unspent, so
+            // the lease is released to be retried (a bigger reserve, or once
+            // congestion eases) — the swap keeps its safe fallback meanwhile.
+            if matches!(chain.spend_status(reserve.outpoint), SpendStatus::Unspent) {
+                ledger.release_lease(reserve.outpoint)?;
+            } else {
+                ledger.mark_spent(reserve.outpoint)?;
+            }
             Ok(BumpOutcome::NoBump)
         }
     }

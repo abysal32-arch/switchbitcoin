@@ -284,3 +284,92 @@ fn undersized_reserve_releases_the_lease() {
     assert_eq!(ledger.find(&reserve_op).unwrap().state, CoinState::Unspent);
     assert!(ledger.has_leasable_reserve(1));
 }
+
+/// A minimal v3 tx spending `input` to a standard P2TR output — so a reserve
+/// outpoint can be consumed on chain to simulate the phantom.
+fn spend(input: OutPoint, out_sats: u64) -> Vec<u8> {
+    let tx = Transaction {
+        version: Version(3),
+        lock_time: absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: input,
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut { value: Amount::from_sat(out_sats), script_pubkey: std_p2tr_spk(0x55) }],
+    };
+    bitcoin::consensus::encode::serialize(&tx)
+}
+
+/// Review finding 6 (proactive sweep): a Reserve coin the ledger still counts
+/// Unspent but whose outpoint is CONFIRMED spent on chain — the phantom a
+/// crashed submit→persist window leaves behind — is marked Spent by
+/// `sweep_spent_reserves`, so it never wins lease selection and disables the
+/// pool. An unspent reserve is left untouched.
+#[test]
+fn sweep_spent_reserves_clears_a_phantom() {
+    let (mut ledger, _keys, reserve_op, reserve_amount, _dir) = provision_reserve();
+    let chain = SimChain::new(500_000);
+    chain.fund_with_amount(reserve_op, 500_000, reserve_amount);
+
+    // Nothing spent yet: the sweep is a no-op and the reserve stays leasable.
+    assert!(ledger.sweep_spent_reserves(&chain).unwrap().is_empty());
+    assert_eq!(ledger.find(&reserve_op).unwrap().state, CoinState::Unspent);
+
+    // The reserve outpoint is consumed on chain (a prior bump's child) while
+    // the ledger — crashed before persisting — still says Unspent: the phantom.
+    chain.broadcast(&spend(reserve_op, reserve_amount - 500)).unwrap();
+    chain.mine(); // Confirmed
+
+    let swept = ledger.sweep_spent_reserves(&chain).unwrap();
+    assert_eq!(swept, vec![reserve_op], "the phantom is swept");
+    assert_eq!(ledger.find(&reserve_op).unwrap().state, CoinState::Spent);
+    assert!(!ledger.has_leasable_reserve(1), "the phantom no longer counts as available");
+}
+
+/// Review finding 6 (submit-failure self-heal): if run_cpfp_bump leases a
+/// reserve the ledger thinks is Unspent but the chain has already spent (the
+/// phantom), the package submit fails on the double-spent input and the
+/// executor marks the reserve Spent — NOT released back to Unspent — so it is
+/// never re-selected. Contrast with a genuine undersize failure, where the
+/// still-unspent reserve IS released (the existing test).
+#[test]
+fn run_cpfp_bump_self_heals_a_phantom_reserve_on_submit_failure() {
+    let (mut ledger, keys, reserve_op, reserve_amount, _dir) = provision_reserve();
+    let chain = SimChain::new(500_000);
+    let parent_input = OutPoint::new(txid(0x0F), 0);
+    seed_chain(&chain, parent_input, reserve_op, reserve_amount);
+    let (parent_bytes, parent_txid, parent_vsize) = parent_with_anchor(parent_input, 500_000, 240);
+
+    // Consume the reserve outpoint on chain BEFORE the bump — the ledger still
+    // says Unspent (phantom), so lease_reserve will pick it and submit will
+    // fail on the double-spend.
+    chain.broadcast(&spend(reserve_op, reserve_amount - 500)).unwrap();
+    chain.mine();
+
+    let out = run_cpfp_bump(
+        &mut ledger,
+        &keys,
+        &chain,
+        CpfpBumpRequest {
+            target: BumpTarget::Refund,
+            linkage_ack: None,
+            lessee: [0xEE; 32],
+            parent_bytes: &parent_bytes,
+            parent_anchor: OutPoint::new(parent_txid, ANCHOR_VOUT),
+            anchor_value_sats: 240,
+            parent_fee_sats: 200,
+            parent_vsize_vb: parent_vsize,
+            target_feerate_sat_vb: 10,
+            change_key_index: 0,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(out, BumpOutcome::NoBump);
+    // Self-healed: the phantom is Spent (not Unspent), so it can never be
+    // re-leased to fail again — the pool is not disabled.
+    assert_eq!(ledger.find(&reserve_op).unwrap().state, CoinState::Spent);
+    assert!(!ledger.has_leasable_reserve(1));
+}
