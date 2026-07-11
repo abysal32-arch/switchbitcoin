@@ -33,7 +33,9 @@ const DUST_SATS: u64 = 330;
 /// Absurd-fee ceiling for a single bump child (defense against a buggy fee
 /// estimate burning a whole reserve coin as fee — finding #12). Generous
 /// headroom over any realistic CPFP; a real bump is a few thousand sats.
-const MAX_BUMP_FEE_SATS: u64 = 200_000;
+/// A `required_child_fee` above this is rejected by `build_cpfp_bump`, so a
+/// caller can pre-check against it to avoid a guaranteed-futile lease attempt.
+pub const MAX_BUMP_FEE_SATS: u64 = 200_000;
 
 /// Anchor-output invariant, shared with `tx::txbuild`: every contract tx
 /// carries its ephemeral anchor as its LAST output. The completion/refund/

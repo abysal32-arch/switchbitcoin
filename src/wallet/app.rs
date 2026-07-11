@@ -72,7 +72,7 @@ use bitcoin::OutPoint;
 use crate::chain::AuthoritativeChainView;
 use crate::crypto::ValidatedPoint;
 use crate::settlement::state_machine::{Funded, PeerSession, Possessing, Role};
-use crate::tx::backstop::{required_child_fee, ANCHOR_VOUT};
+use crate::tx::backstop::{required_child_fee, ANCHOR_VOUT, MAX_BUMP_FEE_SATS};
 use crate::wallet::backstop_driver::{BackstopDriver, BackstopTick, BumpOutcome, CpfpBumpRequest};
 use crate::wallet::ledger::{BumpTarget, LinkageAck};
 use crate::wallet::engine::{DriveStatus, SettleEntry, SwapContext, SwapEngine};
@@ -486,19 +486,51 @@ impl SwapApp {
         stalled_parent: Option<&StalledParent<'_>>,
         consent: Option<LinkageAck>,
     ) -> Result<BackstopRun> {
-        // Size the reserve gate against the parent we would bump: the caller's
-        // stalled tx when supplied, else our own pre-armed refund (the only
-        // other bumpable parent, and the one the tower stalls on).
-        let (gate_fee, gate_vsize) = match stalled_parent {
-            Some(p) => (p.fee_sats, p.vsize_vb),
-            None => {
+        let congested = stalled_parent.is_some();
+
+        // Pass 1 — identify the ACTIVE side with the reserve assumed
+        // UNAVAILABLE, so the tick's own refund-first priority picks the side
+        // without a gate that might be sized for the WRONG parent (review
+        // finding: a completion-sized gate could starve an affordable refund
+        // bump — both stalls are live at once during SH Completing).
+        let base = self.backstop_tick(engine, chain, congested, false)?;
+
+        // Size the reserve gate against THAT side's own parent. The refund
+        // side stalls on our pre-armed refund (bytes in ctx); the completion/
+        // setup side stalls on the caller's tx (only the caller holds it).
+        let (gate_fee, gate_vsize) = match base {
+            // Refund side is the decider (the tower is congested).
+            BackstopTick::KeepWaiting => {
                 let (_, fee, vsize) = self.refund_parent()?;
                 (fee, vsize)
             }
+            // Completion / setup side. Needs the caller's parent to bump at all;
+            // without it the decision stands as-is (never guess the parent).
+            BackstopTick::FallbackToRefund
+            | BackstopTick::KeepFighting
+            | BackstopTick::AbortBeforeLock => match stalled_parent {
+                Some(p) => (p.fee_sats, p.vsize_vb),
+                None => return Ok(BackstopRun::Decided(base)),
+            },
+            // FiredRefund (already broadcast) / Idle / an already-reserve-gated
+            // variant (unreachable in pass 1, reserve=false): nothing to bump.
+            _ => return Ok(BackstopRun::Decided(base)),
         };
+
         let child_fee = required_child_fee(target_feerate_sat_vb, gate_fee, gate_vsize);
+        // Futile-bump short-circuit (review finding): a child fee of 0 means the
+        // parent already meets the target feerate; one above the build ceiling
+        // can never be built. Either way a bump is guaranteed NoBump — return
+        // the decision WITHOUT issuing a Reserve key or a lease/release cycle,
+        // so a stale-feerate dead-device loop can't burn the key-index space or
+        // churn the ledger every tick.
+        if child_fee == 0 || child_fee > MAX_BUMP_FEE_SATS {
+            return Ok(BackstopRun::Decided(base));
+        }
         let reserve_available = engine.ledger().has_leasable_reserve(child_fee);
-        let congested = stalled_parent.is_some();
+
+        // Pass 2 — re-decide with the correctly-sized gate; only now can the
+        // side flip to Bump / NeedsConsent.
         let decision = self.backstop_tick(engine, chain, congested, reserve_available)?;
 
         // `Bump { Refund }` arises ONLY from the tower's refund stall

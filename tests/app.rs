@@ -1413,3 +1413,157 @@ fn backstop_execute_bumps_a_stalled_refund_autonomously() {
         other => panic!("a confirmed refund must quiesce, got {other:?}"),
     }
 }
+
+/// Shared fixture for the backstop_execute regression tests: a record-less
+/// funded swap (our escrow confirmed on chain, matured refund) whose wallet
+/// holds one real provisioned reserve coin. Returns the engine, chain, app,
+/// the reserve outpoint+amount, and the refund's own fee.
+struct BackstopFixture {
+    engine: SwapEngine,
+    chain: SimChain,
+    app: SwapApp,
+    reserve_op: OutPoint,
+    refund_fee: u64,
+    _dirs: Vec<tempfile::TempDir>,
+}
+
+fn record_less_funded_with_reserve(base: u32, seed: u8) -> BackstopFixture {
+    let params = Params::testnet_provisional();
+    let escrow_amt = params.escrow_amount_sats();
+    let d = params.tier_d_sats;
+    let wallet_dir = tempfile::tempdir().unwrap();
+    let reserve_op = {
+        let mut ledger = Ledger::create(
+            wallet_dir.path(),
+            &ModeledEnclave,
+            acknowledge_phase0(PHASE0_WARNING).unwrap(),
+        )
+        .unwrap();
+        let keys = ModeledKeySource::new(&ModeledEnclave);
+        let unit = params.pre_encumbrance_sats();
+        let (idx, spk) = ledger.next_deposit_address(&keys).unwrap();
+        let dep = OutPoint::new(txid_from(seed), 0);
+        ledger
+            .register_deposit(
+                dep, unit + 80_000 + 1_000, 100, idx, &spk, &keys,
+                Some(acknowledge_phase0(PHASE0_WARNING).unwrap()),
+            )
+            .unwrap();
+        let plan = ledger.split_deposit(dep, &params, 1_000, &keys).unwrap();
+        ledger.confirm_split(plan.txid, base - 5, &FixedClock(1_000)).unwrap();
+        let change_op = OutPoint::new(plan.txid, plan.change_vout.expect("change output"));
+        ledger.promote_change_to_reserve(change_op).unwrap();
+        change_op
+    };
+
+    let (sh, sl) = loop {
+        let a = keypair();
+        let b = keypair();
+        if vp(&a.pk).to_bytes() < vp(&b.pk).to_bytes() {
+            break (b, a);
+        } else if vp(&b.pk).to_bytes() < vp(&a.pk).to_bytes() {
+            break (a, b);
+        }
+    };
+    let internal = canonical_internal_key(sh.pk, sl.pk).unwrap();
+    let e_ours = Escrow::new(&internal, &sl.pk, params.delta_early).unwrap();
+    let e_theirs = Escrow::new(&internal, &sh.pk, params.delta_early).unwrap();
+
+    let chain = SimChain::new(base);
+    let our_op = OutPoint::new(txid_from(seed.wrapping_add(1)), 0);
+    let their_op = OutPoint::new(txid_from(seed.wrapping_add(2)), 0);
+    chain.fund_with_amount(our_op, base, escrow_amt);
+
+    let dest = e_ours.funding_script_pubkey().clone();
+    let comp = build_completion(&e_ours, our_op, escrow_amt, dest.clone(), d, params.anchor_sats).unwrap();
+    let refund =
+        PreArmedRefund::arm(&e_ours, our_op, escrow_amt, &sl.sk, dest, d, params.anchor_sats, base).unwrap();
+    let maturity = refund.csv_maturity_height();
+    let refund_fee = escrow_amt - d - params.anchor_sats;
+    let receipt = confirm_watchtower_handoff(&refund, refund.fingerprint()).unwrap();
+
+    let (engine, _) = SwapEngine::open(
+        wallet_dir.path(),
+        &ModeledEnclave,
+        Box::new(ModeledKeySource::new(&ModeledEnclave)),
+        &ModeledTrustRoot,
+    )
+    .unwrap();
+    let reserve_amt = engine.ledger().find(&reserve_op).unwrap().amount_sats;
+    chain.fund_with_amount(reserve_op, base, reserve_amt);
+
+    let lease = tempfile::tempdir().unwrap();
+    let possession = tempfile::tempdir().unwrap();
+    let ctx = make_ctx(
+        sl.sk, sh.pk, our_op, their_op, escrow_amt, comp.sighash, comp.sighash, refund, None,
+        e_ours.merkle_root(), e_theirs.merkle_root(), e_ours.output_key_xonly(),
+        e_theirs.output_key_xonly(), lease.path().to_path_buf(), possession.path().to_path_buf(),
+        receipt, OutPoint::new(txid_from(seed.wrapping_add(3)), 0),
+    );
+    let app = SwapApp::begin(&engine, ctx, PeerSession::new([0u8; 32], Box::new(DeadEnd)), base + 500, 0)
+        .unwrap();
+    while chain.tip_height() < maturity {
+        chain.mine();
+    }
+    BackstopFixture { engine, chain, app, reserve_op, refund_fee, _dirs: vec![lease, possession, wallet_dir] }
+}
+
+/// Review finding 4 (per-side reserve gate): a stalled refund whose OWN small
+/// child fee the reserve covers must bump even when the caller also supplies a
+/// huge stalled completion parent the reserve could NEVER cover. The old
+/// single-gate code sized the gate on the completion (too big → reserve
+/// "unavailable") and starved the affordable refund bump; the two-pass gate
+/// sizes on the ACTIVE (refund) side and bumps.
+#[test]
+fn backstop_execute_refund_bump_not_starved_by_a_huge_completion_parent() {
+    let mut f = record_less_funded_with_reserve(730_000, 0xE1);
+    // Congest so the refund's own fee can't relay → the tower stalls.
+    f.chain.set_congestion(f.refund_fee + 5_000);
+
+    // A caller-supplied completion "parent" so large its required child fee
+    // dwarfs any reserve (fee 1 sat, vsize 10_000_000 vB → child fee ≫ reserve).
+    let huge = swapkey::wallet::app::StalledParent {
+        tx_bytes: &[0u8; 0],
+        fee_sats: 1,
+        vsize_vb: 10_000_000,
+    };
+    match f.app.backstop_execute(&mut f.engine, &f.chain, 50, Some(&huge), None).unwrap() {
+        BackstopRun::Executed {
+            decision: BackstopTick::Bump { target: BumpTarget::Refund },
+            outcome: BumpOutcome::Submitted { reserve_outpoint, .. },
+        } => assert_eq!(reserve_outpoint, f.reserve_op, "the refund bump ran, sized on the refund"),
+        other => panic!("the affordable refund bump must not be starved, got {other:?}"),
+    }
+}
+
+/// Review finding 5 (futile-bump short-circuit): a target feerate at/below the
+/// parent's own feerate yields required_child_fee == 0 — a guaranteed NoBump.
+/// backstop_execute must return the plain decision WITHOUT issuing a Reserve
+/// key or a lease cycle, so a stale-feerate loop can't burn the index space.
+#[test]
+fn backstop_execute_short_circuits_a_futile_zero_fee_bump() {
+    let mut f = record_less_funded_with_reserve(740_000, 0xE4);
+    f.chain.set_congestion(f.refund_fee + 5_000); // tower stalled
+
+    // The next Reserve key index BEFORE the call (issue then observe; a fresh
+    // issue must return the SAME index if the futile call burned none).
+    let idx_before = f.engine.issue_reserve_key().unwrap().0;
+
+    // target_feerate 0 → required_child_fee == 0 → short-circuit.
+    match f.app.backstop_execute(&mut f.engine, &f.chain, 0, None, None).unwrap() {
+        BackstopRun::Decided(BackstopTick::KeepWaiting) => {}
+        other => panic!("a futile bump must be Decided(KeepWaiting), got {other:?}"),
+    }
+
+    let idx_after = f.engine.issue_reserve_key().unwrap().0;
+    assert_eq!(
+        idx_after,
+        idx_before + 1,
+        "the futile bump must not burn a Reserve key index (only our two probes advance it)"
+    );
+    // And the reserve was never leased/spent.
+    assert_eq!(
+        f.engine.ledger().find(&f.reserve_op).unwrap().state,
+        CoinState::Unspent
+    );
+}
