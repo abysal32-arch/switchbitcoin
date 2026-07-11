@@ -532,6 +532,72 @@ fn substituted_counterparty_escrow_spk_is_refused() {
     }
 }
 
+/// An honest Second funder whose wallet was offline past the co-funding window
+/// must NOT broadcast Setup #2 into an already-dead window: the first escrow is
+/// confirmed at the exact tier amount, but the tip has advanced ≥ cofunding_window
+/// blocks beyond it, so our Setup could never confirm inside the window. The
+/// driver must clean-abort BEFORE anything is locked (nothing on the wire), not
+/// BroadcastOurSetup (which would lock the coin ~delta_early into a swap the
+/// post-broadcast window check aborts deterministically). Still before Block X,
+/// so Block-X cannot rescue it either.
+#[test]
+fn second_funder_aborts_before_locking_into_a_dead_cofunding_window() {
+    let manifest = SignedManifest::provisional();
+    let params = manifest.params().clone();
+    let chain = SimChain::new(900_000);
+    let (a, b) = two_parties(&chain, &manifest, 900_000);
+    let view = dual(&chain);
+    let block_x = 900_500u32;
+
+    // Take whichever driver is the Second funder; the OTHER party's Setup is #1.
+    let (mut d, first_setup) = {
+        let d = FundingDriver::begin(&manifest, &a.pk, &b.pk, a.escrow_op, b.escrow_op, block_x, 0)
+            .unwrap();
+        if d.order() == FundingOrder::Second {
+            (d, &b.setup)
+        } else {
+            let d =
+                FundingDriver::begin(&manifest, &b.pk, &a.pk, b.escrow_op, a.escrow_op, block_x, 0)
+                    .unwrap();
+            (d, &a.setup)
+        }
+    };
+    assert_eq!(d.order(), FundingOrder::Second);
+
+    // ONLY the first party's Setup goes on the wire and confirms (escrow #1).
+    chain.broadcast(first_setup).unwrap();
+    chain.mine();
+    let h1 = chain.tip_height();
+
+    // The Second funder's wallet was offline: the tip advances past the window
+    // (still well before Block X). Broadcasting Setup #2 now could never meet
+    // the co-funding window (our Setup confirms at ≥ tip+1 → oh − h1 ≥ cw+1).
+    let cw = params.cofunding_window;
+    while chain.tip_height() < h1 + cw + 1 {
+        chain.mine();
+    }
+    assert!(chain.tip_height() < block_x, "still inside the Block-X deadline");
+
+    // The tick is a clean, sticky Abort — NOT BroadcastOurSetup. Our Setup was
+    // never broadcast (our_setup_broadcast unset), so the abort locks nothing.
+    match d.tick(&view).unwrap() {
+        FundingTick::Abort(reason) => {
+            assert!(reason.contains("co-funding window can no longer be met"), "got {reason:?}");
+        }
+        other => panic!("expected a clean pre-broadcast Abort, got {other:?}"),
+    }
+    assert!(matches!(d.tick(&view).unwrap(), FundingTick::Abort(_)), "abort must be sticky");
+
+    // The handoff refuses too — a dead window never mints a Funded.
+    match d.into_funded(params, dead_peer(), &view) {
+        Err(HandoffError::Refused { error: Error::Abort(reason), .. }) => {
+            assert!(reason.contains("co-funding window can no longer be met"));
+        }
+        Err(other) => panic!("dead-window handoff must refuse with the window Abort, got {other:?}"),
+        Ok(_) => panic!("a dead co-funding window must never mint a Funded"),
+    }
+}
+
 /// The Second funder's jitter decorrelates Setup #2 from escrow #1's
 /// CONFIRMATION: the delay counts from the verification event, not from the
 /// driver's first tick — a first-tick anchor would elapse concurrently with

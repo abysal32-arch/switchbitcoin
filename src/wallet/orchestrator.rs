@@ -167,11 +167,14 @@ impl FundingCoordinator {
         }
         // The counterparty escrow is VERIFIED-encumbered iff both sources
         // agree it is confirmed at exactly the tier escrow amount
-        // (D + Δ_fee − setup_cost, scheme (a)).
-        let their_encumbrance_ok = matches!(
-            their_reading,
-            FundingReading::Confirmed { amount: Some(a), .. } if a == expected
-        );
+        // (D + Δ_fee − setup_cost, scheme (a)). Capture its confirmation
+        // HEIGHT too (already carried on the reading) — the Second funder's
+        // pre-broadcast window-feasibility gate below needs it.
+        let their_verified_height = match their_reading {
+            FundingReading::Confirmed { height, amount: Some(a) } if a == expected => Some(height),
+            _ => None,
+        };
+        let their_encumbrance_ok = their_verified_height.is_some();
 
         // Have we funded yet?
         if !our_setup_broadcast {
@@ -182,14 +185,26 @@ impl FundingCoordinator {
                 // First funder broadcasts as soon as jitter elapses.
                 FundingOrder::First => FundingAction::BroadcastOurSetup,
                 // Second funder funds only after the first escrow is VERIFIED
-                // at exactly the tier escrow amount.
-                FundingOrder::Second => {
-                    if their_encumbrance_ok {
-                        FundingAction::BroadcastOurSetup
-                    } else {
-                        FundingAction::Wait
+                // at exactly the tier escrow amount — AND only while
+                // broadcasting now could still meet the co-funding window.
+                // Our Setup, once broadcast, confirms at oh ≥ tip+1, so
+                // oh − th ≥ (tip − th) + 1; once tip − th ≥ cofunding_window
+                // the window is unmeetable at ANY future confirmation height,
+                // and the post-broadcast window check would then abort
+                // deterministically — after our coin is already locked
+                // ~delta_early. An honest Second funder whose wallet was
+                // offline past the window is the reachable case; nothing is on
+                // the wire yet, so aborting HERE locks nothing (a clean
+                // pre-broadcast Abort per `FundingAction::Abort`'s own doc).
+                FundingOrder::Second => match their_verified_height {
+                    Some(th) if tip.saturating_sub(th) >= self.params.cofunding_window => {
+                        FundingAction::Abort(
+                            "co-funding window can no longer be met; abandon before locking",
+                        )
                     }
-                }
+                    Some(_) => FundingAction::BroadcastOurSetup,
+                    None => FundingAction::Wait,
+                },
             });
         }
 
@@ -434,6 +449,41 @@ mod tests {
             c.next_funding_action(&chain, FundingOrder::First, op(1), op(2), true, true, 5_000)
                 .unwrap(),
             FundingAction::Abort("co-funding window exceeded; abandon to refunds")
+        );
+    }
+
+    #[test]
+    fn second_funder_aborts_before_a_dead_cofunding_window_locks_the_coin() {
+        let c = coord();
+        let cw = Params::testnet_provisional().cofunding_window;
+
+        // Their escrow confirms at the exact tier amount at h1 = 1_000.
+        let chain = SimChain::new(1_000);
+        chain.fund_with_amount(op(2), 1_000, unit());
+
+        // Boundary: tip − th == cw − 1 → the window is still meetable (our
+        // Setup can confirm at tip+1 giving oh − th == cw), so still broadcast.
+        while chain.tip_height() < 1_000 + cw - 1 {
+            chain.mine();
+        }
+        assert_eq!(
+            c.next_funding_action(&chain, FundingOrder::Second, op(1), op(2), false, true, 5_000)
+                .unwrap(),
+            FundingAction::BroadcastOurSetup,
+            "one block inside the window the Second funder still broadcasts"
+        );
+
+        // One block later: tip − th == cw. Any future confirmation gives
+        // oh − th ≥ cw+1 > cofunding_window, so broadcasting now only locks the
+        // coin into a swap the post-broadcast check would abort. The correct
+        // decision pre-broadcast is a CLEAN Abort (nothing on the wire, nothing
+        // locked) — not BroadcastOurSetup, not Wait (Wait cannot heal it, and
+        // Block-X won't fire once our Setup confirms).
+        chain.mine();
+        assert_eq!(
+            c.next_funding_action(&chain, FundingOrder::Second, op(1), op(2), false, true, 5_000)
+                .unwrap(),
+            FundingAction::Abort("co-funding window can no longer be met; abandon before locking"),
         );
     }
 
