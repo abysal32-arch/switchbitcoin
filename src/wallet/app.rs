@@ -72,7 +72,9 @@ use bitcoin::OutPoint;
 use crate::chain::AuthoritativeChainView;
 use crate::crypto::ValidatedPoint;
 use crate::settlement::state_machine::{Funded, PeerSession, Possessing, Role};
-use crate::wallet::backstop_driver::{BackstopDriver, BackstopTick};
+use crate::tx::backstop::{required_child_fee, ANCHOR_VOUT};
+use crate::wallet::backstop_driver::{BackstopDriver, BackstopTick, BumpOutcome, CpfpBumpRequest};
+use crate::wallet::ledger::{BumpTarget, LinkageAck};
 use crate::wallet::engine::{DriveStatus, SettleEntry, SwapContext, SwapEngine};
 use crate::wallet::funding_driver::{FundingDriver, FundingTick, HandoffError};
 use crate::wallet::orchestrator::FundingOrder;
@@ -80,6 +82,34 @@ use crate::wallet::recovery_driver::{RecoveryDriver, RecoveryScan};
 use crate::wallet::store::{SwapPhase, SwapRecord};
 use crate::wallet::watchtower_driver::WatchtowerDriver;
 use crate::{Error, Result};
+
+/// The caller's observation of ITS stalled non-refund tx (the Setup or
+/// completion it broadcast — only the caller holds those bytes; the engine
+/// boundary keeps broadcast custody outside the app): everything
+/// [`SwapApp::backstop_execute`] needs to size and build a CPFP bump of it.
+pub struct StalledParent<'a> {
+    /// The fully-signed stalled tx, exactly as broadcast.
+    pub tx_bytes: &'a [u8],
+    /// That tx's own absolute fee (sats).
+    pub fee_sats: u64,
+    /// That tx's vsize (vB).
+    pub vsize_vb: u64,
+}
+
+/// The outcome of one [`SwapApp::backstop_execute`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackstopRun {
+    /// No bump was executed — the decision stands on its own: an idle/fired/
+    /// safe-fallback tick, or a `NeedsConsent` awaiting the owner's
+    /// [`LinkageAck`](crate::wallet::ledger::LinkageAck) (and the caller's
+    /// [`StalledParent`] observation).
+    Decided(BackstopTick),
+    /// A bump decision was EXECUTED via
+    /// [`run_cpfp_bump`](crate::wallet::backstop_driver::run_cpfp_bump).
+    /// `NoBump` means the lease/build/submit fell through (e.g. an undersized
+    /// reserve) with nothing stranded — the decision's safe fallback stands.
+    Executed { decision: BackstopTick, outcome: BumpOutcome },
+}
 
 /// The outcome of one [`SwapApp::poll`]: a durable terminal, or a non-terminal
 /// re-drive signal. The forward-or-refund invariant means the only terminals are
@@ -419,6 +449,120 @@ impl SwapApp {
                 }
             }
         }
+    }
+
+    /// One backstop poll for this swap that also EXECUTES the bump it decides —
+    /// the autonomous counterpart to [`backstop_tick`](SwapApp::backstop_tick)
+    /// (which stays a pure decision for callers that own the execution).
+    ///
+    /// Routing:
+    /// - `Bump { target: Refund }` (the tower's own relay-floor stall) is
+    ///   executed FULLY AUTONOMOUSLY: the pre-armed refund IS the stalled
+    ///   parent and the app holds its bytes in ctx, so the dead-device loop
+    ///   needs nothing from the caller but a target feerate. The bump is
+    ///   silent by spec (no linkage consent for refunds).
+    /// - `Bump`/`NeedsConsent { target: Completion }` (a stalled Setup or
+    ///   completion — the caller broadcast that tx, so only the caller holds
+    ///   its bytes/fee/vsize) executes only when the caller supplies BOTH the
+    ///   [`StalledParent`] observation and the typed privacy
+    ///   [`LinkageAck`](crate::wallet::ledger::LinkageAck); otherwise the
+    ///   decision is returned untouched (`Decided`) — the dead-device policy
+    ///   (consent = None) keeps fighting rather than linking the reserve
+    ///   behind the owner's back.
+    /// - Every other tick (Idle / FiredRefund / the no-reserve safe fallbacks)
+    ///   passes through as `Decided`.
+    ///
+    /// Reserve sizing: the DECISION gate uses a conservative ledger read sized
+    /// to the parent we would bump; `run_cpfp_bump`'s lease step re-checks the
+    /// exact child fee, so an undersized reserve degrades to
+    /// `Executed { outcome: NoBump }` with the lease released — the safe
+    /// fallback stands and nothing is stranded. A reserve key index issued for
+    /// a bump that falls through is skipped, never reused.
+    pub fn backstop_execute(
+        &self,
+        engine: &mut SwapEngine,
+        chain: &impl AuthoritativeChainView,
+        target_feerate_sat_vb: u64,
+        stalled_parent: Option<&StalledParent<'_>>,
+        consent: Option<LinkageAck>,
+    ) -> Result<BackstopRun> {
+        // Size the reserve gate against the parent we would bump: the caller's
+        // stalled tx when supplied, else our own pre-armed refund (the only
+        // other bumpable parent, and the one the tower stalls on).
+        let (gate_fee, gate_vsize) = match stalled_parent {
+            Some(p) => (p.fee_sats, p.vsize_vb),
+            None => {
+                let (_, fee, vsize) = self.refund_parent()?;
+                (fee, vsize)
+            }
+        };
+        let child_fee = required_child_fee(target_feerate_sat_vb, gate_fee, gate_vsize);
+        let reserve_available = engine.ledger().has_leasable_reserve(child_fee);
+        let congested = stalled_parent.is_some();
+        let decision = self.backstop_tick(engine, chain, congested, reserve_available)?;
+
+        // `Bump { Refund }` arises ONLY from the tower's refund stall
+        // (bump_target maps Setup/completions to the Completion class), so
+        // the parent is unambiguous in every arm.
+        let (target, parent_bytes, parent_fee, parent_vsize, ack): (_, &[u8], _, _, _) =
+            match decision {
+                BackstopTick::Bump { target: BumpTarget::Refund } => {
+                    let (bytes, fee, vsize) = self.refund_parent()?;
+                    (BumpTarget::Refund, bytes, fee, vsize, None)
+                }
+                BackstopTick::Bump { target: BumpTarget::Completion }
+                | BackstopTick::NeedsConsent { target: BumpTarget::Completion } => {
+                    match (stalled_parent, consent) {
+                        (Some(p), Some(ack)) => {
+                            (BumpTarget::Completion, p.tx_bytes, p.fee_sats, p.vsize_vb, Some(ack))
+                        }
+                        // No ack (dead-device) or no parent observation: the
+                        // decision stands on its own — never bump behind the
+                        // owner's back, never guess the parent.
+                        _ => return Ok(BackstopRun::Decided(decision)),
+                    }
+                }
+                other => return Ok(BackstopRun::Decided(other)),
+            };
+
+        let parent_tx: bitcoin::Transaction =
+            bitcoin::consensus::encode::deserialize(parent_bytes)
+                .map_err(|_| Error::Validation("backstop_execute: parent tx bytes do not decode"))?;
+        let sid = SwapEngine::swap_session_id(&self.ctx)?;
+        let (change_key_index, _spk) = engine.issue_reserve_key()?;
+        let outcome = engine.execute_cpfp_bump(
+            chain,
+            CpfpBumpRequest {
+                target,
+                linkage_ack: ack,
+                lessee: sid,
+                parent_bytes,
+                parent_anchor: OutPoint::new(parent_tx.compute_txid(), ANCHOR_VOUT),
+                anchor_value_sats: self.params.anchor_sats,
+                parent_fee_sats: parent_fee,
+                parent_vsize_vb: parent_vsize,
+                target_feerate_sat_vb,
+                change_key_index,
+            },
+        )?;
+        Ok(BackstopRun::Executed { decision, outcome })
+    }
+
+    /// The pre-armed refund viewed as a bumpable STALLED PARENT: its signed
+    /// bytes (held in ctx since `begin`), its own fee (escrow amount minus the
+    /// sum of its outputs — checked, so hostile values error rather than
+    /// wrap), and its vsize.
+    fn refund_parent(&self) -> Result<(&[u8], u64, u64)> {
+        let bytes = self.ctx.pre_armed_refund.tx_bytes();
+        let tx: bitcoin::Transaction = bitcoin::consensus::encode::deserialize(bytes)
+            .map_err(|_| Error::Validation("pre-armed refund bytes do not decode"))?;
+        let out_sum: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
+        let fee = self
+            .ctx
+            .escrow_amount
+            .checked_sub(out_sum)
+            .ok_or(Error::Validation("refund outputs exceed the escrow amount"))?;
+        Ok((bytes, fee, tx.vsize() as u64))
     }
 
     /// Whole-wallet crash re-entry: re-enter every non-terminal swap in the

@@ -412,6 +412,15 @@ impl Ledger {
         self.transact(|l| l.issue_key(KeyPurpose::SwapDestination, keys))
     }
 
+    /// A fresh Reserve key for a CPFP bump child's change output — the
+    /// executor derives the change spk from this index and registers the
+    /// change as a new Reserve coin (the pool replenishes itself). Persists
+    /// the index bump immediately; an index issued for a bump that then falls
+    /// through (NoBump) is simply skipped, never reused.
+    pub fn next_reserve_key(&mut self, keys: &dyn KeySource) -> Result<(u32, ScriptBuf)> {
+        self.transact(|l| l.issue_key(KeyPurpose::Reserve, keys))
+    }
+
     /// RESTORE TOOLING ONLY: after restoring an older ledger backup, the key
     /// counter has rewound; scan forward on-chain and raise the floor past
     /// every index observed in use, or new issuance will REUSE addresses.

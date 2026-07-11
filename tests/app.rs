@@ -33,8 +33,8 @@ use swapkey::settlement::state_machine::{
 use swapkey::tx::escrow::Escrow;
 use swapkey::tx::setup::build_setup;
 use swapkey::tx::txbuild::{build_completion, finalize_key_spend};
-use swapkey::wallet::app::{AppTick, SwapApp};
-use swapkey::wallet::backstop_driver::BackstopTick;
+use swapkey::wallet::app::{AppTick, BackstopRun, SwapApp};
+use swapkey::wallet::backstop_driver::{BackstopTick, BumpOutcome};
 use swapkey::wallet::engine::{SwapContext, SwapEngine};
 use swapkey::wallet::keys::ModeledKeySource;
 use swapkey::wallet::ledger::{acknowledge_phase0, BumpTarget, Ledger, WalletClock, PHASE0_WARNING};
@@ -1264,4 +1264,152 @@ fn spend_of(outpoint: OutPoint, out: u64, csv: Option<u16>) -> Vec<u8> {
         output: vec![TxOut { value: Amount::from_sat(out), script_pubkey: ScriptBuf::from_bytes(spk) }],
     };
     bitcoin::consensus::encode::serialize(&tx)
+}
+
+// ============================================================================
+// Autonomous backstop execution: the dead-device refund bump, end-to-end.
+// ============================================================================
+
+/// `backstop_execute` — the refund side needs NOTHING from the caller but a
+/// target feerate: at CSV maturity under a fee floor the tower's fire stalls,
+/// the decision routes to `Bump { Refund }`, and the app executes the 1P1C
+/// bump itself (the pre-armed refund IS the stalled parent; its bytes live in
+/// ctx): lease → enclave-sign → package submit → reserve marked spent →
+/// child change tracked as a fresh Reserve coin. Pre-maturity the decision
+/// passes through untouched, and once the refund confirms the loop quiesces.
+#[test]
+fn backstop_execute_bumps_a_stalled_refund_autonomously() {
+    let params = Params::testnet_provisional();
+    let escrow_amt = params.escrow_amount_sats();
+    let d = params.tier_d_sats;
+    let base = 720_000u32;
+
+    // Provision a REAL reserve coin (onboarding change → promoted reserve)
+    // into the wallet dir the engine will open.
+    let wallet_dir = tempfile::tempdir().unwrap();
+    let reserve_op = {
+        let mut ledger = Ledger::create(
+            wallet_dir.path(),
+            &ModeledEnclave,
+            acknowledge_phase0(PHASE0_WARNING).unwrap(),
+        )
+        .unwrap();
+        let keys = ModeledKeySource::new(&ModeledEnclave);
+        let unit = params.pre_encumbrance_sats();
+        let (idx, spk) = ledger.next_deposit_address(&keys).unwrap();
+        let dep = OutPoint::new(txid_from(0xD1), 0);
+        ledger
+            .register_deposit(
+                dep,
+                unit + 80_000 + 1_000,
+                100,
+                idx,
+                &spk,
+                &keys,
+                Some(acknowledge_phase0(PHASE0_WARNING).unwrap()),
+            )
+            .unwrap();
+        let plan = ledger.split_deposit(dep, &params, 1_000, &keys).unwrap();
+        ledger.confirm_split(plan.txid, 105, &FixedClock(1_000)).unwrap();
+        let change_op = OutPoint::new(plan.txid, plan.change_vout.expect("change output"));
+        ledger.promote_change_to_reserve(change_op).unwrap();
+        change_op
+    };
+
+    let (sh, sl) = loop {
+        let a = keypair();
+        let b = keypair();
+        if vp(&a.pk).to_bytes() < vp(&b.pk).to_bytes() {
+            break (b, a);
+        } else if vp(&b.pk).to_bytes() < vp(&a.pk).to_bytes() {
+            break (a, b);
+        }
+    };
+    let internal = canonical_internal_key(sh.pk, sl.pk).unwrap();
+    let e_ours = Escrow::new(&internal, &sl.pk, params.delta_early).unwrap();
+    let e_theirs = Escrow::new(&internal, &sh.pk, params.delta_early).unwrap();
+
+    // Our escrow is funded on chain (the pre-Proceed funded shape — the
+    // record-less tower arm guards it); the counterparty never funds.
+    let chain = SimChain::new(base);
+    let our_op = OutPoint::new(txid_from(0xC1), 0);
+    let their_op = OutPoint::new(txid_from(0xC2), 0);
+    chain.fund_with_amount(our_op, base, escrow_amt);
+
+    let dest = e_ours.funding_script_pubkey().clone();
+    let comp = build_completion(&e_ours, our_op, escrow_amt, dest.clone(), d, params.anchor_sats).unwrap();
+    let refund =
+        PreArmedRefund::arm(&e_ours, our_op, escrow_amt, &sl.sk, dest, d, params.anchor_sats, base).unwrap();
+    let maturity = refund.csv_maturity_height();
+    // The refund's own fee: escrow in, D + anchor out.
+    let refund_fee = escrow_amt - d - params.anchor_sats;
+    let receipt = confirm_watchtower_handoff(&refund, refund.fingerprint()).unwrap();
+
+    let (mut engine, _) = SwapEngine::open(
+        wallet_dir.path(),
+        &ModeledEnclave,
+        Box::new(ModeledKeySource::new(&ModeledEnclave)),
+        &ModeledTrustRoot,
+    )
+    .unwrap();
+    // The reserve's UTXO exists on chain too (the child spends it).
+    let reserve_amt = engine.ledger().find(&reserve_op).unwrap().amount_sats;
+    chain.fund_with_amount(reserve_op, base, reserve_amt);
+
+    let lease = tempfile::tempdir().unwrap();
+    let possession = tempfile::tempdir().unwrap();
+    let ctx = make_ctx(
+        sl.sk, sh.pk, our_op, their_op, escrow_amt, comp.sighash, comp.sighash, refund, None,
+        e_ours.merkle_root(), e_theirs.merkle_root(), e_ours.output_key_xonly(),
+        e_theirs.output_key_xonly(), lease.path().to_path_buf(), possession.path().to_path_buf(),
+        receipt, OutPoint::new(txid_from(0xC3), 0),
+    );
+    let app = SwapApp::begin(&engine, ctx, PeerSession::new([0u8; 32], Box::new(DeadEnd)), base + 500, 0)
+        .unwrap();
+
+    // Pre-maturity: nothing to do — the decision passes through untouched.
+    match app.backstop_execute(&mut engine, &chain, 50, None, None).unwrap() {
+        BackstopRun::Decided(BackstopTick::Idle) => {}
+        other => panic!("immature refund must pass through as Decided(Idle), got {other:?}"),
+    }
+
+    // Congestion: the refund alone can no longer relay. At maturity the
+    // tower's fire stalls below the floor and the app bumps AUTONOMOUSLY.
+    chain.set_congestion(refund_fee + 5_000);
+    while chain.tip_height() < maturity {
+        chain.mine();
+    }
+    let (change_op, child_fee) =
+        match app.backstop_execute(&mut engine, &chain, 50, None, None).unwrap() {
+            BackstopRun::Executed {
+                decision: BackstopTick::Bump { target: BumpTarget::Refund },
+                outcome:
+                    BumpOutcome::Submitted {
+                        reserve_outpoint,
+                        deposit_linked,
+                        change_outpoint,
+                        change_amount_sats,
+                        ..
+                    },
+            } => {
+                assert_eq!(reserve_outpoint, reserve_op);
+                assert!(!deposit_linked, "a refund bump is silent — no deposit linkage");
+                (change_outpoint, (params.anchor_sats + reserve_amt) - change_amount_sats)
+            }
+            other => panic!("expected an executed refund bump, got {other:?}"),
+        };
+    assert!(child_fee > 0, "the child pays a real fee");
+    // The 1P1C package is on the wire: the refund now spends our escrow, the
+    // reserve is spent in the ledger, and the child change is a fresh coin.
+    assert!(matches!(chain.spend_status(our_op), SpendStatus::InMempool));
+    assert_eq!(engine.ledger().find(&reserve_op).unwrap().state, CoinState::Spent);
+    assert_eq!(engine.ledger().find(&change_op).unwrap().state, CoinState::Unspent);
+
+    // Confirm: the refund lands; the loop quiesces (StandDown → Idle).
+    chain.mine();
+    assert!(matches!(chain.spend_status(our_op), SpendStatus::Confirmed(_)));
+    match app.backstop_execute(&mut engine, &chain, 50, None, None).unwrap() {
+        BackstopRun::Decided(BackstopTick::Idle) => {}
+        other => panic!("a confirmed refund must quiesce, got {other:?}"),
+    }
 }

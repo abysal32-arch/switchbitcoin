@@ -183,6 +183,32 @@ impl SwapEngine {
         self.keys.as_ref()
     }
 
+    /// Issue a fresh Reserve change key (index + spk) through the ledger — the
+    /// CPFP bump child's change output lands at it, keeping the reserve pool
+    /// self-replenishing. Borrow-splitting wrapper (the ledger and the keys are
+    /// both this engine's fields).
+    pub fn issue_reserve_key(&mut self) -> Result<(u32, bitcoin::ScriptBuf)> {
+        self.ledger.next_reserve_key(self.keys.as_ref())
+    }
+
+    /// Execute a decided CPFP bump against this wallet's ledger + enclave seam
+    /// — a borrow-splitting wrapper over
+    /// [`run_cpfp_bump`](crate::wallet::backstop_driver::run_cpfp_bump) (an
+    /// outside caller cannot borrow the engine's ledger mutably and its keys
+    /// shared at the same time).
+    pub fn execute_cpfp_bump(
+        &mut self,
+        chain: &impl crate::chain::AuthoritativeChainView,
+        req: crate::wallet::backstop_driver::CpfpBumpRequest<'_>,
+    ) -> Result<crate::wallet::backstop_driver::BumpOutcome> {
+        crate::wallet::backstop_driver::run_cpfp_bump(
+            &mut self.ledger,
+            self.keys.as_ref(),
+            chain,
+            req,
+        )
+    }
+
     /// The AUTHORITATIVE swap_session_id, derived exactly as the settlement
     /// layer derives it (canonical order of `our_pubkey`/`their_pubkey`), so
     /// the engine's store keys and the settlement possession file always agree.

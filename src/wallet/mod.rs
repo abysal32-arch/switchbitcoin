@@ -75,7 +75,7 @@ pub mod orchestrator;
 pub mod recovery_driver;
 pub mod store;
 
-pub use app::{AppTick, SwapApp};
+pub use app::{AppTick, BackstopRun, StalledParent, SwapApp};
 pub use backstop_driver::{
     run_cpfp_bump, BackstopDriver, BackstopTick, BumpOutcome, CpfpBumpRequest,
 };
