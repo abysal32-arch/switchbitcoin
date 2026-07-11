@@ -444,3 +444,106 @@ fn abort_and_funding_records_route_correctly() {
     assert!(ticks.iter().any(|(sid, t)| *sid == sid_abort && matches!(t, RecoveryTick::Refund(_))));
     assert!(ticks.iter().any(|(sid, t)| *sid == sid_unfunded && matches!(t, RecoveryTick::Funding { refund: None })));
 }
+
+/// A standard P2TR-shaped spk and a minimal v3 spend of `outpoint`, so a swept
+/// escrow can be marked confirmed-spent on the sim.
+fn std_p2tr_spk() -> bitcoin::ScriptBuf {
+    let mut v = vec![0x51u8, 0x20];
+    v.extend_from_slice(&[0x66u8; 32]);
+    bitcoin::ScriptBuf::from_bytes(v)
+}
+fn spend_of(outpoint: OutPoint, out_sats: u64) -> Vec<u8> {
+    use bitcoin::{absolute, transaction::Version, Amount, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+    let tx = Transaction {
+        version: Version(3),
+        lock_time: absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: outpoint,
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut { value: Amount::from_sat(out_sats), script_pubkey: std_p2tr_spk() }],
+    };
+    bitcoin::consensus::encode::serialize(&tx)
+}
+
+/// Deep-audit gap #2: a terminal `Completed`/`Refunded` record is RE-VALIDATED
+/// against the chain, not trusted blindly. When the defining spend is still
+/// confirmed the record reads `Settled`; when a reorg reverted it (the spend is
+/// no longer confirmed) recovery re-drives — rebroadcast the completion, or
+/// re-enter the refund decision — instead of a false `Settled`.
+#[test]
+fn terminal_records_are_revalidated_against_reorg() {
+    let params = Params::testnet_provisional();
+    let s_height = 800_000u32;
+    let unit = params.escrow_amount_sats();
+
+    let a = keypair();
+    let b = keypair();
+    let internal = swapkey::settlement::state_machine::canonical_internal_key(a.pk, b.pk).unwrap();
+    let escrow = Escrow::new(&internal, &a.pk, params.delta_early).unwrap();
+    let dest = escrow.funding_script_pubkey().clone();
+    let our_escrow = OutPoint::new(txid_from(0x50), 0);
+    let their_escrow = OutPoint::new(txid_from(0x51), 0);
+    let refund = PreArmedRefund::arm(
+        &escrow, our_escrow, unit, &a.sk, dest, params.tier_d_sats, params.anchor_sats, s_height,
+    )
+    .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _) = SwapStore::open(dir.path(), &ModeledEnclave).unwrap();
+    let rec = |phase| SwapRecord {
+        swap_session_id: [0x60u8; 32],
+        role: Role::SecretHolder,
+        phase,
+        params: params.clone(),
+        s_height,
+        sweep_escrow_height: s_height,
+        our_escrow_outpoint: Some(our_escrow),
+        their_escrow_outpoint: Some(their_escrow),
+        pre_armed_refund: Some(refund.clone()),
+        completion_tx: Some(vec![0xcdu8; 64]),
+        possession_record: None,
+    };
+
+    // --- Completed, swept escrow still CONFIRMED-spent → Settled. ---
+    let good = SimChain::new(s_height);
+    good.fund(their_escrow, s_height);
+    good.broadcast(&spend_of(their_escrow, unit - 500)).unwrap();
+    good.mine();
+    assert_eq!(
+        RecoveryDriver::reenter_one(&store, &rec(SwapPhase::Completed), &good).unwrap(),
+        RecoveryTick::Settled
+    );
+
+    // --- Completed, but a reorg reverted the completion (swept escrow unspent
+    // again) → rebroadcast the persisted completion signature, not Settled. ---
+    let reorged = SimChain::new(s_height);
+    reorged.fund(their_escrow, s_height); // funded, NOT spent (completion reverted)
+    match RecoveryDriver::reenter_one(&store, &rec(SwapPhase::Completed), &reorged).unwrap() {
+        RecoveryTick::Rebroadcast { final_sig, confirmed: false } => {
+            assert_eq!(final_sig, [0xcdu8; 64])
+        }
+        other => panic!("a reverted Completed must rebroadcast, got {other:?}"),
+    }
+
+    // --- Refunded, our refund still CONFIRMED-spent → Settled. ---
+    let good_r = SimChain::new(s_height);
+    good_r.fund(our_escrow, s_height);
+    good_r.broadcast(&spend_of(our_escrow, unit - 500)).unwrap();
+    good_r.mine();
+    assert_eq!(
+        RecoveryDriver::reenter_one(&store, &rec(SwapPhase::Refunded), &good_r).unwrap(),
+        RecoveryTick::Settled
+    );
+
+    // --- Refunded, but a reorg reverted the refund (our escrow live again) →
+    // re-enter the refund decision (matured + unspent → BroadcastRefund). ---
+    let reorged_r = SimChain::new(refund.csv_maturity_height());
+    reorged_r.fund(our_escrow, s_height); // funded, unspent
+    match RecoveryDriver::reenter_one(&store, &rec(SwapPhase::Refunded), &reorged_r).unwrap() {
+        RecoveryTick::Refund(AbortAction::BroadcastRefund) => {}
+        other => panic!("a reverted Refunded must re-drive the refund, got {other:?}"),
+    }
+}

@@ -36,7 +36,7 @@
 
 use std::path::PathBuf;
 
-use bitcoin::Txid;
+use bitcoin::{OutPoint, Txid};
 
 use crate::chain::AuthoritativeChainView;
 use crate::crypto::ValidatedFinalSig;
@@ -124,13 +124,58 @@ impl RecoveryDriver {
         chain: &impl AuthoritativeChainView,
     ) -> Result<RecoveryTick> {
         match rec.phase {
-            SwapPhase::Completed | SwapPhase::Refunded => Ok(RecoveryTick::Settled),
+            SwapPhase::Completed => Self::reenter_completed(rec, chain),
+            SwapPhase::Refunded => Self::reenter_refunded(rec, chain),
             SwapPhase::Signing => Ok(RecoveryTick::RewritePending),
             SwapPhase::Funding => Self::reenter_funding(rec, chain),
             SwapPhase::Released => Self::reenter_released(store, rec, chain),
             SwapPhase::Completing => Self::reenter_completing(store, rec, chain),
             SwapPhase::AbortRefund => Self::reenter_abort_refund(store, rec, chain),
         }
+    }
+
+    /// `Completed` — RE-VALIDATED against the chain, not trusted blindly (deep
+    /// audit finding: a reorg can revert a shallowly-confirmed completion, and
+    /// mapping the record straight to `Settled` would leave recovery blind to
+    /// an escrow that is contestable again). Our completion swept the
+    /// counterparty escrow (`their_escrow_outpoint`); if that spend is still
+    /// CONFIRMED the swap is genuinely done (`Settled`). If a reorg reverted it
+    /// (the completion fell back to mempool / the output is unspent again), we
+    /// rebroadcast the persisted completion signature — idempotent, exactly the
+    /// `Completing` babysit — so the settled leg is re-established rather than
+    /// silently abandoned. (A deep reorg in which the COUNTERPARTY then refunds
+    /// its own escrow is an unrecoverable, mainnet-implausible edge — 144+ block
+    /// reorg — and simply reads `Settled`; documented, out of scope.)
+    fn reenter_completed(rec: &SwapRecord, chain: &dyn AuthoritativeChainView) -> Result<RecoveryTick> {
+        let swept = rec
+            .their_escrow_outpoint
+            .ok_or(Error::Ordering("Completed record without the swept escrow outpoint"))?;
+        if spend_confirmed(chain, swept) {
+            return Ok(RecoveryTick::Settled);
+        }
+        // Reverted: rebroadcast our completion if we retained its signature.
+        match completion_sig(rec) {
+            Ok(final_sig) => Ok(RecoveryTick::Rebroadcast { final_sig, confirmed: false }),
+            // No signature to rebroadcast (should not happen for Completed) —
+            // nothing actionable; report Settled rather than fabricate work.
+            Err(_) => Ok(RecoveryTick::Settled),
+        }
+    }
+
+    /// `Refunded` — RE-VALIDATED like `Completed`. Our refund spent our own
+    /// escrow (`our_escrow_outpoint`); if that spend is still CONFIRMED the
+    /// funds are genuinely reclaimed (`Settled`). If a reorg reverted it, the
+    /// escrow is live again — re-enter the completion-supersedes refund decision
+    /// (`AbortDriver`: rebroadcast the refund at maturity, or take the swap if a
+    /// counterparty completion is now winning), never a false `Settled`.
+    fn reenter_refunded(rec: &SwapRecord, chain: &dyn AuthoritativeChainView) -> Result<RecoveryTick> {
+        let our_escrow = rec
+            .our_escrow_outpoint
+            .ok_or(Error::Ordering("Refunded record without our escrow outpoint"))?;
+        if spend_confirmed(chain, our_escrow) {
+            return Ok(RecoveryTick::Settled);
+        }
+        Ok(RecoveryTick::Refund(Self::abort_action(rec, chain)?))
     }
 
     /// `AbortRefund`: the completion-supersedes decision on our escrow — with
@@ -286,6 +331,14 @@ impl RecoveryDriver {
             .ok_or(Error::Deadline("abort path without a pre-armed refund (G2)"))?;
         Ok(AbortDriver::next_abort_action(chain, our_escrow, refund, refund_txid(refund)))
     }
+}
+
+/// Is `outpoint` CONFIRMED spent (not merely in the mempool)? The re-validation
+/// gate for a terminal record: only a confirmed spend proves the terminal still
+/// holds after a possible reorg. An `InMempool` or `Unspent` reading means the
+/// terminal's defining spend is not (or no longer) on chain — re-drive.
+fn spend_confirmed(chain: &dyn AuthoritativeChainView, outpoint: OutPoint) -> bool {
+    matches!(chain.spend_status(outpoint), crate::chain::SpendStatus::Confirmed(_))
 }
 
 /// The txid of our own pre-armed refund, for the `AbortDriver`'s
