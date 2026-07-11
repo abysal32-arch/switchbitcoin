@@ -51,7 +51,7 @@
 
 use bitcoin::{OutPoint, Txid};
 
-use crate::chain::{ChainView, SpendStatus};
+use crate::chain::{AuthoritativeChainView, SpendStatus};
 use crate::settlement::state_machine::Role;
 use crate::tx::backstop::{build_cpfp_bump, finalize_cpfp_bump, required_child_fee};
 use crate::tx::setup::pre_encumbrance_spk;
@@ -127,7 +127,7 @@ impl BackstopDriver {
     pub fn tick(
         &self,
         rec: &SwapRecord,
-        chain: &impl ChainView,
+        chain: &impl AuthoritativeChainView,
         congested: bool,
         reserve_available: bool,
     ) -> Result<BackstopTick> {
@@ -170,7 +170,7 @@ impl BackstopDriver {
     /// refund needs nothing this tick.
     pub fn tick_refund_only(
         &self,
-        chain: &impl ChainView,
+        chain: &impl AuthoritativeChainView,
         reserve_available: bool,
     ) -> Result<BackstopTick> {
         Ok(self.refund_side(chain, reserve_available)?.unwrap_or(BackstopTick::Idle))
@@ -181,7 +181,7 @@ impl BackstopDriver {
     /// or the refund is congested, `None` (Idle/StandDown) when it needs nothing.
     fn refund_side(
         &self,
-        chain: &impl ChainView,
+        chain: &impl AuthoritativeChainView,
         reserve_available: bool,
     ) -> Result<Option<BackstopTick>> {
         Ok(match self.tower.tick(chain)? {
@@ -283,7 +283,7 @@ pub enum BumpOutcome {
 pub fn run_cpfp_bump(
     ledger: &mut Ledger,
     keys: &dyn KeySource,
-    chain: &impl ChainView,
+    chain: &impl AuthoritativeChainView,
     req: CpfpBumpRequest<'_>,
 ) -> Result<BumpOutcome> {
     let child_fee = required_child_fee(
@@ -368,7 +368,7 @@ pub fn run_cpfp_bump(
 /// non-refund tx of ours to back-stop — an off-chain/volatile phase, a terminal,
 /// or the refund path (which the tower owns). See the module-doc classification
 /// safe-default for the unbroadcast↔in-flight split.
-pub fn classify_stalled_tx(rec: &SwapRecord, chain: &impl ChainView) -> Option<StalledTx> {
+pub fn classify_stalled_tx(rec: &SwapRecord, chain: &impl AuthoritativeChainView) -> Option<StalledTx> {
     match rec.phase {
         // Escrow-funding Setup in flight (the coordinator's tx; classified for
         // completeness even though its broadcast is increment-3 territory).
@@ -428,7 +428,7 @@ pub fn classify_stalled_tx(rec: &SwapRecord, chain: &impl ChainView) -> Option<S
 /// and not by our refund" IS the reveal. Unknown spender (`spend_txid` = None
 /// on views that don't track it) stays conservative: treat as revealed —
 /// `KeepFighting` never abandons, which is the safe direction.
-fn reveal_is_public(rec: &SwapRecord, chain: &impl ChainView) -> bool {
+fn reveal_is_public(rec: &SwapRecord, chain: &impl AuthoritativeChainView) -> bool {
     let e_sl = match rec.role {
         Role::SecretLearner => rec.our_escrow_outpoint,
         Role::SecretHolder => rec.their_escrow_outpoint,
@@ -456,7 +456,7 @@ fn our_refund_txid(rec: &SwapRecord) -> Option<bitcoin::Txid> {
 
 /// Is OUR completion confirmed — i.e. is the escrow WE sweep
 /// (`their_escrow_outpoint`) confirmed spent (by us)?
-fn our_completion_confirmed(rec: &SwapRecord, chain: &impl ChainView) -> bool {
+fn our_completion_confirmed(rec: &SwapRecord, chain: &impl AuthoritativeChainView) -> bool {
     match rec.their_escrow_outpoint {
         Some(op) => matches!(chain.spend_status(op), SpendStatus::Confirmed(_)),
         None => false,
@@ -466,7 +466,7 @@ fn our_completion_confirmed(rec: &SwapRecord, chain: &impl ChainView) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chain::SimChain;
+    use crate::chain::{ChainView, SimChain};
     use crate::settlement::params::Params;
     use crate::settlement::refund::{confirm_watchtower_handoff, PreArmedRefund};
     use bitcoin::OutPoint;

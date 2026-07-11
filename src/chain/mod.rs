@@ -145,6 +145,30 @@ pub trait ChainView {
     }
 }
 
+/// Marker for a [`ChainView`] whose readings are backed by at least one
+/// SELF-VERIFYING source — the type-level half of the dual-source rule.
+///
+/// The wallet's fund-deciding entry points (`SwapApp`, `SwapDriver`,
+/// `SwapEngine`'s settlement seams, `FundingDriver`, `RecoveryDriver`, the
+/// backstop) require this bound, so a bare untrusted explorer client cannot
+/// be wired into a fund decision BY CONSTRUCTION — it must be composed
+/// through [`DualSourceChainView`] (whose constructor refuses a composition
+/// with no self-verifying source) first. Implemented by:
+/// - [`SimChain`]: it IS the chain — a direct view, not an explorer's claim
+///   about one (and the reason tests need no changes);
+/// - [`DualSourceChainView`]: `new` enforces ≥ 1 self-verifying source, and
+///   its `ChainView` impl routes tip/spend reads to the authoritative source
+///   while funding stays agreement-required.
+///
+/// Deliberately NOT implemented for arbitrary views: a real explorer-backed
+/// `ChainView` (rank 8) must not receive this marker — pair it with a
+/// BIP157/158 client inside a `DualSourceChainView` instead. The marker adds
+/// no methods, so it changes no behavior — only what the compiler accepts.
+pub trait AuthoritativeChainView: ChainView {}
+
+impl AuthoritativeChainView for SimChain {}
+impl<A: ChainSource, B: ChainSource> AuthoritativeChainView for DualSourceChainView<A, B> {}
+
 #[derive(Clone)]
 struct Inner {
     height: u32,

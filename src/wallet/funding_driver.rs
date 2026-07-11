@@ -46,7 +46,7 @@
 
 use bitcoin::{OutPoint, ScriptBuf};
 
-use crate::chain::{ChainView, FundingReading};
+use crate::chain::{AuthoritativeChainView, FundingReading};
 use crate::crypto::ValidatedPoint;
 use crate::settlement::params::Params;
 use crate::settlement::state_machine::{canonical_internal_key, Funded, Funding, PeerSession};
@@ -201,7 +201,7 @@ impl FundingDriver {
     }
 
     /// Anti-substitution read of the counterparty escrow's on-chain spk.
-    fn verify_their_escrow_spk(&self, chain: &impl ChainView) -> SpkCheck {
+    fn verify_their_escrow_spk(&self, chain: &impl AuthoritativeChainView) -> SpkCheck {
         match chain.funding_spk(self.their_escrow) {
             Some(spk) if self.their_escrow_spks.contains(&spk) => SpkCheck::Ok,
             Some(_) => SpkCheck::Mismatch,
@@ -222,7 +222,7 @@ impl FundingDriver {
     /// One pre-funding poll. Idempotent per chain state; safe to re-drive.
     /// `chain` must be the dual-source (or single self-verifying) view — the
     /// same one later handed to [`FundingDriver::into_funded`].
-    pub fn tick(&mut self, chain: &impl ChainView) -> Result<FundingTick> {
+    pub fn tick(&mut self, chain: &impl AuthoritativeChainView) -> Result<FundingTick> {
         if let Some(reason) = self.aborted {
             return Ok(FundingTick::Abort(reason));
         }
@@ -367,7 +367,7 @@ impl FundingDriver {
         self,
         params: Params,
         peer: PeerSession,
-        chain: &impl ChainView,
+        chain: &impl AuthoritativeChainView,
     ) -> std::result::Result<Funded, HandoffError> {
         if let Some(reason) = self.aborted {
             return Err(HandoffError::Refused {

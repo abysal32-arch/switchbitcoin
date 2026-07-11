@@ -22,7 +22,7 @@
 //! for both parties, or the refund is automatic — so the only terminals are
 //! `Completed` and `Refunding`; every "cannot proceed yet" is a re-drive.
 
-use crate::chain::ChainView;
+use crate::chain::AuthoritativeChainView;
 use crate::settlement::state_machine::{Funded, Possessing, Role};
 use crate::wallet::engine::{SettleEntry, SwapContext, SwapEngine};
 use crate::Result;
@@ -71,7 +71,7 @@ impl<'e> SwapDriver<'e> {
         role: Role,
         funded: Funded,
         mut ctx: SwapContext,
-        chain: &impl ChainView,
+        chain: &impl AuthoritativeChainView,
     ) -> Result<Self> {
         // Delegate to the shared settlement-spine primitive: record the funding
         // record, run Phase A, and discriminate a persisted-AbortRefund exit
@@ -86,7 +86,7 @@ impl<'e> SwapDriver<'e> {
     /// Drive Phase B one step. Re-enterable and idempotent: safe to call
     /// repeatedly as the chain advances. Returns a terminal
     /// (`Completed`/`Refunding`) or the non-terminal `AwaitingReveal`.
-    pub fn poll(&mut self, chain: &impl ChainView) -> Result<DriveStatus> {
+    pub fn poll(&mut self, chain: &impl AuthoritativeChainView) -> Result<DriveStatus> {
         // Terminal already reached — return it idempotently. Otherwise borrow
         // the retained `Possessing` and take one shared settlement step;
         // `step_settlement` only BORROWS the `Possessing`, so nothing here can

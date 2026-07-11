@@ -38,7 +38,7 @@ use std::path::PathBuf;
 
 use bitcoin::Txid;
 
-use crate::chain::ChainView;
+use crate::chain::{AuthoritativeChainView, ChainView};
 use crate::crypto::ValidatedFinalSig;
 use crate::settlement::refund::PreArmedRefund;
 use crate::settlement::state_machine::{Possessing, Role};
@@ -106,7 +106,7 @@ impl RecoveryDriver {
     /// readable record plus the paths of any that could not be loaded —
     /// surfaced, never silently skipped (matches [`SwapStore::list`]; a corrupt
     /// file must not hide another swap's deadline).
-    pub fn reenter_all(store: &SwapStore, chain: &dyn ChainView) -> Result<RecoveryScan> {
+    pub fn reenter_all(store: &SwapStore, chain: &impl AuthoritativeChainView) -> Result<RecoveryScan> {
         let (records, failed) = store.list()?;
         let mut ticks = Vec::with_capacity(records.len());
         for rec in &records {
@@ -121,7 +121,7 @@ impl RecoveryDriver {
     pub fn reenter_one(
         store: &SwapStore,
         rec: &SwapRecord,
-        chain: &dyn ChainView,
+        chain: &impl AuthoritativeChainView,
     ) -> Result<RecoveryTick> {
         match rec.phase {
             SwapPhase::Completed | SwapPhase::Refunded => Ok(RecoveryTick::Settled),

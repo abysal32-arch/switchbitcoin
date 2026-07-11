@@ -69,7 +69,7 @@
 
 use bitcoin::OutPoint;
 
-use crate::chain::ChainView;
+use crate::chain::AuthoritativeChainView;
 use crate::crypto::ValidatedPoint;
 use crate::settlement::state_machine::{Funded, PeerSession, Possessing, Role};
 use crate::wallet::backstop_driver::{BackstopDriver, BackstopTick};
@@ -328,7 +328,7 @@ impl SwapApp {
     /// engine drives many swaps. At the handoff this call runs the interlocked
     /// Phase-A adaptor exchange over the peer, which BLOCKS until the exchange
     /// completes or the transport fails — identical to `SwapDriver::start`.
-    pub fn poll(&mut self, engine: &mut SwapEngine, chain: &impl ChainView) -> Result<AppTick> {
+    pub fn poll(&mut self, engine: &mut SwapEngine, chain: &impl AuthoritativeChainView) -> Result<AppTick> {
         match &self.phase {
             AppPhase::Terminal(tick) => return Ok(*tick),
             // Honest error re-surface — never a benign Wait. The original cause
@@ -401,7 +401,7 @@ impl SwapApp {
     pub fn backstop_tick(
         &self,
         engine: &SwapEngine,
-        chain: &impl ChainView,
+        chain: &impl AuthoritativeChainView,
         congested: bool,
         reserve_available: bool,
     ) -> Result<BackstopTick> {
@@ -427,7 +427,7 @@ impl SwapApp {
     /// [`RecoveryDriver::reenter_all`]; the caller drives each returned
     /// [`RecoveryTick`](crate::wallet::recovery_driver::RecoveryTick) and
     /// performs its broadcasts.
-    pub fn recover(engine: &SwapEngine, chain: &dyn ChainView) -> Result<RecoveryScan> {
+    pub fn recover(engine: &SwapEngine, chain: &impl AuthoritativeChainView) -> Result<RecoveryScan> {
         RecoveryDriver::reenter_all(engine.store(), chain)
     }
 
@@ -445,7 +445,7 @@ impl SwapApp {
     fn cross_into_settlement(
         &mut self,
         engine: &mut SwapEngine,
-        chain: &impl ChainView,
+        chain: &impl AuthoritativeChainView,
     ) -> Result<AppTick> {
         // Extract the Funding phase by value (into_funded consumes the driver +
         // peer). The transient placeholder is `Failed`, NOT `Terminal(Wait)`: if
@@ -492,7 +492,7 @@ impl SwapApp {
         &mut self,
         engine: &mut SwapEngine,
         funded: Funded,
-        chain: &impl ChainView,
+        chain: &impl AuthoritativeChainView,
     ) -> Result<AppTick> {
         // Role is the Funded's DERIVED role (from the two funding txids + S), so
         // record_funding persists the same role run_exchange uses — no mismatch.
@@ -519,7 +519,7 @@ impl SwapApp {
     fn step_settling(
         &mut self,
         engine: &mut SwapEngine,
-        chain: &impl ChainView,
+        chain: &impl AuthoritativeChainView,
     ) -> Result<AppTick> {
         let status = {
             let possessing = match &self.phase {
@@ -567,7 +567,7 @@ impl SwapApp {
     fn terminate_abort(
         &mut self,
         engine: &SwapEngine,
-        chain: &impl ChainView,
+        chain: &impl AuthoritativeChainView,
         reason: &'static str,
     ) -> AppTick {
         // Three-state record read: Some / None / unreadable — an Err must

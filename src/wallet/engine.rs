@@ -25,7 +25,7 @@
 //! composition, which is the integration surface the parts couldn't prove on
 //! their own.
 
-use crate::chain::ChainView;
+use crate::chain::AuthoritativeChainView;
 use crate::crypto::adaptor::AdaptorSecret;
 use crate::crypto::{ValidatedFinalSig, ValidatedPoint};
 use crate::settlement::refund::{PreArmedRefund, WatchtowerReceipt};
@@ -252,7 +252,7 @@ impl SwapEngine {
         role: Role,
         funded: Funded,
         ctx: &mut SwapContext,
-        chain: &impl ChainView,
+        chain: &impl AuthoritativeChainView,
     ) -> Result<SettleEntry> {
         // The manifest is the ONLY legitimate params source (record_funding
         // enforces params == the signed manifest), so read it from the engine.
@@ -293,7 +293,7 @@ impl SwapEngine {
         &mut self,
         possessing: &Possessing,
         ctx: &SwapContext,
-        chain: &impl ChainView,
+        chain: &impl AuthoritativeChainView,
     ) -> Result<DriveStatus> {
         // SL: the reveal must be observable before `settle` can extract the
         // claim. A not-ready step is a clean re-drive — the `Possessing` stays
@@ -337,7 +337,7 @@ impl SwapEngine {
         &mut self,
         funded: Funded,
         ctx: &mut SwapContext,
-        _chain: &impl ChainView,
+        _chain: &impl AuthoritativeChainView,
     ) -> Result<Possessing> {
         let role = funded.role();
         let sid = Self::swap_session_id(ctx)?;
@@ -426,7 +426,7 @@ impl SwapEngine {
         &mut self,
         possessing: &Possessing,
         ctx: &SwapContext,
-        chain: &impl ChainView,
+        chain: &impl AuthoritativeChainView,
     ) -> Result<SwapOutcome> {
         let sid = Self::swap_session_id(ctx)?;
 
