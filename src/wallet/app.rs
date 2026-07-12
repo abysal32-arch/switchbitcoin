@@ -82,7 +82,7 @@ use crate::settlement::state_machine::{Funded, PeerSession, Possessing, Role};
 use crate::tx::backstop::{required_child_fee, ANCHOR_VOUT, MAX_BUMP_FEE_SATS};
 use crate::wallet::backstop_driver::{BackstopDriver, BackstopTick, BumpOutcome, CpfpBumpRequest};
 use crate::wallet::ledger::{BumpTarget, LinkageAck};
-use crate::wallet::engine::{DriveStatus, SettleEntry, SwapContext, SwapEngine};
+use crate::wallet::engine::{ChainReconcile, DriveStatus, SettleEntry, SwapContext, SwapEngine};
 use crate::wallet::funding_driver::{FundingDriver, FundingTick, HandoffError};
 use crate::wallet::orchestrator::FundingOrder;
 use crate::wallet::recovery_driver::{RecoveryDriver, RecoveryScan};
@@ -638,6 +638,26 @@ impl SwapApp {
     /// performs its broadcasts.
     pub fn recover(engine: &SwapEngine, chain: &impl AuthoritativeChainView) -> Result<RecoveryScan> {
         RecoveryDriver::reenter_all(engine.store(), chain)
+    }
+
+    /// Whole-wallet STARTUP over a freshly opened engine — steps 2 and 3 of
+    /// the canonical sequence (see
+    /// [`SwapEngine::reconcile_with_chain`](crate::wallet::engine::SwapEngine::reconcile_with_chain))
+    /// in one call: the chain-aware phantom heals FIRST (so no recovery
+    /// decision or later lease selection acts on a coin the chain already
+    /// spent), then the whole-store crash re-entry scan. Returns both
+    /// reports; the caller drives each [`RecoveryTick`]'s broadcasts exactly
+    /// as with [`recover`](SwapApp::recover). Step 1 —
+    /// [`SwapEngine::open`](crate::wallet::engine::SwapEngine::open) — stays
+    /// separate: it must succeed even with the chain backend down, and the
+    /// engine it returns is this function's input.
+    pub fn startup(
+        engine: &mut SwapEngine,
+        chain: &impl AuthoritativeChainView,
+    ) -> Result<(ChainReconcile, RecoveryScan)> {
+        let reconcile = engine.reconcile_with_chain(chain)?;
+        let scan = Self::recover(engine, chain)?;
+        Ok((reconcile, scan))
     }
 
     /// The outpoint our pre-armed refund reclaims (E_ours) — exposed for a

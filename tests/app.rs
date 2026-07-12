@@ -2157,3 +2157,100 @@ fn eternal_mangled_reveal_never_strands_sl() {
     let (ticks, _) = SwapApp::recover(&engine, &degraded).unwrap();
     assert!(matches!(ticks[0].1, RecoveryTick::Settled), "got {:?}", ticks[0].1);
 }
+
+// ============================================================================
+// TASK B: SwapApp::startup — steps 2+3 of the canonical sequence in one call.
+// ============================================================================
+
+/// `SwapApp::startup` composes the chain-aware phantom heal and the recovery
+/// scan in the documented order over a freshly opened engine: the funding-coin
+/// phantom (leased to a record-less swap, its Setup confirmed on chain — the
+/// chain-blind `open` re-exposes it as `Unspent`) is swept BEFORE the scan
+/// runs, and the scan re-enters the surviving recoverable swap (a `Funding`
+/// record whose escrow is confirmed → the standing refund is surfaced) — one
+/// call, both reports.
+#[test]
+fn swap_app_startup_heals_phantoms_then_recovers() {
+    let params = Params::testnet_provisional();
+    let escrow_amt = params.escrow_amount_sats();
+    let d = params.tier_d_sats;
+    let base = 750_000u32;
+    let wallet_dir = tempfile::tempdir().unwrap();
+
+    // The PHANTOM: a pre-encumbrance coin leased to a swap that never wrote a
+    // record, whose real Setup then CONFIRMED on chain.
+    let phantom_pre = onboard_one_coin(wallet_dir.path(), params.pre_encumbrance_sats(), [0xB1u8; 32]);
+    let (p1, p2) = (keypair(), keypair());
+    let internal_p = canonical_internal_key(p1.pk, p2.pk).unwrap();
+    let e_phantom = Escrow::new(&internal_p, &p1.pk, params.delta_early).unwrap();
+    let chain = SimChain::new(base);
+    let (phantom_setup, _phantom_escrow) =
+        build_real_setup(&chain, &params, phantom_pre, base, &e_phantom, &p1.sk);
+    chain.broadcast(&phantom_setup).unwrap();
+    chain.mine();
+    assert!(matches!(chain.spend_status(phantom_pre), SpendStatus::Confirmed(_)));
+
+    // The RECOVERABLE swap: a `Funding` record whose escrow is confirmed on
+    // chain (its standing pre-armed refund must surface in the scan).
+    let (q1, q2) = (keypair(), keypair());
+    let internal_q = canonical_internal_key(q1.pk, q2.pk).unwrap();
+    let e_ours = Escrow::new(&internal_q, &q1.pk, params.delta_early).unwrap();
+    let (rec_setup, rec_escrow_op) = build_real_setup(
+        &chain, &params, OutPoint::new(txid_from(0xC2), 0), base, &e_ours, &q1.sk,
+    );
+    chain.broadcast(&rec_setup).unwrap();
+    chain.mine();
+    let dest = e_ours.funding_script_pubkey().clone();
+    let funded_at = chain.funding_height(rec_escrow_op).unwrap();
+    let rec_refund =
+        PreArmedRefund::arm(&e_ours, rec_escrow_op, escrow_amt, &q1.sk, dest, d, params.anchor_sats, funded_at)
+            .unwrap();
+
+    // STEP 1: chain-blind open — the orphaned lease releases (the phantom is
+    // now `Unspent`, on-chain-spent); then persist the recoverable record.
+    let (mut engine, _) = SwapEngine::open(
+        wallet_dir.path(),
+        &ModeledEnclave,
+        Box::new(ModeledKeySource::new(&ModeledEnclave)),
+        &ModeledTrustRoot,
+    )
+    .unwrap();
+    assert_eq!(engine.ledger().find(&phantom_pre).unwrap().state, CoinState::Unspent);
+    let rec_sid = [0x5Bu8; 32];
+    engine
+        .store()
+        .put(&SwapRecord {
+            swap_session_id: rec_sid,
+            role: Role::SecretHolder,
+            phase: SwapPhase::Funding,
+            params: params.clone(),
+            s_height: 0,
+            sweep_escrow_height: 0,
+            our_escrow_outpoint: Some(rec_escrow_op),
+            their_escrow_outpoint: Some(OutPoint::new(txid_from(0xC3), 0)),
+            pre_armed_refund: Some(rec_refund),
+            completion_tx: None,
+            setup_tx: None,
+            possession_record: None,
+        })
+        .unwrap();
+
+    // STEPS 2+3 in ONE call.
+    let (reconcile, (ticks, failed)) = SwapApp::startup(&mut engine, &chain).unwrap();
+
+    // Step 2 healed the phantom (swept by the lease pass, permanently Spent).
+    assert_eq!(reconcile.leases.swept, vec![phantom_pre]);
+    assert!(reconcile.reserves_swept.is_empty());
+    assert_eq!(engine.ledger().find(&phantom_pre).unwrap().state, CoinState::Spent);
+
+    // Step 3 re-entered the recoverable swap: funded escrow → the standing
+    // pre-armed refund is surfaced (immature → Wait decision).
+    assert!(failed.is_empty());
+    assert_eq!(ticks.len(), 1);
+    assert_eq!(ticks[0].0, rec_sid);
+    assert!(
+        matches!(ticks[0].1, RecoveryTick::Funding { refund: Some(_) }),
+        "the funded Funding record must surface its refund, got {:?}",
+        ticks[0].1
+    );
+}

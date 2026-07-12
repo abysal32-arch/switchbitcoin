@@ -252,6 +252,8 @@ impl SwapEngine {
     ///      swap from its record (refund broadcasts, Setup re-submits, claims).
     /// ```
     ///
+    /// `SwapApp::startup` wraps steps 2+3 into ONE call for composed callers.
+    ///
     /// `open` cannot do step 2 itself (it deliberately takes no chain — a
     /// wallet must open even when the backend is down), and both heals are
     /// no-ops unless a crash straddled a submit→persist window, so a caller
