@@ -206,7 +206,12 @@ impl RecoveryDriver {
         if rec.role == Role::SecretLearner && rec.possession_record.is_some() {
             if let Some(our_escrow) = rec.our_escrow_outpoint {
                 if let Some(reveal) = ClaimScheduler::observe_reveal(chain, our_escrow) {
-                    return Self::restore_and_extract(store, rec, chain, &reveal);
+                    if let Some(tick) = Self::restore_and_extract(store, rec, chain, &reveal)? {
+                        return Ok(tick);
+                    }
+                    // The witness failed extraction (mangled — a degraded
+                    // source, not a claim): keep the plain refund decision
+                    // below; a genuine reveal is picked up on the next scan.
                 }
             }
         }
@@ -249,27 +254,47 @@ impl RecoveryDriver {
     /// on-chain reveal, persisting the finalized signature as `Completing`
     /// BEFORE it is handed back (rule 3). Shared by the `Released` re-entry and
     /// the post-release `AbortRefund` completion-supersedes executor.
+    ///
+    /// Returns `Ok(None)` when the OBSERVED WITNESS fails extraction (a
+    /// malformed BIP340 signature, or a valid one whose extracted t does not
+    /// open T) — the recovery twin of settle's mangled-reveal re-drive: an
+    /// extraction-failing witness is EVIDENCE-FREE (it cannot take the swap),
+    /// so the caller falls back to its no-reveal decision — the refund path —
+    /// exactly as if nothing had been observed. Propagating that Err instead
+    /// would let one permanently lying/degraded source poison the WHOLE
+    /// recovery scan (`reenter_all` stops at the first record Err), stranding
+    /// every other swap's re-entry behind a witness that will never validate.
+    /// Restore/possession failures still `Err` — the record claims G1
+    /// evidence, and corruption there must surface, not be silently skipped.
     fn restore_and_extract(
         store: &SwapStore,
         rec: &SwapRecord,
         chain: &dyn AuthoritativeChainView,
         reveal: &[u8; 64],
-    ) -> Result<RecoveryTick> {
+    ) -> Result<Option<RecoveryTick>> {
         let record_path = rec
             .possession_record
             .as_ref()
             .ok_or(Error::Ordering("restore-and-extract without a possession pointer"))?;
         let restored = Possessing::restore_secret_learner(record_path, &rec.swap_session_id)?;
-        let observed = ValidatedFinalSig::from_bytes(reveal)?;
+        let observed = match ValidatedFinalSig::from_bytes(reveal) {
+            Ok(o) => o,
+            // Not even a valid signature encoding: a degraded source's garbage.
+            Err(_) => return Ok(None),
+        };
         // Extract t and complete our leg; the delay is clamped inside to the
         // swept escrow's claim ceiling (never past S + delta_late).
-        let plan = restored.claim_after_reveal(&observed, chain.tip_height())?;
+        let plan = match restored.claim_after_reveal(&observed, chain.tip_height()) {
+            Ok(p) => p,
+            // Extraction failed (t*G != T): a mangled reveal, not a claim.
+            Err(_) => return Ok(None),
+        };
         let final_sig = plan.comp_sl_final.0;
         let mut next = rec.clone();
         next.phase = SwapPhase::Completing;
         next.completion_tx = Some(final_sig.to_vec());
         store.put(&next)?;
-        Ok(RecoveryTick::Extract { final_sig: Some(final_sig), fallback: AbortAction::Wait })
+        Ok(Some(RecoveryTick::Extract { final_sig: Some(final_sig), fallback: AbortAction::Wait }))
     }
 
     /// `Funding`: if our escrow is confirmed on chain the standing pre-armed
@@ -330,25 +355,29 @@ impl RecoveryDriver {
         // not only once SH completes.
         let _validated = Possessing::restore_secret_learner(record_path, &rec.swap_session_id)?;
 
-        match ClaimScheduler::observe_reveal(chain, our_escrow) {
-            Some(reveal) => Self::restore_and_extract(store, rec, chain, &reveal),
-            None => {
-                // No reveal yet: SH has not completed. The safe fallback is the
-                // AbortDriver decision on OUR escrow — wait, refund at maturity,
-                // or (if SH's completion is winning) take the swap next scan.
-                let refund = rec
-                    .pre_armed_refund
-                    .as_ref()
-                    .ok_or(Error::Deadline("Released record without a pre-armed refund (G2)"))?;
-                let action = AbortDriver::next_abort_action(
-                    chain,
-                    our_escrow,
-                    refund,
-                    refund_txid(refund),
-                );
-                Ok(RecoveryTick::Extract { final_sig: None, fallback: action })
+        if let Some(reveal) = ClaimScheduler::observe_reveal(chain, our_escrow) {
+            if let Some(tick) = Self::restore_and_extract(store, rec, chain, &reveal)? {
+                return Ok(tick);
             }
+            // The observed witness failed extraction (mangled — a degraded/
+            // lying source): fall through to the SAME safe fallback as no
+            // reveal at all. A hard Err here would poison the whole scan
+            // forever on a source that never heals.
         }
+        // No reveal (or none usable): SH has not completed. The safe fallback
+        // is the AbortDriver decision on OUR escrow — wait, refund at maturity,
+        // or (if SH's completion is winning) take the swap next scan.
+        let refund = rec
+            .pre_armed_refund
+            .as_ref()
+            .ok_or(Error::Deadline("Released record without a pre-armed refund (G2)"))?;
+        let action = AbortDriver::next_abort_action(
+            chain,
+            our_escrow,
+            refund,
+            refund_txid(refund),
+        );
+        Ok(RecoveryTick::Extract { final_sig: None, fallback: action })
     }
 
     /// `Completing`: the finalized completion signature was persisted before

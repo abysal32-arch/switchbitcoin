@@ -22,7 +22,7 @@
 //!   re-entry delegates to `RecoveryDriver::reenter_all`.
 
 use bitcoin::OutPoint;
-use swapkey::chain::{ChainView, DualSourceChainView, SimChain, Source, SpendStatus};
+use swapkey::chain::{ChainView, DualSourceChainView, FundingReading, SimChain, Source, SpendStatus};
 use swapkey::crypto::adaptor::AdaptorSecret;
 use swapkey::crypto::ValidatedPoint;
 use swapkey::settlement::params::Params;
@@ -32,7 +32,7 @@ use swapkey::settlement::state_machine::{
 };
 use swapkey::tx::escrow::Escrow;
 use swapkey::tx::setup::build_setup;
-use swapkey::tx::txbuild::{build_completion, finalize_key_spend};
+use swapkey::tx::txbuild::{build_completion, finalize_key_spend, sign_schnorr_single};
 use swapkey::wallet::app::{AppTick, BackstopRun, SwapApp};
 use swapkey::wallet::backstop_driver::{BackstopTick, BumpOutcome};
 use swapkey::wallet::engine::{SwapContext, SwapEngine};
@@ -1876,4 +1876,298 @@ fn terminate_abort_store_read_failure_fails_safe_to_refunding() {
         engine.store().get(&sid).is_err(),
         "terminate_abort must not overwrite an unreadable record"
     );
+}
+
+// ============================================================================
+// TASK 3: the eternal-mangled-reveal BOUND (forward-or-refund closure for the
+// mangled-reveal re-drive, 77018f5) -- end-to-end through SwapApp + backstop.
+// ============================================================================
+
+/// A permanently DEGRADED/LYING view: for the reveal escrow it serves a
+/// witness that FAILS extraction (a valid BIP340 signature over an unrelated
+/// message) on every read, forever -- even after the escrow's real spend
+/// confirms. Everything else delegates to the truth. This is the strongest
+/// version of the degraded-single-source model the mangled-reveal re-drive
+/// (77018f5) was built for: the lie never heals.
+struct DegradedRevealView {
+    inner: SimChain,
+    reveal_escrow: OutPoint,
+    bad_sig: [u8; 64],
+}
+impl ChainView for DegradedRevealView {
+    fn tip_height(&self) -> u32 {
+        self.inner.tip_height()
+    }
+    fn funding_height(&self, op: OutPoint) -> Option<u32> {
+        self.inner.funding_height(op)
+    }
+    fn funding_amount(&self, op: OutPoint) -> Option<u64> {
+        self.inner.funding_amount(op)
+    }
+    fn funding_spk(&self, op: OutPoint) -> Option<bitcoin::ScriptBuf> {
+        self.inner.funding_spk(op)
+    }
+    fn spend_status(&self, op: OutPoint) -> SpendStatus {
+        self.inner.spend_status(op)
+    }
+    fn spend_txid(&self, op: OutPoint) -> Option<bitcoin::Txid> {
+        self.inner.spend_txid(op)
+    }
+    fn verified_funding_reading(&self, op: OutPoint) -> FundingReading {
+        self.inner.verified_funding_reading(op)
+    }
+    fn authoritative_funding_height(&self, op: OutPoint) -> Option<u32> {
+        self.inner.authoritative_funding_height(op)
+    }
+    fn spending_witness_sig(&self, op: OutPoint) -> Option<[u8; 64]> {
+        if op == self.reveal_escrow {
+            Some(self.bad_sig) // the eternal lie
+        } else {
+            self.inner.spending_witness_sig(op)
+        }
+    }
+    fn broadcast(&self, tx: &[u8]) -> Result<bitcoin::Txid> {
+        self.inner.broadcast(tx)
+    }
+    fn submit_package(&self, p: &[u8], c: &[u8]) -> Result<(bitcoin::Txid, bitcoin::Txid)> {
+        self.inner.submit_package(p, c)
+    }
+}
+impl swapkey::chain::AuthoritativeChainView for DegradedRevealView {}
+
+/// TASK 3 -- a reveal that stays mangled FOREVER never strands SL. 77018f5
+/// made a bad-witness reveal a bounded re-drive (`AwaitingReveal`, asserted
+/// pre-maturity); this proves the BOUND end-to-end at the app level:
+///
+///   1. every `poll` under the eternal lie is `AwaitingReveal` -- never a
+///      poison, never a false refund, never a false completion, before OR
+///      after CSV maturity (the app instance cannot be misled either way);
+///   2. `backstop_tick` (the primary-independent cadence) fires the pre-armed
+///      refund exactly at CSV maturity (`FiredRefund`) -- the bound;
+///   3. recovery reconciles the terminal UNDER THE SAME LYING VIEW: the
+///      mangled witness must fall back to the refund decision (the recovery
+///      twin of 77018f5's settle fix -- before that fix, one lying source
+///      poisoned the WHOLE `reenter_all` scan with a hard Err, forever), and
+///      the record advances AbortRefund -> Refunded.
+#[test]
+fn eternal_mangled_reveal_never_strands_sl() {
+    let params = Params::testnet_provisional();
+    let escrow_amt = params.escrow_amount_sats();
+    let d = params.tier_d_sats;
+    let base = 910_000u32;
+    let s_height = base + 1;
+    let delta_late = u32::try_from(params.delta_late()).unwrap();
+
+    let wallet_dir = tempfile::tempdir().unwrap();
+    let sl_pre = onboard_one_coin(wallet_dir.path(), params.pre_encumbrance_sats(), [0xAFu8; 32]);
+    let sh_pre = OutPoint::new(txid_from(0xB9), 0);
+
+    // Grind SL (same as the headline full-swap fixture).
+    let (sh, sl, escrow_e_sl, escrow_e_sh, sl_setup, sh_setup, sl_escrow_op, sh_escrow_op) = loop {
+        let sh = keypair();
+        let sl = keypair();
+        let internal = canonical_internal_key(sh.pk, sl.pk).unwrap();
+        let e_sl = Escrow::new(&internal, &sl.pk, params.delta_early).unwrap();
+        let e_sh = Escrow::new(&internal, &sh.pk, delta_late).unwrap();
+        let probe = SimChain::new(base);
+        let (sl_setup, sl_op) = build_real_setup(&probe, &params, sl_pre, base, &e_sl, &sl.sk);
+        let (sh_setup, sh_op) = build_real_setup(&probe, &params, sh_pre, base, &e_sh, &sh.sk);
+        probe.broadcast(&sl_setup).unwrap();
+        probe.broadcast(&sh_setup).unwrap();
+        probe.mine();
+        if derived_role(&probe, &params, sl_op, sh_op, &sl.pk, &sh.pk) == Role::SecretLearner {
+            break (sh, sl, e_sl, e_sh, sl_setup, sh_setup, sl_op, sh_op);
+        }
+    };
+
+    let chain = SimChain::new(base);
+    chain.fund_with_amount(sl_pre, base, params.pre_encumbrance_sats());
+    chain.fund_with_amount(sh_pre, base, params.pre_encumbrance_sats());
+    chain.broadcast(&sl_setup).unwrap();
+    chain.broadcast(&sh_setup).unwrap();
+    chain.mine();
+
+    let dest = escrow_e_sl.funding_script_pubkey().clone();
+    let comp_sh = build_completion(&escrow_e_sl, sl_escrow_op, escrow_amt, dest.clone(), d, params.anchor_sats).unwrap();
+    let comp_sl = build_completion(&escrow_e_sh, sh_escrow_op, escrow_amt, dest.clone(), d, params.anchor_sats).unwrap();
+    let (msg_sh, msg_sl) = (comp_sh.sighash, comp_sl.sighash);
+    let (root_sh, root_sl) = (escrow_e_sl.merkle_root(), escrow_e_sh.merkle_root());
+    let (ok_sh, ok_sl) = (escrow_e_sl.output_key_xonly(), escrow_e_sh.output_key_xonly());
+
+    let sid = swap_session_id(sl.pk, sh.pk).unwrap();
+    let lease_sl = tempfile::tempdir().unwrap();
+    let lease_sh = tempfile::tempdir().unwrap();
+    let possession_store = tempfile::tempdir().unwrap();
+    let (io_sh, io_sl) = duplex();
+
+    let sl_refund =
+        PreArmedRefund::arm(&escrow_e_sl, sl_escrow_op, escrow_amt, &sl.sk, dest, d, params.anchor_sats, s_height)
+            .unwrap();
+    let maturity = sl_refund.csv_maturity_height();
+    let refund_for_terminal = sl_refund.clone();
+    let sl_receipt = confirm_watchtower_handoff(&sl_refund, sl_refund.fingerprint()).unwrap();
+
+    // The DEGRADED view SL operates through: the witness it serves for E_sl
+    // (the reveal escrow) is a VALID BIP340 signature over an unrelated
+    // message -- observe_reveal happily surfaces it, extraction rejects it
+    // (t*G != T) -- and it never heals.
+    let bad_sig = sign_schnorr_single(sl.sk.serialize(), msg_sl).unwrap();
+    let degraded = DegradedRevealView {
+        inner: chain.clone(),
+        reveal_escrow: sl_escrow_op,
+        bad_sig,
+    };
+
+    // SH counterparty: completes the Phase-A exchange, then goes PERMANENTLY
+    // silent -- it never broadcasts Comp->SH, so no genuine reveal ever
+    // appears; the only "reveal" SL ever sees is the degraded view's lie.
+    let sh_params = params.clone();
+    let sh_handle = std::thread::spawn(move || -> Result<()> {
+        let refund = PreArmedRefund::from_signed_tx(vec![0xaa; 64], s_height + delta_late)?;
+        let _receipt = confirm_watchtower_handoff(&refund, refund.fingerprint())?;
+        let (t, _) = AdaptorSecret::generate()?;
+        let peer = PeerSession::new([0xEAu8; 32], Box::new(io_sh));
+        let funded = Funding::new(sh_params, peer).funded_manual(Role::SecretHolder, s_height)?;
+        let _possessing = funded.run_adaptor_exchange(ExchangeInputs {
+            our_seckey: sh.sk,
+            their_pubkey: vp(&sl.pk),
+            msg_comp_sh: msg_sh,
+            msg_comp_sl: msg_sl,
+            pre_armed_refund: refund,
+            adaptor_secret: Some(t),
+            lease_dir: Some(lease_sh.path().to_path_buf()),
+            possession_store: None,
+            taproot_root_comp_sh: Some(root_sh),
+            taproot_root_comp_sl: Some(root_sl),
+            taproot_output_comp_sh: Some(ok_sh),
+            taproot_output_comp_sl: Some(ok_sl),
+        })?;
+        Ok(()) // dies without ever broadcasting its completion
+    });
+
+    let (mut engine, actions) = SwapEngine::open(
+        wallet_dir.path(),
+        &ModeledEnclave,
+        Box::new(ModeledKeySource::new(&ModeledEnclave)),
+        &ModeledTrustRoot,
+    )
+    .unwrap();
+    assert!(actions.is_empty());
+
+    let ctx = make_ctx(
+        sl.sk, sh.pk, sl_escrow_op, sh_escrow_op, escrow_amt, msg_sh, msg_sl, sl_refund, None,
+        root_sh, root_sl, ok_sh, ok_sl, lease_sl.path().to_path_buf(),
+        possession_store.path().to_path_buf(), sl_receipt, sl_pre,
+    );
+    let peer = PeerSession::new([0xEAu8; 32], Box::new(io_sl));
+    let mut app = SwapApp::begin(&engine, ctx, peer, base + 500, 0).unwrap();
+
+    // Drive to settlement through the DEGRADED view. The crossing poll blocks
+    // in the Phase-A rendezvous with the SH thread; the first settlement step
+    // then observes the mangled witness and must re-drive -- 77018f5's bound.
+    let mut reached_awaiting = false;
+    for _ in 0..12 {
+        match app.poll(&mut engine, &degraded).unwrap() {
+            AppTick::BroadcastSetup => {
+                chain.broadcast(&sl_setup).expect("idempotent re-broadcast");
+                app.setup_broadcast(&engine, &sl_setup).unwrap();
+            }
+            AppTick::Wait => {}
+            AppTick::AwaitingReveal => {
+                reached_awaiting = true;
+                break;
+            }
+            other => panic!("unexpected tick under the eternal lie: {other:?}"),
+        }
+    }
+    assert!(reached_awaiting, "the mangled witness must surface as AwaitingReveal");
+    sh_handle.join().unwrap().expect("SH exchange half");
+    assert_eq!(
+        engine.store().get(&sid).unwrap().unwrap().phase,
+        SwapPhase::Released,
+        "SL is post-G1 (possession persisted), awaiting a reveal that never validates"
+    );
+
+    // (1) The re-drive is STABLE: more polls under the unchanged lie stay
+    // AwaitingReveal -- never a poison, never a false terminal.
+    for _ in 0..3 {
+        assert_eq!(app.poll(&mut engine, &degraded).unwrap(), AppTick::AwaitingReveal);
+    }
+    // Pre-maturity the backstop has nothing to do (escrow unspent, immature).
+    assert_eq!(
+        app.backstop_tick(&engine, &degraded, false, false).unwrap(),
+        BackstopTick::Idle
+    );
+
+    // (2) THE BOUND: at CSV maturity the dead-device tower fires the
+    // pre-armed refund -- the lie cannot delay it (authoritative reads).
+    while chain.tip_height() < maturity {
+        chain.mine();
+    }
+    assert_eq!(
+        app.poll(&mut engine, &degraded).unwrap(),
+        AppTick::AwaitingReveal,
+        "the app loop itself never falsely refunds -- the tower owns the exit"
+    );
+    match app.backstop_tick(&engine, &degraded, false, false).unwrap() {
+        BackstopTick::FiredRefund => {}
+        other => panic!("the tower must fire the refund at CSV maturity, got {other:?}"),
+    }
+    chain.mine(); // the refund confirms
+    assert!(matches!(chain.spend_status(sl_escrow_op), SpendStatus::Confirmed(_)));
+
+    // Even with our refund CONFIRMED the lie persists -- and still cannot
+    // mislead the live instance into a false terminal in either direction.
+    assert_eq!(app.poll(&mut engine, &degraded).unwrap(), AppTick::AwaitingReveal);
+
+    // (3) Terminal reconciliation UNDER THE LYING VIEW. reenter_released
+    // observes the mangled witness; it must fall back to the refund decision
+    // (before the restore_and_extract fallback fix, this Err-poisoned the
+    // whole recovery scan) and report the confirmed refund.
+    let (ticks, failed) = SwapApp::recover(&engine, &degraded).unwrap();
+    assert!(failed.is_empty());
+    assert_eq!(ticks.len(), 1);
+    assert!(
+        matches!(
+            ticks[0].1,
+            RecoveryTick::Extract { final_sig: None, fallback: AbortAction::Refunded }
+        ),
+        "a mangled witness must fall back to the (confirmed) refund decision, got {:?}",
+        ticks[0].1
+    );
+
+    // The caller routes the swap onto its abort path (SwapEngine::abort's
+    // Released -> AbortRefund move, driven at the store here -- abort itself
+    // is engine-internal).
+    let mut rec = engine.store().get(&sid).unwrap().unwrap();
+    rec.phase = SwapPhase::AbortRefund;
+    engine.store().put(&rec).unwrap();
+
+    // reenter_abort_refund's completion-supersedes EXECUTOR also observes the
+    // mangled witness (SL + possession present) -- it too must fall back to
+    // the plain refund decision instead of erroring the scan.
+    let (ticks, _) = SwapApp::recover(&engine, &degraded).unwrap();
+    assert!(
+        matches!(ticks[0].1, RecoveryTick::Refund(AbortAction::Refunded)),
+        "the AbortRefund executor must skip an extraction-failing witness, got {:?}",
+        ticks[0].1
+    );
+
+    // The refund confirmed -> the record reaches its true terminal.
+    let ctx2 = make_ctx(
+        sl.sk, sh.pk, sl_escrow_op, sh_escrow_op, escrow_amt, msg_sh, msg_sl,
+        refund_for_terminal.clone(), None, root_sh, root_sl, ok_sh, ok_sl,
+        lease_sl.path().to_path_buf(), possession_store.path().to_path_buf(),
+        confirm_watchtower_handoff(&refund_for_terminal, refund_for_terminal.fingerprint()).unwrap(),
+        sl_pre,
+    );
+    engine.record_refunded(&ctx2).unwrap();
+    assert_eq!(
+        engine.store().get(&sid).unwrap().unwrap().phase,
+        SwapPhase::Refunded,
+        "forward-or-refund closed: the eternally-mangled reveal ended in Refunded"
+    );
+    // And SL's funds are genuinely reclaimed on the REAL chain by OUR refund.
+    let comp_sl_unusable = comp_sl; // never finalized -- no valid reveal ever existed
+    drop(comp_sl_unusable);
 }
