@@ -1569,3 +1569,311 @@ fn backstop_execute_short_circuits_a_futile_zero_fee_bump() {
         CoinState::Unspent
     );
 }
+
+// ============================================================================
+// Feature-2 audit: the funded discriminator's two blind spots (findings G/L)
+// and the pre-record backstop's lying-source suppression (finding H).
+// ============================================================================
+
+/// Finding G (record-less crash, Setup still IN THE MEMPOOL): the caller
+/// broadcast its fully-signed Setup and crashed in the broadcast ->
+/// `setup_broadcast` gap; the Setup stalls UNCONFIRMED under congestion while
+/// Block-X passes. The fresh app's first poll is a terminal abort -- and every
+/// prior funded discriminator read negative here (no flag, no record, and the
+/// escrow outpoint does not exist yet, so the authoritative funding read is
+/// blind). Miners do not honor Block-X: that Setup can still confirm, so a
+/// clean `Aborted` ("nothing locked") would abandon the refund guard and stop
+/// the backstop on a coin that is about to lock -- violating forward-or-refund.
+/// The funding COIN's spend status observes the shape throughout: the abort
+/// must classify `Refunding` and write the early record it found missing.
+#[test]
+fn record_less_abort_with_setup_still_in_mempool_classifies_refunding() {
+    let params = Params::testnet_provisional();
+    let escrow_amt = params.escrow_amount_sats();
+    let d = params.tier_d_sats;
+    let base = 720_000u32;
+    let wallet_dir = tempfile::tempdir().unwrap();
+    let sl_pre = onboard_one_coin(wallet_dir.path(), params.pre_encumbrance_sats(), [0xACu8; 32]);
+    let (sh, sl) = loop {
+        let a = keypair();
+        let b = keypair();
+        if vp(&a.pk).to_bytes() < vp(&b.pk).to_bytes() {
+            break (b, a);
+        } else if vp(&b.pk).to_bytes() < vp(&a.pk).to_bytes() {
+            break (a, b);
+        }
+    };
+    let internal = canonical_internal_key(sh.pk, sl.pk).unwrap();
+    let e_ours = Escrow::new(&internal, &sl.pk, params.delta_early).unwrap();
+    let e_theirs = Escrow::new(&internal, &sh.pk, params.delta_early).unwrap();
+    let chain = SimChain::new(base);
+    let (sl_setup, our_op) = build_real_setup(&chain, &params, sl_pre, base, &e_ours, &sl.sk);
+    let (_x, their_op) =
+        build_real_setup(&chain, &params, OutPoint::new(txid_from(0xB6), 0), base, &e_theirs, &sh.sk);
+
+    // Pre-crash session: the Setup goes on the wire but NEVER CONFIRMS
+    // (congestion); the process dies before setup_broadcast.
+    chain.broadcast(&sl_setup).unwrap();
+    assert!(
+        matches!(chain.spend_status(sl_pre), SpendStatus::InMempool),
+        "the funding coin's spend (our Setup) sits in the mempool"
+    );
+    assert_eq!(
+        chain.authoritative_funding_height(our_op),
+        None,
+        "the escrow outpoint does not exist yet -- the funding read is blind"
+    );
+
+    let dest = e_ours.funding_script_pubkey().clone();
+    let comp = build_completion(&e_ours, our_op, escrow_amt, dest.clone(), d, params.anchor_sats).unwrap();
+    let refund =
+        PreArmedRefund::arm(&e_ours, our_op, escrow_amt, &sl.sk, dest, d, params.anchor_sats, base).unwrap();
+    let receipt = confirm_watchtower_handoff(&refund, refund.fingerprint()).unwrap();
+    let (mut engine, _) = SwapEngine::open(
+        wallet_dir.path(),
+        &ModeledEnclave,
+        Box::new(ModeledKeySource::new(&ModeledEnclave)),
+        &ModeledTrustRoot,
+    )
+    .unwrap();
+    let lease = tempfile::tempdir().unwrap();
+    let possession = tempfile::tempdir().unwrap();
+    let ctx = make_ctx(
+        sl.sk, sh.pk, our_op, their_op, escrow_amt, comp.sighash, comp.sighash, refund, None,
+        e_ours.merkle_root(), e_theirs.merkle_root(), e_ours.output_key_xonly(),
+        e_theirs.output_key_xonly(), lease.path().to_path_buf(), possession.path().to_path_buf(),
+        receipt, sl_pre,
+    );
+    let sid = SwapEngine::swap_session_id(&ctx).unwrap();
+    let block_x = base + 40;
+    let mut app =
+        SwapApp::begin(&engine, ctx, PeerSession::new([0u8; 32], Box::new(DeadEnd)), block_x, 0)
+            .unwrap();
+    assert!(engine.store().get(&sid).unwrap().is_none(), "record-less by construction");
+
+    // Block-X passes with the Setup STILL unconfirmed (advance, never mine).
+    chain.advance(41);
+    assert!(chain.tip_height() >= block_x);
+    assert!(matches!(chain.spend_status(sl_pre), SpendStatus::InMempool));
+
+    match app.poll(&mut engine, &chain).unwrap() {
+        AppTick::Refunding(reason) => assert!(reason.contains("Block X"), "got {reason:?}"),
+        other => panic!(
+            "an in-mempool Setup means the coin can still lock -- must be Refunding, got {other:?}"
+        ),
+    }
+    // The missing early record was written and advanced, so recover() sees it.
+    assert_eq!(
+        engine.store().get(&sid).unwrap().unwrap().phase,
+        SwapPhase::AbortRefund,
+        "the terminal wrote the missing early record and advanced it"
+    );
+
+    // Miners confirm the Setup after Block-X (they do not honor it): recovery
+    // drives the standing refund over the now-funded escrow.
+    chain.mine();
+    assert!(chain.authoritative_funding_height(our_op).is_some());
+    let (ticks, _) = SwapApp::recover(&engine, &chain).unwrap();
+    assert_eq!(ticks.len(), 1);
+    assert!(matches!(ticks[0].1, RecoveryTick::Refund(_)), "got {:?}", ticks[0].1);
+}
+
+/// Finding H (pre-record backstop vs a lying source): the no-record arm of
+/// `backstop_tick` guards a funded-but-record-less escrow's dead-device
+/// refund. That funded/not decision must be the AUTHORITATIVE read -- on the
+/// agreement-required `funding_height` a single lying source (never syncing)
+/// collapses the reading to None, the tower reads Idle forever, and the
+/// pre-armed refund never fires at CSV maturity: the escrow strands. Same
+/// rationale as `terminate_abort` / `reenter_funding` /
+/// `rebroadcast_setup_if_unconfirmed`, which all use the authoritative read.
+#[test]
+fn backstop_pre_record_fires_the_refund_despite_a_lying_source() {
+    let params = Params::testnet_provisional();
+    let escrow_amt = params.escrow_amount_sats();
+    let d = params.tier_d_sats;
+    let base = 730_000u32;
+    let wallet_dir = tempfile::tempdir().unwrap();
+    let sl_pre = onboard_one_coin(wallet_dir.path(), params.pre_encumbrance_sats(), [0xADu8; 32]);
+    let (sh, sl) = loop {
+        let a = keypair();
+        let b = keypair();
+        if vp(&a.pk).to_bytes() < vp(&b.pk).to_bytes() {
+            break (b, a);
+        } else if vp(&b.pk).to_bytes() < vp(&a.pk).to_bytes() {
+            break (a, b);
+        }
+    };
+    let internal = canonical_internal_key(sh.pk, sl.pk).unwrap();
+    let e_ours = Escrow::new(&internal, &sl.pk, params.delta_early).unwrap();
+    let e_theirs = Escrow::new(&internal, &sh.pk, params.delta_early).unwrap();
+    let truth = SimChain::new(base);
+    let liar = SimChain::new(base);
+    let (sl_setup, our_op) = build_real_setup(&truth, &params, sl_pre, base, &e_ours, &sl.sk);
+    let (_x, their_op) =
+        build_real_setup(&truth, &params, OutPoint::new(txid_from(0xB7), 0), base, &e_theirs, &sh.sk);
+
+    // Our Setup confirms ON TRUTH ONLY; the liar never syncs, so the
+    // agreement-required funding_height reads None throughout.
+    truth.broadcast(&sl_setup).unwrap();
+    truth.mine();
+    let view = DualSourceChainView::new(
+        Source::self_verifying(truth.clone()),
+        Source::untrusted(liar.clone()),
+    )
+    .unwrap();
+    assert_eq!(view.funding_height(our_op), None, "the liar suppresses the agreement read");
+    assert!(view.authoritative_funding_height(our_op).is_some());
+
+    let dest = e_ours.funding_script_pubkey().clone();
+    let comp = build_completion(&e_ours, our_op, escrow_amt, dest.clone(), d, params.anchor_sats).unwrap();
+    // Arm at the escrow's REAL funding height so the refund's own maturity
+    // matches the chain's CSV enforcement (the tower must actually broadcast).
+    let funded_at = truth.funding_height(our_op).unwrap();
+    let refund =
+        PreArmedRefund::arm(&e_ours, our_op, escrow_amt, &sl.sk, dest, d, params.anchor_sats, funded_at)
+            .unwrap();
+    let maturity = refund.csv_maturity_height();
+    let receipt = confirm_watchtower_handoff(&refund, refund.fingerprint()).unwrap();
+    let (engine, _) = SwapEngine::open(
+        wallet_dir.path(),
+        &ModeledEnclave,
+        Box::new(ModeledKeySource::new(&ModeledEnclave)),
+        &ModeledTrustRoot,
+    )
+    .unwrap();
+    let lease = tempfile::tempdir().unwrap();
+    let possession = tempfile::tempdir().unwrap();
+    let ctx = make_ctx(
+        sl.sk, sh.pk, our_op, their_op, escrow_amt, comp.sighash, comp.sighash, refund, None,
+        e_ours.merkle_root(), e_theirs.merkle_root(), e_ours.output_key_xonly(),
+        e_theirs.output_key_xonly(), lease.path().to_path_buf(), possession.path().to_path_buf(),
+        receipt, sl_pre,
+    );
+    let sid = SwapEngine::swap_session_id(&ctx).unwrap();
+    // Record-less: setup_broadcast never ran (the exact shape this arm guards).
+    let app =
+        SwapApp::begin(&engine, ctx, PeerSession::new([0u8; 32], Box::new(DeadEnd)), base + 500, 0)
+            .unwrap();
+    assert!(engine.store().get(&sid).unwrap().is_none());
+
+    // Past CSV maturity the dead-device tower must fire REGARDLESS of the
+    // liar: the tower acts on authoritative reads a liar cannot suppress.
+    while truth.tip_height() < maturity {
+        truth.mine();
+    }
+    match app.backstop_tick(&engine, &view, false, false).unwrap() {
+        BackstopTick::FiredRefund => {}
+        other => panic!("the pre-record tower must fire at maturity, got {other:?}"),
+    }
+    // The refund actually landed on the authoritative chain.
+    assert!(
+        !matches!(truth.spend_status(our_op), SpendStatus::Unspent),
+        "the pre-armed refund is on the wire"
+    );
+}
+
+/// Finding L (the read-err discriminator): a store read FAILURE at the abort
+/// classifier must fail SAFE to `Refunding` -- never collapse into the "no
+/// record" clean-abort arm (a false `Aborted` on a funded swap abandons the
+/// refund guard; a false `Refunding` on an unfunded one is harmless). A
+/// regression collapsing `get()` Err into None (e.g. an `.ok().flatten()`
+/// refactor) would flip this test's terminal to `Aborted`. Also pins the
+/// `!read_err` guard: the corrupt record is NOT overwritten by the early-
+/// record write (the terminal stays in-memory; the evidence is preserved).
+#[test]
+fn terminate_abort_store_read_failure_fails_safe_to_refunding() {
+    let params = Params::testnet_provisional();
+    let escrow_amt = params.escrow_amount_sats();
+    let d = params.tier_d_sats;
+    let base = 740_000u32;
+    let wallet_dir = tempfile::tempdir().unwrap();
+    let sl_pre = onboard_one_coin(wallet_dir.path(), params.pre_encumbrance_sats(), [0xAEu8; 32]);
+    let (sh, sl) = loop {
+        let a = keypair();
+        let b = keypair();
+        if vp(&a.pk).to_bytes() < vp(&b.pk).to_bytes() {
+            break (b, a);
+        } else if vp(&b.pk).to_bytes() < vp(&a.pk).to_bytes() {
+            break (a, b);
+        }
+    };
+    let internal = canonical_internal_key(sh.pk, sl.pk).unwrap();
+    let e_ours = Escrow::new(&internal, &sl.pk, params.delta_early).unwrap();
+    let e_theirs = Escrow::new(&internal, &sh.pk, params.delta_early).unwrap();
+    let chain = SimChain::new(base);
+    // Real outpoints/refund, but NOTHING ever goes on the wire: the chain
+    // discriminators all read negative, isolating the read-err arm.
+    let (_sl_setup, our_op) = build_real_setup(&chain, &params, sl_pre, base, &e_ours, &sl.sk);
+    let (_x, their_op) =
+        build_real_setup(&chain, &params, OutPoint::new(txid_from(0xB8), 0), base, &e_theirs, &sh.sk);
+
+    let dest = e_ours.funding_script_pubkey().clone();
+    let comp = build_completion(&e_ours, our_op, escrow_amt, dest.clone(), d, params.anchor_sats).unwrap();
+    let refund =
+        PreArmedRefund::arm(&e_ours, our_op, escrow_amt, &sl.sk, dest, d, params.anchor_sats, base).unwrap();
+    let receipt = confirm_watchtower_handoff(&refund, refund.fingerprint()).unwrap();
+    let (mut engine, _) = SwapEngine::open(
+        wallet_dir.path(),
+        &ModeledEnclave,
+        Box::new(ModeledKeySource::new(&ModeledEnclave)),
+        &ModeledTrustRoot,
+    )
+    .unwrap();
+    let lease = tempfile::tempdir().unwrap();
+    let possession = tempfile::tempdir().unwrap();
+    let ctx = make_ctx(
+        sl.sk, sh.pk, our_op, their_op, escrow_amt, comp.sighash, comp.sighash, refund.clone(), None,
+        e_ours.merkle_root(), e_theirs.merkle_root(), e_ours.output_key_xonly(),
+        e_theirs.output_key_xonly(), lease.path().to_path_buf(), possession.path().to_path_buf(),
+        receipt, sl_pre,
+    );
+    let sid = SwapEngine::swap_session_id(&ctx).unwrap();
+    let block_x = base + 40;
+    let mut app =
+        SwapApp::begin(&engine, ctx, PeerSession::new([0u8; 32], Box::new(DeadEnd)), block_x, 0)
+            .unwrap();
+
+    // A prior session's record exists on disk...
+    engine
+        .store()
+        .put(&SwapRecord {
+            swap_session_id: sid,
+            role: Role::SecretHolder,
+            phase: SwapPhase::Funding,
+            params: params.clone(),
+            s_height: 0,
+            sweep_escrow_height: 0,
+            our_escrow_outpoint: Some(our_op),
+            their_escrow_outpoint: Some(their_op),
+            pre_armed_refund: Some(refund),
+            completion_tx: None,
+            setup_tx: None,
+            possession_record: None,
+        })
+        .unwrap();
+    // ...but the sealed file is DAMAGED (the post-crash condition records are
+    // likeliest to be in): flip bytes so the GCM open fails.
+    let rec_path = {
+        let hex: String = sid.iter().map(|b| format!("{b:02x}")).collect();
+        wallet_dir.path().join(format!("{hex}.swap"))
+    };
+    let mut sealed = std::fs::read(&rec_path).expect("the sealed record exists");
+    let mid = sealed.len() / 2;
+    sealed[mid] ^= 0xFF;
+    std::fs::write(&rec_path, &sealed).unwrap();
+    assert!(engine.store().get(&sid).is_err(), "the damaged record must read as Err");
+
+    // Drive a Block-X abort: flag unset, record unreadable, chain clean --
+    // the read failure alone must classify FUNDED (fail safe).
+    chain.advance(41);
+    match app.poll(&mut engine, &chain).unwrap() {
+        AppTick::Refunding(reason) => assert!(reason.contains("Block X"), "got {reason:?}"),
+        other => panic!("an unreadable record must fail safe to Refunding, got {other:?}"),
+    }
+    // The `!read_err` guard: the damaged file was NOT overwritten by the
+    // early-record write -- the evidence survives for a rescan.
+    assert!(
+        engine.store().get(&sid).is_err(),
+        "terminate_abort must not overwrite an unreadable record"
+    );
+}

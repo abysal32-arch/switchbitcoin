@@ -44,9 +44,12 @@
 //! Setup #2 on the wire a deterministic beat after verification). Jitter is
 //! privacy, not safety — a crash that resamples and re-anchors is harmless.
 
+use core::cell::RefCell;
+use std::collections::HashMap;
+
 use bitcoin::{OutPoint, ScriptBuf};
 
-use crate::chain::{AuthoritativeChainView, FundingReading};
+use crate::chain::{AuthoritativeChainView, ChainView, FundingReading};
 use crate::crypto::ValidatedPoint;
 use crate::settlement::params::Params;
 use crate::settlement::state_machine::{canonical_internal_key, Funded, Funding, PeerSession};
@@ -315,7 +318,20 @@ impl FundingDriver {
                             self.aborted = Some(SPK_MISMATCH_ABORT);
                             FundingTick::Abort(SPK_MISMATCH_ABORT)
                         }
-                        SpkCheck::Unverifiable => FundingTick::Wait,
+                        // Unverifiable is a re-poll — but when both escrows are
+                        // already AUTHORITATIVELY confirmed (the restarted-
+                        // driver shape: broadcast flag lost, both escrows long
+                        // on chain) Block-X is disarmed and a PERSISTENT
+                        // spk-only liar would otherwise stall this Wait
+                        // forever; that is the same source-disagreement stall
+                        // the classification exists for, so surface it.
+                        SpkCheck::Unverifiable => {
+                            if both_auth {
+                                FundingTick::AwaitingVerification
+                            } else {
+                                FundingTick::Wait
+                            }
+                        }
                     },
                 }
             }
@@ -330,7 +346,26 @@ impl FundingDriver {
                         self.aborted = Some(SPK_MISMATCH_ABORT);
                         FundingTick::Abort(SPK_MISMATCH_ABORT)
                     }
-                    SpkCheck::Unverifiable => FundingTick::Wait,
+                    // A coordinator go-signal means both escrows are agreement-
+                    // confirmed (hence authoritatively confirmed — `both_auth`),
+                    // so an unverifiable spk here is a SOURCE DISAGREEING about
+                    // the escrow's identity: the same persistent-liar stall the
+                    // Wait-arm classification surfaces. Without it a spk-only
+                    // liar would hold a fully-funded swap at a bare `Wait`
+                    // forever (Block-X disarmed, coordinator satisfied), and
+                    // `SwapApp::poll`'s refund-maturity escalation — keyed on
+                    // `AwaitingVerification` — could never terminate the swap;
+                    // only the independent backstop cadence would save the
+                    // funds, leaving the record permanently non-terminal. The
+                    // same liar lying about the AMOUNT already classifies and
+                    // escalates; the spk must not be the softer lie.
+                    SpkCheck::Unverifiable => {
+                        if both_auth {
+                            FundingTick::AwaitingVerification
+                        } else {
+                            FundingTick::Wait
+                        }
+                    }
                 }
             }
             FundingAction::Abort(reason) => {
@@ -356,8 +391,12 @@ impl FundingDriver {
     /// `await_funded` then independently re-derives both heights, re-enforces
     /// the window, and derives the role from the two funding txids + S; a
     /// failure past that point ([`HandoffError::Fatal`]) does consume the
-    /// peer session, but with the pre-checks above every remaining cause is
-    /// a construction bug, not a chain transient.
+    /// peer session, but the agreement funding reads are PINNED for the
+    /// handoff's duration (`PinnedFundingView`), so the pre-check and
+    /// `await_funded` judge the identical reading — a live-source flicker
+    /// between the two reads surfaces as the non-consuming `Refused`, never
+    /// a `Fatal`, and every remaining `Fatal` cause is a construction bug,
+    /// not a chain transient.
     ///
     /// `params` must be the manifest params (`engine.manifest().current()
     /// .params().clone()`) — `record_funding` enforces the equality later.
@@ -376,10 +415,14 @@ impl FundingDriver {
                 error: Error::Abort(reason),
             });
         }
+        // Pin the agreement funding reads for the WHOLE handoff: the
+        // coordinator go-signal below and settlement's `await_funded` at the
+        // bottom must judge the same reading (see `PinnedFundingView`).
+        let chain = PinnedFundingView::new(chain);
         // `jitter_ready = true` cannot force a false go-signal: jitter only
         // gates pre-broadcast paths, none of which yield Proceed.
         let action = match self.coordinator.next_funding_action(
-            chain,
+            &chain,
             self.order,
             self.our_escrow,
             self.their_escrow,
@@ -396,7 +439,7 @@ impl FundingDriver {
             FundingAction::Proceed { .. } => {
                 // Un-bypassable identity gate: even on a coordinator go-signal,
                 // never mint a Funded against a substituted counterparty escrow.
-                match self.verify_their_escrow_spk(chain) {
+                match self.verify_their_escrow_spk(&chain) {
                     SpkCheck::Ok => {}
                     SpkCheck::Mismatch => {
                         let mut driver = self;
@@ -440,10 +483,90 @@ impl FundingDriver {
             }
         }
         Funding::new(params, peer)
-            .await_funded(chain, self.our_escrow, self.their_escrow, &self.our_pk, &self.their_pk)
+            .await_funded(&chain, self.our_escrow, self.their_escrow, &self.our_pk, &self.their_pk)
             .map_err(HandoffError::Fatal)
     }
 }
+
+/// Pins the AGREEMENT-REQUIRED funding reads of a live chain view for the
+/// duration of one `into_funded` handoff, so the coordinator's `Refused`
+/// pre-check and settlement's `await_funded` judge the IDENTICAL reading.
+///
+/// The two are separate, non-atomic reads of a live view: on a real
+/// dual-source view each `funding_height` call re-queries both remote
+/// sources, so a source flicker/lag (or a reorg) landing BETWEEN the
+/// coordinator's go-signal and `await_funded`'s own re-read would collapse a
+/// `Some` to `None` mid-handoff — turning a fully-funded honest swap into a
+/// session-consuming [`HandoffError::Fatal`] over a one-read transient the
+/// `Refused` arm was designed to absorb. Memoizing the first read of each
+/// agreement method per outpoint closes that window in the WALLET layer
+/// (settlement's `await_funded` is frozen surface and keeps its signature).
+///
+/// `funding_height` and `verified_funding_reading` are pinned INDEPENDENTLY
+/// (the dual view can legitimately answer height-agreement `Some` while the
+/// amount-bearing reading is `Unverifiable`); a flicker straddling the two
+/// still lands in a coordinator `Wait` → `Refused` — the absorbing,
+/// non-consuming arm. Tip, spend, spk, and authoritative reads pass through
+/// live: they feed decisions that must act on current state.
+struct PinnedFundingView<'a, C: AuthoritativeChainView> {
+    inner: &'a C,
+    heights: RefCell<HashMap<OutPoint, Option<u32>>>,
+    readings: RefCell<HashMap<OutPoint, FundingReading>>,
+}
+
+impl<'a, C: AuthoritativeChainView> PinnedFundingView<'a, C> {
+    fn new(inner: &'a C) -> Self {
+        Self { inner, heights: RefCell::new(HashMap::new()), readings: RefCell::new(HashMap::new()) }
+    }
+}
+
+impl<C: AuthoritativeChainView> ChainView for PinnedFundingView<'_, C> {
+    fn tip_height(&self) -> u32 {
+        self.inner.tip_height()
+    }
+    fn funding_height(&self, outpoint: OutPoint) -> Option<u32> {
+        *self
+            .heights
+            .borrow_mut()
+            .entry(outpoint)
+            .or_insert_with(|| self.inner.funding_height(outpoint))
+    }
+    fn funding_amount(&self, outpoint: OutPoint) -> Option<u64> {
+        self.inner.funding_amount(outpoint)
+    }
+    fn funding_spk(&self, outpoint: OutPoint) -> Option<ScriptBuf> {
+        self.inner.funding_spk(outpoint)
+    }
+    fn spend_status(&self, escrow_outpoint: OutPoint) -> crate::chain::SpendStatus {
+        self.inner.spend_status(escrow_outpoint)
+    }
+    fn spend_txid(&self, outpoint: OutPoint) -> Option<bitcoin::Txid> {
+        self.inner.spend_txid(outpoint)
+    }
+    fn verified_funding_reading(&self, outpoint: OutPoint) -> FundingReading {
+        *self
+            .readings
+            .borrow_mut()
+            .entry(outpoint)
+            .or_insert_with(|| self.inner.verified_funding_reading(outpoint))
+    }
+    fn authoritative_funding_height(&self, outpoint: OutPoint) -> Option<u32> {
+        self.inner.authoritative_funding_height(outpoint)
+    }
+    fn spending_witness_sig(&self, outpoint: OutPoint) -> Option<[u8; 64]> {
+        self.inner.spending_witness_sig(outpoint)
+    }
+    fn broadcast(&self, tx_bytes: &[u8]) -> Result<bitcoin::Txid> {
+        self.inner.broadcast(tx_bytes)
+    }
+    fn submit_package(&self, parent_bytes: &[u8], child_bytes: &[u8]) -> Result<(bitcoin::Txid, bitcoin::Txid)> {
+        self.inner.submit_package(parent_bytes, child_bytes)
+    }
+}
+
+// The pin wraps a view that is itself authoritative (the bound requires it),
+// and only MEMOIZES that view's own answers — it introduces no new source.
+impl<C: AuthoritativeChainView> AuthoritativeChainView for PinnedFundingView<'_, C> {}
 
 /// Why [`FundingDriver::into_funded`] did not mint a [`Funded`].
 ///

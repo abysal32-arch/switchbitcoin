@@ -55,8 +55,10 @@
 //! and its `setup_broadcast` call; a re-driven restart heals it (the fresh
 //! driver re-issues `BroadcastSetup`, the re-broadcast is idempotent, and
 //! `setup_broadcast` re-runs), and even inside that gap a pre-funding ABORT
-//! cannot mislabel: `terminate_abort` also consults the chain's authoritative
-//! funding reading, classifies funded, and writes the record it found missing.
+//! cannot mislabel: `terminate_abort` also consults the chain — the escrow's
+//! authoritative funding reading once the Setup confirmed, and the funding
+//! coin's spend status while it is still in the mempool — classifies funded,
+//! and writes the record it found missing.
 //!
 //! Never-confirming-Setup handling: a funded-classified abort whose Setup later
 //! falls out of every mempool and NEVER confirms would otherwise leave its
@@ -74,7 +76,7 @@
 
 use bitcoin::OutPoint;
 
-use crate::chain::AuthoritativeChainView;
+use crate::chain::{AuthoritativeChainView, SpendStatus};
 use crate::crypto::ValidatedPoint;
 use crate::settlement::state_machine::{Funded, PeerSession, Possessing, Role};
 use crate::tx::backstop::{required_child_fee, ANCHOR_VOUT, MAX_BUMP_FEE_SATS};
@@ -466,9 +468,14 @@ impl SwapApp {
             Some(rec) => self.backstop.tick(&rec, chain, congested, reserve_available),
             // No durable record yet. Still guard a funded-but-record-less escrow's
             // dead-device refund (the pre-`Proceed` funded-abort case); nothing
-            // locked ⇒ Idle.
+            // locked ⇒ Idle. AUTHORITATIVE read, matching `terminate_abort`,
+            // `reenter_funding`, and `rebroadcast_setup_if_unconfirmed`: a lying
+            // source that HIDES a real confirmation must not be able to suppress
+            // the standing pre-armed refund (the agreement-required read
+            // collapses to `None` on any single-source disagreement, which would
+            // keep the tower Idle past CSV maturity on a liar's say-so).
             None => {
-                if chain.funding_height(self.ctx.our_escrow_op).is_some() {
+                if chain.authoritative_funding_height(self.ctx.our_escrow_op).is_some() {
                     self.backstop.tick_refund_only(chain, reserve_available)
                 } else {
                     Ok(BackstopTick::Idle)
@@ -752,11 +759,15 @@ impl SwapApp {
     ///   an unfunded swap is harmless — recovery's Funding arm yields no
     ///   refund action and the tower needs a funding height — while a false
     ///   `Aborted` on a funded one abandons the guard),
-    /// - the CHAIN's authoritative funding reading of our escrow (outranks
-    ///   everything: it directly observes the record-less crash shape, and it
-    ///   is what makes the `AwaitingVerification` escalation — whose
-    ///   precondition already implies both escrows are authoritatively
-    ///   confirmed — always classify as a funded abort).
+    /// - the CHAIN (outranks everything): the authoritative funding reading of
+    ///   our escrow — it directly observes the record-less crash shape once the
+    ///   Setup confirms, and it is what makes the `AwaitingVerification`
+    ///   escalation — whose precondition already implies both escrows are
+    ///   authoritatively confirmed — always classify as a funded abort — OR a
+    ///   non-`Unspent` spend of the funding coin, which observes the SAME shape
+    ///   while the Setup still sits unconfirmed in the mempool (the escrow
+    ///   outpoint does not exist yet, so the funding read alone is blind, but
+    ///   miners do not honor Block-X and can still confirm that Setup).
     ///
     /// A funded abort is also made DURABLE (best-effort, mirroring
     /// `SwapEngine::abort` — the terminal classification itself must not fail
@@ -781,8 +792,20 @@ impl SwapApp {
             },
             Err(_) => (None, None, true),
         };
-        let chain_funded =
-            chain.authoritative_funding_height(self.ctx.our_escrow_op).is_some();
+        // The chain is read TWICE, because the record-less crash shape has two
+        // faces: after the Setup CONFIRMS, the escrow's authoritative funding
+        // height observes it directly; while the Setup still sits UNCONFIRMED
+        // in the mempool, the escrow outpoint does not exist yet (the funding
+        // read is blind), but the pre-encumbrance coin our Setup spends
+        // already reads InMempool — and a Setup the miners can still confirm
+        // (they do not honor Block-X) must never be classified "nothing
+        // locked". A non-Unspent funding coin is therefore funded. False
+        // positives are fail-safe by the same argument as `read_err`: the
+        // coin is leased to THIS swap, so nothing else spends it honestly.
+        let chain_funded = chain
+            .authoritative_funding_height(self.ctx.our_escrow_op)
+            .is_some()
+            || !matches!(chain.spend_status(self.ctx.funding_coin), SpendStatus::Unspent);
         let funded = self.our_setup_broadcast || record.is_some() || read_err || chain_funded;
         let tick = if funded {
             if let Some(sid) = sid {

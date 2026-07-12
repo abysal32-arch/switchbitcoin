@@ -286,6 +286,18 @@ impl AbortDriver {
                 // own refund, we are Refunded; otherwise a completion won.
                 match (our_refund_txid, spend_txid(chain, our_escrow)) {
                     (Some(mine), Some(seen)) if mine == seen => AbortAction::Refunded,
+                    // We hold a refund candidate but the view cannot NAME the
+                    // spender (spend_txid unreportable — the trait permits
+                    // it): claiming either terminal would be a guess, and a
+                    // false `Completed` would persist an inverted terminal
+                    // (recovery's caller passes the refund txid derived from
+                    // the record, so this is the shape a spend_txid-less
+                    // view always lands in after our own refund confirms).
+                    // Stay honestly non-terminal and re-poll until a view
+                    // that reports the spender resolves it.
+                    (Some(_), None) => AbortAction::Wait,
+                    // No refund of ours was ever armed/known: a confirmed
+                    // sweep can only be a completion.
                     _ => AbortAction::Completed,
                 }
             }
@@ -311,10 +323,13 @@ impl AbortDriver {
 }
 
 /// The txid currently spending an outpoint (mempool or confirmed), if any.
-/// Used only to distinguish OUR refund from a counterparty completion; a
-/// view that cannot report it collapses to "not ours" (conservative: we then
-/// treat an unknown spend as a winning completion and take the swap rather
-/// than double-spend).
+/// Used only to distinguish OUR refund from a counterparty completion. A
+/// view that cannot report it collapses differently per decision: for the
+/// IN-MEMPOOL double-spend decision, unknown = "not ours" (conservative — we
+/// treat it as a winning completion and take the swap rather than
+/// double-spend); for the CONFIRMED terminal reconciliation, unknown with a
+/// known refund candidate is `Wait` (honestly non-terminal — a guessed
+/// `Completed` over our own confirmed refund would invert the terminal).
 fn spend_txid(chain: &dyn AuthoritativeChainView, outpoint: OutPoint) -> Option<bitcoin::Txid> {
     chain.spend_txid(outpoint)
 }
@@ -550,6 +565,62 @@ mod tests {
             "our refund is in the mempool; keep waiting for it"
         );
         chain.mine();
+        assert_eq!(
+            AbortDriver::next_abort_action(&chain, op(1), &r, Some(refund_txid)),
+            AbortAction::Refunded
+        );
+    }
+
+    /// A view that KNOWS an outpoint is spent but cannot NAME the spender —
+    /// the trait's default `spend_txid = None` (a filter-based client may
+    /// track spent-ness without retaining the spending tx).
+    struct SpendTxidless(SimChain);
+    impl ChainView for SpendTxidless {
+        fn tip_height(&self) -> u32 {
+            self.0.tip_height()
+        }
+        fn funding_height(&self, op: OutPoint) -> Option<u32> {
+            self.0.funding_height(op)
+        }
+        fn spend_status(&self, op: OutPoint) -> SpendStatus {
+            self.0.spend_status(op)
+        }
+        fn spend_txid(&self, _op: OutPoint) -> Option<bitcoin::Txid> {
+            None
+        }
+        fn broadcast(&self, tx: &[u8]) -> crate::Result<bitcoin::Txid> {
+            self.0.broadcast(tx)
+        }
+    }
+    impl AuthoritativeChainView for SpendTxidless {}
+
+    /// Terminal reconciliation must not GUESS: with our own refund confirmed
+    /// but the spender unreportable (`spend_txid` None — permitted by the
+    /// trait), the driver used to claim `Completed` — an inverted terminal
+    /// (recovery derives `our_refund_txid` from the record, so this is the
+    /// exact shape a spend_txid-less view always lands in after our refund
+    /// confirms). It must stay honestly non-terminal (`Wait`) until a view
+    /// that names the spender resolves it; the full view says `Refunded`.
+    #[test]
+    fn confirmed_spend_with_unreportable_spender_is_not_claimed_completed() {
+        let chain = SimChain::new(500);
+        chain.fund(op(1), 500);
+        while chain.tip_height() < 600 {
+            chain.mine();
+        }
+        let refund_bytes = spend_of(op(1), 400);
+        let r = PreArmedRefund::from_signed_tx(refund_bytes, 600).unwrap();
+        let refund_txid = chain.broadcast(r.tx_bytes()).unwrap();
+        chain.mine(); // our refund CONFIRMS
+
+        let blind = SpendTxidless(chain.clone());
+        assert!(matches!(blind.spend_status(op(1)), SpendStatus::Confirmed(_)));
+        assert_eq!(
+            AbortDriver::next_abort_action(&blind, op(1), &r, Some(refund_txid)),
+            AbortAction::Wait,
+            "an unreportable spender must never be claimed Completed over our own refund"
+        );
+        // The full view (spender reportable) resolves the same state honestly.
         assert_eq!(
             AbortDriver::next_abort_action(&chain, op(1), &r, Some(refund_txid)),
             AbortAction::Refunded
