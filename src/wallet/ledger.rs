@@ -17,6 +17,10 @@
 //!   * `OnboardingChange` — the one change output; never touches a swap.
 //!   * `Reserve` — CPFP backstop coins (congestion-only; opt-in WITH a
 //!     typed linkage acknowledgement for completions, silent for refunds).
+//!     PROVISIONED BY THE SPLIT: onboarding carves one dedicated reserve
+//!     output of `params.cpfp_reserve_sats` per deposit split (skipped only
+//!     when the deposit cannot fund it alongside one unit + fee); change can
+//!     additionally be promoted via `promote_change_to_reserve`.
 //!   * `Swapped` — exactly D at a fresh destination; carries a persisted
 //!     `deposit_linked` taint flag when a deposit-provenance reserve ever
 //!     bumped its completion (the linkage is recorded, not just consented).
@@ -325,6 +329,12 @@ pub struct SplitPlan {
     /// Which output index carries the change (shuffled position — a fixed
     /// change position would fingerprint the tx shape). None if no change.
     pub change_vout: Option<u32>,
+    /// The dedicated CPFP-reserve output the split carved
+    /// (`params.cpfp_reserve_sats`), or 0 when the deposit was too small to
+    /// fund it (reserve skipped; the backstop stays inert for this wallet).
+    pub reserve_sats: u64,
+    /// Which output index carries the reserve (shuffled like the change).
+    pub reserve_vout: Option<u32>,
     /// Sampled per-child delay DURATIONS (seconds); the absolute eligibility
     /// is fixed at confirmation time.
     pub delay_secs: Vec<u64>,
@@ -542,11 +552,25 @@ impl Ledger {
     }
 
     /// Phase 1 auto-split: build + sign the split of one deposit into k
-    /// (≤ 64) pre-encumbrance outputs of EXACTLY D + Δ_fee each plus at most
-    /// one change output at a SHUFFLED position; sub-dust change folds into
-    /// the fee; fee capped against absurdity. Per-child delays are sampled
-    /// now but ANCHOR AT CONFIRMATION. Everything persists atomically before
-    /// return (crash ⇒ rebroadcastable from the ledger alone).
+    /// (≤ 64) pre-encumbrance outputs of EXACTLY D + Δ_fee each, ONE dedicated
+    /// CPFP-reserve output of exactly `params.cpfp_reserve_sats`, plus at most
+    /// one change output — reserve and change at SHUFFLED positions; sub-dust
+    /// change folds into the fee; fee capped against absurdity. Per-child
+    /// delays are sampled now but ANCHOR AT CONFIRMATION. Everything persists
+    /// atomically before return (crash ⇒ rebroadcastable from the ledger
+    /// alone).
+    ///
+    /// RESERVE CARVE (the production backstop provisioning): the reserve is
+    /// deducted from the spendable pool BEFORE the k-unit division —
+    /// deterministic, never competing with change rounding. It is minted
+    /// `class: Reserve` at a fresh `KeyPurpose::Reserve` key with `parent` =
+    /// this deposit, so its deposit provenance stays structurally readable
+    /// (the completion-bump consent gate is target-based and unaffected by
+    /// key purpose). TOO-SMALL DEPOSIT: if the deposit cannot fund
+    /// `reserve + 1 unit + fee`, the reserve is SKIPPED (not an error) — the
+    /// split still onboards what it can and the CPFP backstop simply stays
+    /// inert for this wallet until a larger deposit is split (or change is
+    /// explicitly promoted via [`promote_change_to_reserve`](Self::promote_change_to_reserve)).
     pub fn split_deposit(
         &mut self,
         deposit: OutPoint,
@@ -574,20 +598,29 @@ impl Ledger {
         let spendable = dep_amount
             .checked_sub(fee_sats)
             .ok_or(Error::Validation("ledger: fee exceeds deposit"))?;
-        let k = (spendable / unit).min(MAX_PRE_ENC_OUTPUTS);
+        // Carve the dedicated CPFP reserve BEFORE the k-unit division — but
+        // only if at least one full unit still fits alongside it (the
+        // too-small-deposit case skips the reserve, never the onboarding).
+        let reserve_sats = match spendable.checked_sub(params.cpfp_reserve_sats) {
+            Some(rem) if rem >= unit => params.cpfp_reserve_sats,
+            _ => 0,
+        };
+        let k = ((spendable - reserve_sats) / unit).min(MAX_PRE_ENC_OUTPUTS);
         if k == 0 {
             return Err(Error::Validation(
                 "ledger: deposit too small for one pre-encumbrance unit",
             ));
         }
-        let mut change = spendable - k * unit;
+        let mut change = spendable - reserve_sats - k * unit;
         let mut effective_fee = fee_sats;
         if change > 0 && change < DUST_SATS {
             effective_fee += change;
             change = 0;
         }
 
-        // Sample per-child delay DURATIONS + the shuffled change position.
+        // Sample per-child delay DURATIONS + the shuffled reserve/change
+        // positions (distinct slots, jointly uniform — fixed positions would
+        // fingerprint the tx shape).
         let (lo_h, hi_h) = params.onboarding_delay_hours;
         let mut delay_secs = Vec::with_capacity(k as usize);
         for _ in 0..k {
@@ -595,21 +628,39 @@ impl Ledger {
             let jitter = sample_range_u64(0, 3599)?;
             delay_secs.push(hours * 3600 + jitter);
         }
+        let n_outputs = k + (reserve_sats > 0) as u64 + (change > 0) as u64;
+        let reserve_vout = if reserve_sats > 0 {
+            Some(sample_range_u64(0, n_outputs - 1)? as u32)
+        } else {
+            None
+        };
         let change_vout = if change > 0 {
-            Some(sample_range_u64(0, k)? as u32) // position among k+1 outputs
+            // Uniform over the slots the reserve did not take.
+            let mut cv = sample_range_u64(0, n_outputs - 1 - reserve_vout.map_or(0, |_| 1))?
+                as u32;
+            if let Some(rv) = reserve_vout {
+                if cv >= rv {
+                    cv += 1;
+                }
+            }
+            Some(cv)
         } else {
             None
         };
 
         self.transact(|l| {
-            // Fresh keys + output list with the change at its shuffled slot.
-            let n_outputs = k + change_vout.map_or(0, |_| 1);
+            // Fresh keys + output list with reserve/change at their slots.
             let mut outputs: Vec<(ScriptBuf, u64)> = Vec::with_capacity(n_outputs as usize);
             let mut child_meta: Vec<(u32, u32, u64)> = Vec::new(); // (vout, key_index, delay)
             let mut change_meta: Option<(u32, u32)> = None; // (vout, key_index)
+            let mut reserve_meta: Option<(u32, u32)> = None; // (vout, key_index)
             let mut pre_i = 0usize;
             for vout in 0..n_outputs as u32 {
-                if Some(vout) == change_vout {
+                if Some(vout) == reserve_vout {
+                    let (idx, spk) = l.issue_key(KeyPurpose::Reserve, keys)?;
+                    reserve_meta = Some((vout, idx));
+                    outputs.push((spk, reserve_sats));
+                } else if Some(vout) == change_vout {
                     let (idx, spk) = l.issue_key(KeyPurpose::OnboardingChange, keys)?;
                     change_meta = Some((vout, idx));
                     outputs.push((spk, change));
@@ -673,6 +724,28 @@ impl Ledger {
                     split_attempts: Vec::new(),
                 });
             }
+            if let Some((vout, idx)) = reserve_meta {
+                l.coins.push(CoinRecord {
+                    outpoint: OutPoint::new(txid, vout),
+                    amount_sats: reserve_sats,
+                    class: CoinClass::Reserve,
+                    state: CoinState::PendingConfirm,
+                    key_purpose: KeyPurpose::Reserve,
+                    key_index: idx,
+                    created_height: 0,
+                    // No onboarding delay: reserves never fund an escrow (the
+                    // decorrelation delay protects encumbrance timing only),
+                    // and a delayed reserve would leave the backstop inert
+                    // exactly when a fresh wallet first needs it.
+                    delay_or_eligible_unix: 0,
+                    eligible_height: 0,
+                    deposit_linked: false,
+                    parent: Some(deposit),
+                    lessee: None,
+                    split_tx: None,
+                    split_attempts: Vec::new(),
+                });
+            }
             {
                 let dep = l.find_mut(&deposit).expect("checked above");
                 dep.state = CoinState::SplitPending;
@@ -685,6 +758,8 @@ impl Ledger {
                 pre_encumbrance_count: k as u32,
                 change_sats: change,
                 change_vout,
+                reserve_sats,
+                reserve_vout,
                 delay_secs,
             })
         })
@@ -693,9 +768,9 @@ impl Ledger {
     /// RBF fee bump for a stuck split (the review's SplitPending-dead-end
     /// fix). Rebuilds the split spending the SAME deposit input (mutually
     /// exclusive with every earlier attempt) at a strictly higher fee,
-    /// REUSING the same child keys and delay durations — k may shrink if the
-    /// fee eats into the last unit's change. All attempts stay tracked until
-    /// one confirms.
+    /// REUSING the same child keys and delay durations (and the reserve key)
+    /// — k may shrink, and the CPFP-reserve carve may drop, if the fee eats
+    /// into them. All attempts stay tracked until one confirms.
     pub fn bump_split_fee(
         &mut self,
         deposit: OutPoint,
@@ -736,13 +811,23 @@ impl Ledger {
         let spendable = dep_amount
             .checked_sub(new_fee_sats)
             .ok_or(Error::Validation("ledger: fee exceeds deposit"))?;
-        let k = (spendable / unit).min(MAX_PRE_ENC_OUTPUTS);
+        // Re-plan the reserve carve at the new fee, same rule as
+        // `split_deposit`: the higher fee may eat the reserve (dropped, like
+        // a shrinking k), never the other way around (`Params::validate`
+        // bounds reserve < D < unit, so dropping the reserve can add at most
+        // one unit's worth back — not enough to GROW k past the previous
+        // attempt's; the guard below still checks).
+        let reserve_sats = match spendable.checked_sub(params.cpfp_reserve_sats) {
+            Some(rem) if rem >= unit => params.cpfp_reserve_sats,
+            _ => 0,
+        };
+        let k = ((spendable - reserve_sats) / unit).min(MAX_PRE_ENC_OUTPUTS);
         if k == 0 {
             return Err(Error::Validation(
                 "ledger: bump would consume the last pre-encumbrance unit",
             ));
         }
-        let mut change = spendable - k * unit;
+        let mut change = spendable - reserve_sats - k * unit;
         let mut effective_fee = new_fee_sats;
         if change > 0 && change < DUST_SATS {
             effective_fee += change;
@@ -773,20 +858,55 @@ impl Ledger {
                     && c.class == CoinClass::OnboardingChange
             })
             .map(|c| c.key_index);
+        // Reuse the previous attempt's reserve key too (same discipline as
+        // the child/change keys: attempts are mutually exclusive, so the
+        // address never appears on-chain twice).
+        let prev_reserve_key: Option<u32> = self
+            .coins
+            .iter()
+            .find(|c| {
+                c.parent == Some(deposit)
+                    && c.outpoint.txid == last_txid
+                    && c.class == CoinClass::Reserve
+            })
+            .map(|c| c.key_index);
+        let n_outputs = k + (reserve_sats > 0) as u64 + (change > 0) as u64;
+        let reserve_vout = if reserve_sats > 0 {
+            Some(sample_range_u64(0, n_outputs - 1)? as u32)
+        } else {
+            None
+        };
         let change_vout = if change > 0 {
-            Some(sample_range_u64(0, k)? as u32)
+            let mut cv = sample_range_u64(0, n_outputs - 1 - reserve_vout.map_or(0, |_| 1))?
+                as u32;
+            if let Some(rv) = reserve_vout {
+                if cv >= rv {
+                    cv += 1;
+                }
+            }
+            Some(cv)
         } else {
             None
         };
 
         self.transact(|l| {
-            let n_outputs = k + change_vout.map_or(0, |_| 1);
             let mut outputs: Vec<(ScriptBuf, u64)> = Vec::with_capacity(n_outputs as usize);
             let mut child_meta: Vec<(u32, u32, u64)> = Vec::new();
             let mut change_meta: Option<(u32, u32)> = None;
+            let mut reserve_meta: Option<(u32, u32)> = None;
             let mut pre_i = 0usize;
             for vout in 0..n_outputs as u32 {
-                if Some(vout) == change_vout {
+                if Some(vout) == reserve_vout {
+                    let idx = match prev_reserve_key {
+                        Some(idx) => idx,
+                        None => l.issue_key(KeyPurpose::Reserve, keys)?.0,
+                    };
+                    let spk = crate::tx::setup::pre_encumbrance_spk(
+                        keys.derive_xonly(KeyPurpose::Reserve, idx)?,
+                    )?;
+                    reserve_meta = Some((vout, idx));
+                    outputs.push((spk, reserve_sats));
+                } else if Some(vout) == change_vout {
                     let idx = match prev_change_key {
                         Some(idx) => idx,
                         None => l.issue_key(KeyPurpose::OnboardingChange, keys)?.0,
@@ -855,6 +975,24 @@ impl Ledger {
                     split_attempts: Vec::new(),
                 });
             }
+            if let Some((vout, idx)) = reserve_meta {
+                l.coins.push(CoinRecord {
+                    outpoint: OutPoint::new(txid, vout),
+                    amount_sats: reserve_sats,
+                    class: CoinClass::Reserve,
+                    state: CoinState::PendingConfirm,
+                    key_purpose: KeyPurpose::Reserve,
+                    key_index: idx,
+                    created_height: 0,
+                    delay_or_eligible_unix: 0,
+                    eligible_height: 0,
+                    deposit_linked: false,
+                    parent: Some(deposit),
+                    lessee: None,
+                    split_tx: None,
+                    split_attempts: Vec::new(),
+                });
+            }
             {
                 let dep = l.find_mut(&deposit).expect("checked above");
                 dep.split_tx = Some(tx_bytes.clone());
@@ -866,6 +1004,8 @@ impl Ledger {
                 pre_encumbrance_count: k as u32,
                 change_sats: change,
                 change_vout,
+                reserve_sats,
+                reserve_vout,
                 delay_secs,
             })
         })
@@ -874,7 +1014,10 @@ impl Ledger {
     /// One split attempt confirmed at `height`: its children activate with
     /// their eligibility ANCHORED NOW (wall clock + chain height), losing
     /// attempts' children are dropped (mutually exclusive txs), the deposit
-    /// becomes Spent. The CONFIRMED (winning) attempt's signed bytes are
+    /// becomes Spent. The carved CPFP reserve activates `PendingConfirm →
+    /// Unspent` here like every other child (no delay anchor — reserves are
+    /// not encumbrance-eligible), which is what flips
+    /// [`has_leasable_reserve`](Self::has_leasable_reserve) true. The CONFIRMED (winning) attempt's signed bytes are
     /// installed as `split_tx` for shallow-reorg rebroadcast — NOT left as the
     /// latest attempt's, which after an RBF race can be a losing, mutually
     /// exclusive tx whose rebroadcast would strand the confirmed children.
@@ -890,6 +1033,16 @@ impl Ledger {
     /// anchors (children are already `Unspent`, so the anchor-writing branch is
     /// skipped) — the effective delay is measured from the first confirmation,
     /// a bounded privacy nuance only.
+    ///
+    /// FLIPPED-WINNER reorg (documented, bounded): if a reorg lets a RIVAL
+    /// attempt confirm after this ran, the activated children become
+    /// never-existed phantoms (their records survive; the rival's were
+    /// dropped). The rival's real outputs pay REUSED, ledger-known keys, so
+    /// no value is cryptographically lost (restore/rescan tooling seam). The
+    /// backstop-critical consequence — a phantom RESERVE deterministically
+    /// winning lease selection forever — is healed by
+    /// [`sweep_spent_reserves`](Self::sweep_spent_reserves) (shape 2) and by
+    /// `run_cpfp_bump`'s submit-failure self-heal.
     pub fn confirm_split(
         &mut self,
         split_txid: Txid,
@@ -1035,17 +1188,36 @@ impl Ledger {
 
     /// Chain-aware reserve reconciliation (review finding): mark Spent any
     /// Reserve coin the ledger still counts as spendable (Unspent or Leased)
-    /// but whose outpoint is CONFIRMED spent on chain. This is the phantom a
-    /// crash in [`run_cpfp_bump`](crate::wallet::backstop_driver::run_cpfp_bump)'s
-    /// submit→persist window creates: the CPFP child is on chain, the ledger
-    /// persist never ran, and a later [`reconcile_leases`] re-exposes the coin
-    /// as Unspent — where its deterministic `max_by_key` lease selection then
-    /// wins forever and fails every bump at submit, silently disabling the
-    /// backstop pool. Sweeping it here (the caller runs this at startup with
-    /// the authoritative chain) removes the phantom before it is ever selected;
-    /// `run_cpfp_bump` additionally self-heals one on a submit failure. Only
-    /// CONFIRMED spends are swept — an `InMempool` spend may be our own
-    /// still-confirming legitimate bump. Returns the swept outpoints.
+    /// but which the chain proves is gone, in either of two phantom shapes:
+    ///
+    ///   1. CONSUMED — the coin's outpoint is CONFIRMED spent on chain. The
+    ///      phantom a crash in
+    ///      [`run_cpfp_bump`](crate::wallet::backstop_driver::run_cpfp_bump)'s
+    ///      submit→persist window creates: the CPFP child is on chain, the
+    ///      ledger persist never ran, and a later [`reconcile_leases`]
+    ///      re-exposes the coin as Unspent.
+    ///
+    ///   2. NEVER EXISTED (adversarial-review fix, Task 02) — the coin's
+    ///      outpoint is NOT a funded UTXO on the chain (`authoritative_
+    ///      funding_height` is None) while its `parent`'s spend IS confirmed.
+    ///      The creating tx is then mutually exclusive with a CONFIRMED
+    ///      rival, so the coin can never materialize. This is the flipped-
+    ///      winner reorg: split attempt A confirms (`confirm_split` activates
+    ///      A's carved reserve, drops B's record), a shallow reorg lets the
+    ///      higher-fee rival attempt B confirm instead — A's reserve is now
+    ///      ledger-Unspent but nonexistent, and a nonexistent outpoint reads
+    ///      `SpendStatus::Unspent`, so shape 1 never catches it. (B's real
+    ///      on-chain outputs pay REUSED, ledger-known keys — recoverable by
+    ///      the restore/rescan tooling seam; no fund loss.)
+    ///
+    /// Either phantom would otherwise win `lease_reserve`'s deterministic
+    /// `max_by_key` selection forever and fail every bump at submit, silently
+    /// disabling the backstop pool. Sweeping here (the caller runs this at
+    /// startup with the authoritative chain) removes them before they are
+    /// ever selected; `run_cpfp_bump` additionally self-heals one on a submit
+    /// failure. Only CONFIRMED spends count — an `InMempool` spend (of the
+    /// coin or of its parent) may be our own still-confirming tx. Returns the
+    /// swept outpoints.
     pub fn sweep_spent_reserves(
         &mut self,
         chain: &dyn crate::chain::AuthoritativeChainView,
@@ -1056,10 +1228,16 @@ impl Ledger {
             .filter(|c| {
                 c.class == CoinClass::Reserve
                     && matches!(c.state, CoinState::Unspent | CoinState::Leased)
-                    && matches!(
+                    && (matches!(
                         chain.spend_status(c.outpoint),
                         crate::chain::SpendStatus::Confirmed(_)
-                    )
+                    ) || (chain.authoritative_funding_height(c.outpoint).is_none()
+                        && c.parent.is_some_and(|p| {
+                            matches!(
+                                chain.spend_status(p),
+                                crate::chain::SpendStatus::Confirmed(_)
+                            )
+                        })))
             })
             .map(|c| c.outpoint)
             .collect();
@@ -1283,6 +1461,17 @@ impl Ledger {
                 continue;
             }
             let Some(source) = c.parent else { continue };
+            // A SPLIT-CARVED reserve is also `Reserve`/`PendingConfirm`, but
+            // its `parent` is its DEPOSIT — the split lifecycle
+            // (`confirm_split`) owns its resolution. Healing it here would
+            // EVICT the child of a not-yet-broadcast (or still-mempool-racing)
+            // split — the deposit reads chain-`Unspent` — and a later
+            // rebroadcast would then confirm an untracked reserve output.
+            // Only CPFP-change pendings (parent = the source Reserve coin)
+            // belong to this heal.
+            if self.find(&source).is_some_and(|p| p.class == CoinClass::Deposit) {
+                continue;
+            }
             if chain.authoritative_funding_height(c.outpoint).is_some() {
                 heals.push(Heal::Activate(c.outpoint));
             } else if matches!(
@@ -1712,20 +1901,26 @@ mod tests {
         let params = Params::testnet_provisional();
         let unit = params.tier_d_sats + params.delta_fee_sats;
 
-        // 3 units + healthy change.
+        let reserve = params.cpfp_reserve_sats;
+
+        // 3 units + the carved reserve + healthy change.
         let dep_amount = 3 * unit + 50_000 + 1_000;
         add_deposit(&mut ledger, &keys, outpoint(1), dep_amount, true);
         let plan = ledger.split_deposit(outpoint(1), &params, 1_000, &keys).unwrap();
         assert_eq!(plan.pre_encumbrance_count, 3);
-        assert_eq!(plan.change_sats, 50_000);
+        assert_eq!(plan.reserve_sats, reserve);
+        assert_eq!(plan.change_sats, 50_000 - reserve);
         let tx: bitcoin::Transaction =
             bitcoin::consensus::encode::deserialize(&plan.tx_bytes).unwrap();
         assert_eq!(tx.input.len(), 1);
-        assert_eq!(tx.output.len(), 4);
+        assert_eq!(tx.output.len(), 5);
         let cv = plan.change_vout.expect("change present") as usize;
-        assert_eq!(tx.output[cv].value.to_sat(), 50_000);
+        let rv = plan.reserve_vout.expect("reserve present") as usize;
+        assert_ne!(cv, rv, "reserve and change occupy distinct shuffled slots");
+        assert_eq!(tx.output[cv].value.to_sat(), 50_000 - reserve);
+        assert_eq!(tx.output[rv].value.to_sat(), reserve);
         for (i, out) in tx.output.iter().enumerate() {
-            if i != cv {
+            if i != cv && i != rv {
                 assert_eq!(out.value.to_sat(), unit);
             }
         }
@@ -1733,20 +1928,32 @@ mod tests {
         assert_eq!(dep_amount - out_total, 1_000);
         let spks: std::collections::HashSet<_> =
             tx.output.iter().map(|o| o.script_pubkey.clone()).collect();
-        assert_eq!(spks.len(), 4, "no address reuse across split outputs");
+        assert_eq!(spks.len(), 5, "no address reuse across split outputs");
+        // The reserve is tracked pending, Reserve class at a Reserve key.
+        let res_coin = ledger.find(&OutPoint::new(plan.txid, rv as u32)).unwrap();
+        assert_eq!(res_coin.class, CoinClass::Reserve);
+        assert_eq!(res_coin.state, CoinState::PendingConfirm);
+        assert_eq!(res_coin.key_purpose, KeyPurpose::Reserve);
+        assert_eq!(res_coin.parent, Some(outpoint(1)));
+        assert!(!res_coin.deposit_linked);
 
         // Sub-dust change folds into the fee (P2TR dust = 330).
-        add_deposit(&mut ledger, &keys, outpoint(2), 2 * unit + 300 + 1_000, false);
+        add_deposit(&mut ledger, &keys, outpoint(2), 2 * unit + reserve + 300 + 1_000, false);
         let plan2 = ledger.split_deposit(outpoint(2), &params, 1_000, &keys).unwrap();
+        assert_eq!(plan2.pre_encumbrance_count, 2);
+        assert_eq!(plan2.reserve_sats, reserve);
         assert_eq!(plan2.change_sats, 0);
         assert!(plan2.change_vout.is_none());
         let tx2: bitcoin::Transaction =
             bitcoin::consensus::encode::deserialize(&plan2.tx_bytes).unwrap();
-        assert_eq!(tx2.output.len(), 2);
-        // 330-sat change is RELAYABLE and kept (not burned).
+        assert_eq!(tx2.output.len(), 3);
+        // 330-sat change is RELAYABLE and kept (not burned); a deposit too
+        // small to fund the reserve alongside a unit SKIPS the carve.
         add_deposit(&mut ledger, &keys, outpoint(3), unit + 330 + 1_000, false);
         let plan3 = ledger.split_deposit(outpoint(3), &params, 1_000, &keys).unwrap();
         assert_eq!(plan3.change_sats, 330);
+        assert_eq!(plan3.reserve_sats, 0, "too-small deposit: reserve skipped, not an error");
+        assert!(plan3.reserve_vout.is_none());
 
         // Too small; absurd fee; double-split: refused.
         add_deposit(&mut ledger, &keys, outpoint(4), unit / 2, false);
@@ -1759,7 +1966,8 @@ mod tests {
         add_deposit(&mut ledger, &keys, outpoint(6), 100 * unit + 1_000, false);
         let plan6 = ledger.split_deposit(outpoint(6), &params, 1_000, &keys).unwrap();
         assert_eq!(plan6.pre_encumbrance_count, 64);
-        assert_eq!(plan6.change_sats, 36 * unit);
+        assert_eq!(plan6.reserve_sats, reserve);
+        assert_eq!(plan6.change_sats, 36 * unit - reserve);
     }
 
     #[test]
@@ -1842,7 +2050,7 @@ mod tests {
             .iter()
             .filter(|c| c.state == CoinState::PendingConfirm)
             .collect();
-        assert_eq!(pending.len(), 6, "2 attempts x (2 pre-enc + 1 change)");
+        assert_eq!(pending.len(), 8, "2 attempts x (2 pre-enc + 1 change + 1 reserve)");
 
         // Attempt 2 confirms: its children activate; attempt 1's vanish.
         ledger.confirm_split(plan2.txid, 500, &FixedClock(1_000)).unwrap();
@@ -1855,7 +2063,7 @@ mod tests {
             .iter()
             .filter(|c| c.outpoint.txid == plan2.txid && c.state == CoinState::Unspent)
             .collect();
-        assert_eq!(active.len(), 3);
+        assert_eq!(active.len(), 4, "2 pre-enc + 1 change + 1 reserve");
         // The deposit retains the signed bytes for reorg recovery.
         let dep = ledger.find(&outpoint(1)).unwrap();
         assert_eq!(dep.state, CoinState::Spent);
@@ -1897,7 +2105,7 @@ mod tests {
             .iter()
             .filter(|c| c.outpoint.txid == plan1.txid && c.state == CoinState::Unspent)
             .collect();
-        assert_eq!(active.len(), 3, "2 pre-enc + 1 change from the confirmed attempt");
+        assert_eq!(active.len(), 4, "2 pre-enc + 1 change + 1 reserve from the confirmed attempt");
         // ...and the losing (latest) attempt's children are gone.
         assert!(ledger.coins().iter().all(|c| c.outpoint.txid != plan2.txid));
     }
@@ -1978,23 +2186,28 @@ mod tests {
         let (mut ledger, keys) = fresh(dir.path());
         let params = Params::testnet_provisional();
         let unit = params.tier_d_sats + params.delta_fee_sats;
-        let deposit_amt = 2 * unit + 1_000;
+        let reserve = params.cpfp_reserve_sats;
+        let deposit_amt = 2 * unit + reserve + 1_000;
         add_deposit(&mut ledger, &keys, outpoint(1), deposit_amt, true);
 
-        // Attempt 1: fee 1_000 -> spendable = 2*unit exactly -> k=2, NO change.
+        // Attempt 1: fee 1_000 -> spendable = 2*unit + reserve exactly ->
+        // k=2 + the carved reserve, NO change.
         let plan1 = ledger.split_deposit(outpoint(1), &params, 1_000, &keys).unwrap();
         assert_eq!(plan1.pre_encumbrance_count, 2);
+        assert_eq!(plan1.reserve_sats, reserve);
         assert_eq!(plan1.change_sats, 0);
         let tx1: bitcoin::Transaction =
             bitcoin::consensus::encode::deserialize(&plan1.tx_bytes).unwrap();
         let out1: u64 = tx1.output.iter().map(|o| o.value.to_sat()).sum();
         assert_eq!(out1 + 1_000, deposit_amt, "attempt 1 conserves value");
-        assert_eq!(tx1.output.len(), 2, "no change output on attempt 1");
+        assert_eq!(tx1.output.len(), 3, "2 units + reserve, no change on attempt 1");
 
-        // Attempt 2: fee 5_000 -> spendable = 2*unit - 4_000 -> k COLLAPSES to 1
-        // and a large change output appears, under a FRESH change key.
+        // Attempt 2: fee 5_000 -> spendable = 2*unit + reserve - 4_000 -> k
+        // COLLAPSES to 1 and a large change output appears, under a FRESH
+        // change key (the reserve carve survives at its reused key).
         let plan2 = ledger.bump_split_fee(outpoint(1), 5_000, &params, &keys).unwrap();
         assert_eq!(plan2.pre_encumbrance_count, 1, "the higher fee ate a unit");
+        assert_eq!(plan2.reserve_sats, reserve);
         assert_eq!(plan2.change_sats, unit - 4_000);
         let tx2: bitcoin::Transaction =
             bitcoin::consensus::encode::deserialize(&plan2.tx_bytes).unwrap();
@@ -2012,14 +2225,14 @@ mod tests {
             !spks1.contains(&change_out.script_pubkey),
             "collapsed-k bump must mint a FRESH change key"
         );
-        // Confirming the collapsed attempt activates exactly its 2 outputs.
+        // Confirming the collapsed attempt activates exactly its 3 outputs.
         ledger.confirm_split(plan2.txid, 500, &FixedClock(1_700_000_000)).unwrap();
         let active: Vec<_> = ledger
             .coins()
             .iter()
             .filter(|c| c.state == CoinState::Unspent && c.outpoint.txid == plan2.txid)
             .collect();
-        assert_eq!(active.len(), 2, "1 pre-enc + 1 change");
+        assert_eq!(active.len(), 3, "1 pre-enc + 1 change + 1 reserve");
     }
 
     /// Audit B3: hostile Params whose tier + delta_fee overflows u64 can pass
@@ -2362,13 +2575,175 @@ mod tests {
         assert!(ledger.find(&outpoint(9)).unwrap().deposit_linked, "taint must persist");
     }
 
+    /// Task 02: the PRODUCTION reserve-minting path end-to-end at the ledger
+    /// level. A normal onboarding split carves a dedicated `Reserve` output of
+    /// exactly `cpfp_reserve_sats` — `PendingConfirm` until the split
+    /// confirms (never leasable early), then `Unspent` and immediately
+    /// leasable (no onboarding delay) — flipping the backstop's
+    /// `has_leasable_reserve` gate true with NO manual promote step. Value is
+    /// conserved across the new layout and the carve survives reopen.
+    #[test]
+    fn split_carves_a_leasable_cpfp_reserve() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, keys) = fresh(dir.path());
+        let params = Params::testnet_provisional();
+        let unit = params.tier_d_sats + params.delta_fee_sats;
+        let reserve = params.cpfp_reserve_sats;
+
+        let dep_amount = 2 * unit + reserve + 40_000 + 1_000;
+        add_deposit(&mut ledger, &keys, outpoint(1), dep_amount, true);
+        assert!(!ledger.has_leasable_reserve(1), "nothing leasable before onboarding");
+
+        let plan = ledger.split_deposit(outpoint(1), &params, 1_000, &keys).unwrap();
+        assert_eq!(plan.pre_encumbrance_count, 2);
+        assert_eq!(plan.reserve_sats, reserve);
+        assert_eq!(plan.change_sats, 40_000);
+        let reserve_op = OutPoint::new(plan.txid, plan.reserve_vout.unwrap());
+
+        // Ledger-record conservation: tracked children + fee == deposit.
+        let tracked: u64 = ledger
+            .coins()
+            .iter()
+            .filter(|c| c.parent == Some(outpoint(1)))
+            .map(|c| c.amount_sats)
+            .sum();
+        assert_eq!(tracked + 1_000, dep_amount, "children + fee must equal the deposit");
+
+        // Pending until the split confirms: NOT leasable (an unconfirmed
+        // carve that could still RBF away must never poison the pool).
+        assert_eq!(ledger.find(&reserve_op).unwrap().state, CoinState::PendingConfirm);
+        assert!(!ledger.has_leasable_reserve(1));
+        assert!(ledger.lease_reserve(BumpTarget::Refund, 1, None, LESSEE).unwrap().is_none());
+
+        ledger.confirm_split(plan.txid, 105, &FixedClock(1_000)).unwrap();
+        let coin = ledger.find(&reserve_op).unwrap().clone();
+        assert_eq!(coin.state, CoinState::Unspent);
+        assert_eq!(coin.amount_sats, reserve);
+        assert_eq!(coin.created_height, 105);
+        assert_eq!(coin.key_purpose, KeyPurpose::Reserve);
+        assert!(!coin.deposit_linked);
+        // Leasable at a realistic required-child-fee, immediately.
+        assert!(ledger.has_leasable_reserve(reserve));
+        let leased = ledger
+            .lease_reserve(BumpTarget::Refund, 2_000, None, LESSEE)
+            .unwrap()
+            .expect("the carved reserve must be leasable");
+        assert_eq!(leased.outpoint, reserve_op);
+
+        // The carve persists across reopen.
+        ledger.release_lease(reserve_op).unwrap();
+        drop(ledger);
+        let ledger = Ledger::open(dir.path(), &ModeledEnclave).unwrap();
+        assert!(ledger.has_leasable_reserve(reserve));
+    }
+
+    /// Task 02 adversarial-review regression (flipped-winner reorg phantom):
+    /// split attempt A confirms and activates its carved reserve; a shallow
+    /// reorg then lets the higher-fee RBF attempt B confirm instead. A's
+    /// reserve is now ledger-Unspent but exists on NO chain — and a
+    /// nonexistent outpoint reads `SpendStatus::Unspent`, so the
+    /// consumed-shape sweep alone never catches it and `lease_reserve`'s
+    /// deterministic selection would pick the phantom forever.
+    /// `sweep_spent_reserves` shape 2 (outpoint unfunded + the parent
+    /// deposit's spend CONFIRMED by the rival) must clear it.
+    #[test]
+    fn flipped_winner_reorg_phantom_reserve_is_swept() {
+        use crate::chain::{ChainView, SimChain};
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, keys) = fresh(dir.path());
+        let params = Params::testnet_provisional();
+        let unit = params.tier_d_sats + params.delta_fee_sats;
+        let dep_amount = 2 * unit + params.cpfp_reserve_sats + 50_000;
+        add_deposit(&mut ledger, &keys, outpoint(1), dep_amount, true);
+
+        let plan_a = ledger.split_deposit(outpoint(1), &params, 1_000, &keys).unwrap();
+        let plan_b = ledger.bump_split_fee(outpoint(1), 5_000, &params, &keys).unwrap();
+        let reserve_a = OutPoint::new(plan_a.txid, plan_a.reserve_vout.unwrap());
+
+        // Attempt A confirms first; its carved reserve activates (B's records
+        // are dropped here — mutually exclusive txs).
+        ledger.confirm_split(plan_a.txid, 500, &FixedClock(1_700_000_000)).unwrap();
+        assert_eq!(ledger.find(&reserve_a).unwrap().state, CoinState::Unspent);
+        assert!(ledger.has_leasable_reserve(1));
+
+        // Shallow reorg: the new branch's miners confirm the HIGHER-FEE
+        // attempt B instead. On the resulting chain the deposit is spent by B
+        // and none of A's outputs exist.
+        let chain = SimChain::new(600);
+        chain.fund_with_amount(outpoint(1), 100, dep_amount);
+        chain.broadcast(&plan_b.tx_bytes).unwrap();
+        chain.mine();
+        assert!(matches!(
+            chain.spend_status(outpoint(1)),
+            crate::chain::SpendStatus::Confirmed(_)
+        ));
+        // The phantom's own outpoint reads Unspent (nonexistent, not spent) —
+        // the consumed-shape check alone would never catch it.
+        assert!(matches!(chain.spend_status(reserve_a), crate::chain::SpendStatus::Unspent));
+        assert!(chain.authoritative_funding_height(reserve_a).is_none());
+
+        let swept = ledger.sweep_spent_reserves(&chain).unwrap();
+        assert_eq!(swept, vec![reserve_a], "the never-existed phantom is swept");
+        assert_eq!(ledger.find(&reserve_a).unwrap().state, CoinState::Spent);
+        assert!(
+            !ledger.has_leasable_reserve(1),
+            "the pool degrades cleanly instead of feeding an eternal re-lease loop"
+        );
+        // Idempotent, and a second sweep finds nothing new.
+        assert!(ledger.sweep_spent_reserves(&chain).unwrap().is_empty());
+    }
+
+    /// Task 02 regression: `heal_pending_reserve_changes` must NOT touch a
+    /// split-carved reserve still pending its split confirmation. Without the
+    /// deposit-parent guard, a startup heal while the split is not yet
+    /// broadcast (the deposit reads chain-Unspent) would EVICT the pending
+    /// reserve record — and the split's later rebroadcast would confirm an
+    /// untracked reserve output.
+    #[test]
+    fn heal_leaves_a_pending_split_carved_reserve_alone() {
+        use crate::chain::SimChain;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, keys) = fresh(dir.path());
+        let params = Params::testnet_provisional();
+        let unit = params.tier_d_sats + params.delta_fee_sats;
+        let dep_amount = unit + params.cpfp_reserve_sats + 1_000;
+        add_deposit(&mut ledger, &keys, outpoint(1), dep_amount, true);
+        let plan = ledger.split_deposit(outpoint(1), &params, 1_000, &keys).unwrap();
+        let reserve_op = OutPoint::new(plan.txid, plan.reserve_vout.unwrap());
+
+        // Crash-before-broadcast shape: the deposit outpoint reads
+        // chain-Unspent (funded, never spent); the split tx is nowhere.
+        let chain = SimChain::new(200);
+        chain.fund_with_amount(outpoint(1), 100, dep_amount);
+
+        ledger.heal_pending_reserve_changes(&chain).unwrap();
+        assert_eq!(
+            ledger
+                .find(&reserve_op)
+                .expect("the pending carve must survive the heal")
+                .state,
+            CoinState::PendingConfirm,
+            "confirm_split owns the carve's resolution, not the heal"
+        );
+        // The lifecycle then completes normally.
+        ledger.confirm_split(plan.txid, 205, &FixedClock(1_000)).unwrap();
+        assert_eq!(ledger.find(&reserve_op).unwrap().state, CoinState::Unspent);
+    }
+
     #[test]
     fn lease_reconciliation_releases_orphans_only() {
         let dir = tempfile::tempdir().unwrap();
         let (mut ledger, keys) = fresh(dir.path());
         let params = Params::testnet_provisional();
         let unit = params.tier_d_sats + params.delta_fee_sats;
-        add_deposit(&mut ledger, &keys, outpoint(1), 2 * unit + 2_000, true);
+        // 2 units + the carved reserve + fee, exactly.
+        add_deposit(
+            &mut ledger,
+            &keys,
+            outpoint(1),
+            2 * unit + params.cpfp_reserve_sats + 2_000,
+            true,
+        );
         let plan = ledger.split_deposit(outpoint(1), &params, 2_000, &keys).unwrap();
         ledger.confirm_split(plan.txid, 105, &FixedClock(1_000)).unwrap();
 
@@ -2423,7 +2798,14 @@ mod tests {
         let (mut ledger, keys) = fresh(dir.path());
         let params = Params::testnet_provisional();
         let unit = params.tier_d_sats + params.delta_fee_sats;
-        add_deposit(&mut ledger, &keys, outpoint(1), 3 * unit + 2_000, true);
+        // 3 units + the carved reserve + fee, exactly.
+        add_deposit(
+            &mut ledger,
+            &keys,
+            outpoint(1),
+            3 * unit + params.cpfp_reserve_sats + 2_000,
+            true,
+        );
         let plan = ledger.split_deposit(outpoint(1), &params, 2_000, &keys).unwrap();
         ledger.confirm_split(plan.txid, 105, &FixedClock(1_000)).unwrap();
 

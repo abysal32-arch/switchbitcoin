@@ -1,7 +1,8 @@
 //! Increment 2a: the congestion CPFP bump executes end-to-end from a REAL
-//! provisioned reserve (onboarding change → promoted reserve), via the public
-//! wallet API: lease → build → enclave-sign → 1P1C submit → mark-spent. It
-//! never strands the reserve on failure, and the completion consent gate holds.
+//! provisioned reserve (the dedicated `cpfp_reserve_sats` output the
+//! onboarding split carves), via the public wallet API: lease → build →
+//! enclave-sign → 1P1C submit → mark-spent. It never strands the reserve on
+//! failure, and the completion consent gate holds.
 
 use bitcoin::{
     absolute, transaction::Version, Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut,
@@ -73,10 +74,13 @@ fn provision_reserve() -> (Ledger, ModeledKeySource, OutPoint, u64, tempfile::Te
         .unwrap();
     let plan = ledger.split_deposit(deposit_op, &params, 1_000, &keys).unwrap();
     ledger.confirm_split(plan.txid, 105, &Clock(1_000)).unwrap();
-    let change_op = OutPoint::new(plan.txid, plan.change_vout.expect("change output"));
-    ledger.promote_change_to_reserve(change_op).unwrap();
-    let amount = ledger.find(&change_op).unwrap().amount_sats;
-    (ledger, keys, change_op, amount, dir)
+    // The split CARVES the dedicated reserve (Task 02); no manual promote —
+    // this is the production provisioning path.
+    let reserve_op =
+        OutPoint::new(plan.txid, plan.reserve_vout.expect("split carves the reserve"));
+    assert_eq!(plan.reserve_sats, params.cpfp_reserve_sats);
+    let amount = ledger.find(&reserve_op).unwrap().amount_sats;
+    (ledger, keys, reserve_op, amount, dir)
 }
 
 /// A TRUC/v3 stalled parent with a P2A anchor at the last output, plus its
@@ -378,6 +382,58 @@ fn run_cpfp_bump_self_heals_a_phantom_reserve_on_submit_failure() {
     assert_eq!(out, BumpOutcome::NoBump);
     // Self-healed: the phantom is Spent (not Unspent), so it can never be
     // re-leased to fail again — the pool is not disabled.
+    assert_eq!(ledger.find(&reserve_op).unwrap().state, CoinState::Spent);
+    assert!(!ledger.has_leasable_reserve(1));
+}
+
+/// Task 02 adversarial-review regression: the NEVER-EXISTED phantom (a
+/// flipped-winner split reorg confirmed the rival RBF attempt, so this
+/// reserve's outpoint is on NO chain). A nonexistent outpoint reads
+/// `SpendStatus::Unspent`, so the pre-fix self-heal would RELEASE the lease —
+/// and the deterministic selection would re-lease the phantom on every tick,
+/// an infinite NoBump loop that silently disables the backstop. With the
+/// parent deposit's spend CONFIRMED by the rival, the executor must mark the
+/// phantom Spent instead.
+#[test]
+fn run_cpfp_bump_self_heals_a_never_existed_phantom_reserve() {
+    let (mut ledger, keys, reserve_op, reserve_amount, _dir) = provision_reserve();
+    let chain = SimChain::new(500_000);
+    let parent_input = OutPoint::new(txid(0x10), 0);
+    // Fund the stalled parent's input but NOT the reserve outpoint — it
+    // exists on no chain. The deposit that carved it is confirmed-spent by
+    // the rival attempt.
+    chain.fund_with_amount(parent_input, 500_000, reserve_amount + 1_000_000);
+    let deposit_op = ledger
+        .find(&reserve_op)
+        .unwrap()
+        .parent
+        .expect("a carved reserve records its deposit parent");
+    chain.fund_with_amount(deposit_op, 400_000, 10_000_000);
+    chain.broadcast(&spend(deposit_op, 9_999_000)).unwrap();
+    chain.mine();
+
+    let (parent_bytes, parent_txid, parent_vsize) = parent_with_anchor(parent_input, 500_000, 240);
+    let out = run_cpfp_bump(
+        &mut ledger,
+        &keys,
+        &chain,
+        CpfpBumpRequest {
+            target: BumpTarget::Refund,
+            linkage_ack: None,
+            lessee: [0xEE; 32],
+            parent_bytes: &parent_bytes,
+            parent_anchor: OutPoint::new(parent_txid, ANCHOR_VOUT),
+            anchor_value_sats: 240,
+            parent_fee_sats: 200,
+            parent_vsize_vb: parent_vsize,
+            target_feerate_sat_vb: 10,
+            change_key_index: 0,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(out, BumpOutcome::NoBump);
+    // Healed Spent — NOT released back into eternal re-selection.
     assert_eq!(ledger.find(&reserve_op).unwrap().state, CoinState::Spent);
     assert!(!ledger.has_leasable_reserve(1));
 }

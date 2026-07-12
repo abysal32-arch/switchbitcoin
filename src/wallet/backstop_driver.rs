@@ -389,10 +389,23 @@ pub fn run_cpfp_bump(
             // to-Unspent while its child is on the wire — mark it Spent so it
             // is never re-selected (else its deterministic max_by_key selection
             // fails every future bump at submit, silently disabling the pool).
+            // NEVER-EXISTED phantom (Task 02 adversarial-review fix): a
+            // flipped-winner split reorg leaves a reserve whose outpoint is on
+            // NO chain — and a nonexistent outpoint reads `Unspent`, so the
+            // spend-status check alone would release-and-reselect it forever.
+            // Its parent's spend being CONFIRMED while the coin itself is not
+            // a funded UTXO proves the creating tx lost to a confirmed rival:
+            // mark Spent (mirrors `Ledger::sweep_spent_reserves` shape 2).
             // A genuine build/undersize failure leaves the outpoint Unspent, so
             // the lease is released to be retried (a bigger reserve, or once
             // congestion eases) — the swap keeps its safe fallback meanwhile.
-            if matches!(chain.spend_status(reserve.outpoint), SpendStatus::Unspent) {
+            let never_existed = chain.authoritative_funding_height(reserve.outpoint).is_none()
+                && reserve.parent.is_some_and(|p| {
+                    matches!(chain.spend_status(p), SpendStatus::Confirmed(_))
+                });
+            if matches!(chain.spend_status(reserve.outpoint), SpendStatus::Unspent)
+                && !never_existed
+            {
                 ledger.release_lease(reserve.outpoint)?;
             } else {
                 ledger.mark_spent(reserve.outpoint)?;

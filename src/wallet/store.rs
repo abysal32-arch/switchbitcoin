@@ -425,15 +425,16 @@ impl SwapRecord {
         Ok(())
     }
 
-    // ---- serialization (record format v4, all integers LE) ----
+    // ---- serialization (record format v5, all integers LE) ----
     //
-    // [1 version=4][32 swap_session_id][1 role][1 phase]
-    // [60 params: tier(8) fee(8) anchor(8) setup_fee(8) early(4) margin(4)
-    //             buffer(4) allowance(4) cofund(4) onboard_lo(4) onboard_hi(4)]
+    // [1 version=5][32 swap_session_id][1 role][1 phase]
+    // [68 params: tier(8) fee(8) anchor(8) setup_fee(8) cpfp_reserve(8)
+    //             early(4) margin(4) buffer(4) allowance(4) cofund(4)
+    //             onboard_lo(4) onboard_hi(4)]
     // [4 s_height][4 sweep_escrow_height][1 flags]
     // (v3 added the scheme-(a) fee components; v4 added the optional setup_tx
-    // for the never-confirming-Setup recovery arm. Earlier versions are
-    // rejected — no deployed data predates this.)
+    // for the never-confirming-Setup recovery arm; v5 added cpfp_reserve_sats.
+    // Earlier versions are rejected — no deployed data predates this.)
     // flags bit0: our_outpoint    -> [32 txid][4 vout]
     // flags bit1: their_outpoint  -> [32 txid][4 vout]
     // flags bit2: refund          -> [4 csv_maturity][4 len][len tx bytes]
@@ -444,7 +445,7 @@ impl SwapRecord {
 
     fn to_bytes(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(256);
-        v.push(4u8);
+        v.push(5u8);
         v.extend_from_slice(&self.swap_session_id);
         v.push(match self.role {
             Role::SecretHolder => 0,
@@ -455,6 +456,7 @@ impl SwapRecord {
         v.extend_from_slice(&self.params.delta_fee_sats.to_le_bytes());
         v.extend_from_slice(&self.params.anchor_sats.to_le_bytes());
         v.extend_from_slice(&self.params.setup_fee_sats.to_le_bytes());
+        v.extend_from_slice(&self.params.cpfp_reserve_sats.to_le_bytes());
         v.extend_from_slice(&self.params.delta_early.to_le_bytes());
         v.extend_from_slice(&self.params.margin.to_le_bytes());
         v.extend_from_slice(&self.params.delta_buffer.to_le_bytes());
@@ -519,7 +521,7 @@ impl SwapRecord {
     fn from_bytes(b: &[u8]) -> Result<SwapRecord> {
         let mut at = 0usize;
         let version = take_arr::<1>(b, &mut at)?[0];
-        if version != 4 {
+        if version != 5 {
             return Err(Error::Validation("swap record: unknown version"));
         }
         let swap_session_id = take_arr::<32>(b, &mut at)?;
@@ -534,6 +536,7 @@ impl SwapRecord {
             delta_fee_sats: take_le_u64(b, &mut at)?,
             anchor_sats: take_le_u64(b, &mut at)?,
             setup_fee_sats: take_le_u64(b, &mut at)?,
+            cpfp_reserve_sats: take_le_u64(b, &mut at)?,
             delta_early: take_le_u32(b, &mut at)?,
             margin: take_le_u32(b, &mut at)?,
             delta_buffer: take_le_u32(b, &mut at)?,

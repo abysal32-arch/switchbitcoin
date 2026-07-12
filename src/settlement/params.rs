@@ -45,6 +45,12 @@ pub struct Params {
     /// The Setup's baked fee. Positive, so the Setup relays STANDALONE and
     /// the anchor CPFP stays truly congestion-only.
     pub setup_fee_sats: u64,
+    /// The dedicated CPFP-reserve output the onboarding split carves, apart
+    /// from the D + Δ_fee pre-encumbrance units — the coin the congestion
+    /// backstop leases to anchor-bump a stalled settlement. Carved once per
+    /// deposit split (when the deposit can fund it); without it the CPFP
+    /// backstop is inert. Manifest-signed like every other amount.
+    pub cpfp_reserve_sats: u64,
     /// SL refund maturity, relative blocks from S.
     pub delta_early: u32,
     /// Extra margin so SH refund matures later. delta_late = delta_early + margin.
@@ -68,6 +74,7 @@ impl Params {
             delta_fee_sats: 5_000,       // placeholder; TUNE on testnet
             anchor_sats: 240,            // the P2A dust floor (Core 28+)
             setup_fee_sats: 1_200,       // Setup ~125 vB; TUNE on testnet
+            cpfp_reserve_sats: 25_000,   // 0.00025 BTC — the advertised reserve
             delta_early: 144,            // ~24 h
             margin: 72,                  // ~12 h -> delta_late ~ 216
             delta_buffer: 24,            // ~4 h
@@ -165,6 +172,17 @@ impl Params {
         }
         if self.delta_fee_sats >= self.tier_d_sats {
             return Err(Error::Deadline("delta_fee must be smaller than tier D"));
+        }
+        // The CPFP reserve must be a RELAYABLE output (else the carved coin is
+        // dust the split cannot even create) and a reserve — strictly smaller
+        // than the tier principal. reserve < D < unit also guarantees an RBF
+        // split re-plan can never GROW k when a higher fee drops the reserve
+        // (ledger invariant: attempts only shrink).
+        if self.cpfp_reserve_sats < crate::chain::policy::DUST_P2TR_SATS {
+            return Err(Error::Deadline("cpfp reserve below the P2TR dust floor (330 sats)"));
+        }
+        if self.cpfp_reserve_sats >= self.tier_d_sats {
+            return Err(Error::Deadline("cpfp reserve must be smaller than tier D"));
         }
         // --- Fee-model components (scheme (a)): every contract tx must be
         // STANDALONE-relayable on real Core policy, or the G2 dead-device
@@ -300,6 +318,32 @@ mod tests {
         assert!(p.validate().is_err());
         let _ = p.escrow_amount_sats();
         let _ = p.settlement_fee_sats();
+    }
+
+    #[test]
+    fn cpfp_reserve_bounds_are_enforced() {
+        let base = Params::testnet_provisional();
+        assert_eq!(base.cpfp_reserve_sats, 25_000, "the frontend-advertised reserve");
+
+        // Sub-dust (or zero) reserve: the carved output would be unrelayable.
+        let mut p = base.clone();
+        p.cpfp_reserve_sats = 0;
+        assert!(p.validate().is_err());
+        let mut p = base.clone();
+        p.cpfp_reserve_sats = 329;
+        assert!(p.validate().is_err());
+        let mut p = base.clone();
+        p.cpfp_reserve_sats = 330;
+        assert!(p.validate().is_ok());
+
+        // A "reserve" rivaling the principal is absurd (and would break the
+        // ledger's k-never-grows RBF invariant).
+        let mut p = base.clone();
+        p.cpfp_reserve_sats = p.tier_d_sats;
+        assert!(p.validate().is_err());
+        let mut p = base.clone();
+        p.cpfp_reserve_sats = u64::MAX;
+        assert!(p.validate().is_err());
     }
 
     #[test]

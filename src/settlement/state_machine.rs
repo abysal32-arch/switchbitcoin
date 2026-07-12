@@ -659,12 +659,14 @@ fn hex32(id: &[u8; 32]) -> String {
 }
 
 /// Atomically write SL's possession record (tmp + rename). Layout, all LE:
-/// `[1 version=3][4 s_height][4 sweep_escrow_height][params: tier(8) fee(8)
-/// anchor(8) setup_fee(8) early(4) margin(4) buffer(4) allowance(4) cofund(4)
-/// onboard_lo(4) onboard_hi(4)][33 T][230 presig_comp_sh][230 presig_comp_sl]
+/// `[1 version=4][4 s_height][4 sweep_escrow_height][params: tier(8) fee(8)
+/// anchor(8) setup_fee(8) cpfp_reserve(8) early(4) margin(4) buffer(4)
+/// allowance(4) cofund(4) onboard_lo(4) onboard_hi(4)][33 T]
+/// [230 presig_comp_sh][230 presig_comp_sl]
 /// [4 csv_maturity][4 refund_len][refund_len refund bytes]`.
-/// (v3 added the scheme-(a) fee components anchor/setup_fee; v2 records fail
-/// the version check and are rejected — no deployed data predates this.)
+/// (v3 added the scheme-(a) fee components anchor/setup_fee; v4 added
+/// cpfp_reserve_sats; older records fail the version check and are rejected —
+/// no deployed data predates this.)
 #[allow(clippy::too_many_arguments)]
 fn write_possession_record(
     dir: &std::path::Path,
@@ -679,13 +681,14 @@ fn write_possession_record(
 ) -> Result<std::path::PathBuf> {
     std::fs::create_dir_all(dir).map_err(|_| Error::Abort("possession store unavailable"))?;
     let mut v = Vec::with_capacity(512 + refund.tx_bytes().len());
-    v.push(3u8);
+    v.push(4u8);
     v.extend_from_slice(&s_height.to_le_bytes());
     v.extend_from_slice(&sweep_escrow_height.to_le_bytes());
     v.extend_from_slice(&params.tier_d_sats.to_le_bytes());
     v.extend_from_slice(&params.delta_fee_sats.to_le_bytes());
     v.extend_from_slice(&params.anchor_sats.to_le_bytes());
     v.extend_from_slice(&params.setup_fee_sats.to_le_bytes());
+    v.extend_from_slice(&params.cpfp_reserve_sats.to_le_bytes());
     v.extend_from_slice(&params.delta_early.to_le_bytes());
     v.extend_from_slice(&params.margin.to_le_bytes());
     v.extend_from_slice(&params.delta_buffer.to_le_bytes());
@@ -807,7 +810,7 @@ impl Possessing {
         let b = crate::crypto::storage::open(&tek, &sealed)?;
         let mut at = 0usize;
         let version: [u8; 1] = take_arr(&b, &mut at)?;
-        if version[0] != 3 {
+        if version[0] != 4 {
             return Err(Error::Validation("possession record: unknown version"));
         }
         let s_height = take_le_u32(&b, &mut at)?;
@@ -817,6 +820,7 @@ impl Possessing {
             delta_fee_sats: take_le_u64(&b, &mut at)?,
             anchor_sats: take_le_u64(&b, &mut at)?,
             setup_fee_sats: take_le_u64(&b, &mut at)?,
+            cpfp_reserve_sats: take_le_u64(&b, &mut at)?,
             delta_early: take_le_u32(&b, &mut at)?,
             margin: take_le_u32(&b, &mut at)?,
             delta_buffer: take_le_u32(&b, &mut at)?,
