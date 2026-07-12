@@ -769,11 +769,27 @@ fn hex32(id: &[u8; 32]) -> String {
 /// leases are still legitimately held. Shared by `open`'s chain-blind reconcile
 /// and the post-open chain-aware `reconcile_leases_with_chain`.
 fn live_lessees(store: &SwapStore) -> Result<Vec<[u8; 32]>> {
-    Ok(store
-        .list()?
-        .0
+    let (records, unreadable) = store.list()?;
+    let mut live: Vec<[u8; 32]> = records
         .iter()
         .filter(|r| !matches!(r.phase, SwapPhase::Completed | SwapPhase::Refunded))
         .map(|r| r.swap_session_id)
-        .collect())
+        .collect();
+    // A record that could not be LOADED (a transient read fault — an AV/backup
+    // tool holding the file, a torn read) is treated as LIVE, never dropped.
+    // Dropping its sid would make its funding coin's lease look orphaned, so
+    // the chain-blind reconcile would RELEASE the lease of a genuinely live
+    // in-flight swap — and a later swap would then re-select the coin and
+    // double-spend the still-in-flight Setup. Honoring
+    // `RecoveryAction::Unreadable`'s contract (transient I/O must not destroy
+    // tracking), we fold the sid back in from the `<64hex>.swap` filename; a
+    // genuinely orphaned lease still releases on the next CLEAN scan. Both the
+    // chain-blind `reconcile_leases` and the chain-aware
+    // `reconcile_leases_with_chain` consume this, so both passes are covered.
+    live.extend(
+        unreadable
+            .iter()
+            .filter_map(|p| crate::wallet::store::sid_from_path(p)),
+    );
+    Ok(live)
 }

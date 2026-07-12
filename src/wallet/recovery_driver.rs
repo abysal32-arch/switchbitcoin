@@ -111,10 +111,27 @@ pub enum RecoveryTick {
     RebroadcastSetup { setup_tx: Vec<u8> },
 }
 
-/// The result of a whole-store recovery scan: one `(swap_session_id, tick)`
-/// per readable record, plus the paths of any records that could not be
-/// loaded (surfaced, never silently dropped).
-pub type RecoveryScan = (Vec<([u8; 32], RecoveryTick)>, Vec<PathBuf>);
+/// The result of a whole-store recovery scan. Every failure mode is SURFACED
+/// per-record, never allowed to hide another swap's deadline (the same
+/// segregation [`SwapStore::list`] already applies to unreadable files, now
+/// carried all the way through re-entry).
+pub struct RecoveryScan {
+    /// One `(swap_session_id, tick)` per record that re-entered successfully.
+    pub ticks: Vec<([u8; 32], RecoveryTick)>,
+    /// Paths of records that could not be LOADED at all (corrupt/unreadable
+    /// `.swap` files — from [`SwapStore::list`]'s failed-file segregation).
+    /// Surfaced for the operator; nothing is driven for them.
+    pub unreadable: Vec<PathBuf>,
+    /// Records that LOADED but whose per-record re-entry itself FAILED — a
+    /// lost/corrupt possession file (restore `Err`), a structurally-degenerate
+    /// record (a missing outpoint/completion field a legal put sequence can
+    /// still produce), or a recovery-owned store put that hit a full/read-only
+    /// disk. Carried as `(swap_session_id, error)` and surfaced LOUDLY, one
+    /// entry per damaged swap — the scan does NOT abort, so every OTHER swap's
+    /// deadline is still driven. A permanently-failing record recurs here on
+    /// every scan (it never heals silently), which is the intended alarm.
+    pub failed: Vec<([u8; 32], Error)>,
+}
 
 /// Re-enters crashed swaps from the persisted [`SwapStore`]. Takes only the
 /// store (not the whole engine): recovery needs the record + chain and nothing
@@ -125,17 +142,24 @@ pub type RecoveryScan = (Vec<([u8; 32], RecoveryTick)>, Vec<PathBuf>);
 pub struct RecoveryDriver;
 
 impl RecoveryDriver {
-    /// Scan every tracked record and re-enter each. Returns `(sid, tick)` per
-    /// readable record plus the paths of any that could not be loaded —
-    /// surfaced, never silently skipped (matches [`SwapStore::list`]; a corrupt
-    /// file must not hide another swap's deadline).
+    /// Scan every tracked record and re-enter each, ISOLATING per-record
+    /// failures. A single damaged record (a lost possession file, a degenerate
+    /// field, a store put on a full disk) is collected into
+    /// [`RecoveryScan::failed`] and the scan CONTINUES — one swap's corruption
+    /// must never hide another swap's deadline (the same rule
+    /// [`SwapStore::list`] applies to unreadable files, now carried through
+    /// re-entry). Only a failure to enumerate the store at all is a hard `Err`.
     pub fn reenter_all(store: &SwapStore, chain: &impl AuthoritativeChainView) -> Result<RecoveryScan> {
-        let (records, failed) = store.list()?;
+        let (records, unreadable) = store.list()?;
         let mut ticks = Vec::with_capacity(records.len());
+        let mut failed = Vec::new();
         for rec in &records {
-            ticks.push((rec.swap_session_id, Self::reenter_one(store, rec, chain)?));
+            match Self::reenter_one(store, rec, chain) {
+                Ok(tick) => ticks.push((rec.swap_session_id, tick)),
+                Err(e) => failed.push((rec.swap_session_id, e)),
+            }
         }
-        Ok((ticks, failed))
+        Ok(RecoveryScan { ticks, unreadable, failed })
     }
 
     /// Re-enter one record. Pure decision plus the two recovery-owned persists
@@ -353,12 +377,14 @@ impl RecoveryDriver {
     /// open T) — the recovery twin of settle's mangled-reveal re-drive: an
     /// extraction-failing witness is EVIDENCE-FREE (it cannot take the swap),
     /// so the caller falls back to its no-reveal decision — the refund path —
-    /// exactly as if nothing had been observed. Propagating that Err instead
-    /// would let one permanently lying/degraded source poison the WHOLE
-    /// recovery scan (`reenter_all` stops at the first record Err), stranding
-    /// every other swap's re-entry behind a witness that will never validate.
-    /// Restore/possession failures still `Err` — the record claims G1
-    /// evidence, and corruption there must surface, not be silently skipped.
+    /// exactly as if nothing had been observed. This is a CORRECTNESS choice,
+    /// not just robustness: a mangled reveal is not a claim, so the right
+    /// answer is the refund, never a hard error. Restore/possession failures
+    /// still `Err` — the record claims G1 evidence, and corruption there must
+    /// SURFACE. It surfaces per-record now: [`reenter_all`] isolates each
+    /// record's `Err` into [`RecoveryScan::failed`] and keeps scanning, so a
+    /// corrupt possession file alarms loudly without hiding any other swap's
+    /// deadline (it never poisons the whole scan).
     fn restore_and_extract(
         store: &SwapStore,
         rec: &SwapRecord,

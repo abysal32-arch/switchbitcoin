@@ -633,9 +633,11 @@ impl SwapApp {
     /// Whole-wallet crash re-entry: re-enter every non-terminal swap in the
     /// persisted store from the record alone (a live `SwapApp`'s in-memory state
     /// does not survive a crash — the store is the durable truth). Delegates to
-    /// [`RecoveryDriver::reenter_all`]; the caller drives each returned
-    /// [`RecoveryTick`](crate::wallet::recovery_driver::RecoveryTick) and
-    /// performs its broadcasts.
+    /// [`RecoveryDriver::reenter_all`]; the caller drives each
+    /// [`RecoveryScan::ticks`] entry's broadcasts and SHOULD surface
+    /// [`RecoveryScan::unreadable`] / [`RecoveryScan::failed`] as operator
+    /// alarms — a per-record failure never aborts the scan, so the other swaps'
+    /// deadlines are still driven.
     pub fn recover(engine: &SwapEngine, chain: &impl AuthoritativeChainView) -> Result<RecoveryScan> {
         RecoveryDriver::reenter_all(engine.store(), chain)
     }
@@ -643,19 +645,31 @@ impl SwapApp {
     /// Whole-wallet STARTUP over a freshly opened engine — steps 2 and 3 of
     /// the canonical sequence (see
     /// [`SwapEngine::reconcile_with_chain`](crate::wallet::engine::SwapEngine::reconcile_with_chain))
-    /// in one call: the chain-aware phantom heals FIRST (so no recovery
-    /// decision or later lease selection acts on a coin the chain already
-    /// spent), then the whole-store crash re-entry scan. Returns both
-    /// reports; the caller drives each [`RecoveryTick`]'s broadcasts exactly
-    /// as with [`recover`](SwapApp::recover). Step 1 —
-    /// [`SwapEngine::open`](crate::wallet::engine::SwapEngine::open) — stays
-    /// separate: it must succeed even with the chain backend down, and the
+    /// in one call: the chain-aware phantom heal, then the whole-store crash
+    /// re-entry scan.
+    ///
+    /// The two are DECOUPLED. `reconcile_with_chain` performs an unconditional
+    /// ledger persist (a seal+fsync+rename, even on a zero-change reconcile), so
+    /// on a disk-full / locked-ledger / read-only device it returns `Err`. The
+    /// recovery scan, however, reads ONLY the store and the chain — never the
+    /// ledger — and its `Refund`/`Rebroadcast`/`RebroadcastSetup` ticks are pure
+    /// reads a swap at a hard CSV deadline depends on. So the reconcile outcome
+    /// is returned ALONGSIDE the scan (an inner `Result`), never `?`-propagated
+    /// ahead of it: a reconcile write failure must not suppress every swap's
+    /// refund tick. Reconcile still runs first (its heal is what a LATER
+    /// lease/bump selection consumes), but the scan runs regardless.
+    ///
+    /// CALLER CONTRACT: gate any lease/bump ledger action on a `reconcile`
+    /// `Ok`; the recovery ticks are actionable whether or not it succeeded. Only
+    /// a failure to ENUMERATE the store (nothing to recover) is a hard `Err`.
+    /// Step 1 — [`SwapEngine::open`](crate::wallet::engine::SwapEngine::open) —
+    /// stays separate: it must succeed even with the chain backend down, and the
     /// engine it returns is this function's input.
     pub fn startup(
         engine: &mut SwapEngine,
         chain: &impl AuthoritativeChainView,
-    ) -> Result<(ChainReconcile, RecoveryScan)> {
-        let reconcile = engine.reconcile_with_chain(chain)?;
+    ) -> Result<(Result<ChainReconcile>, RecoveryScan)> {
+        let reconcile = engine.reconcile_with_chain(chain);
         let scan = Self::recover(engine, chain)?;
         Ok((reconcile, scan))
     }

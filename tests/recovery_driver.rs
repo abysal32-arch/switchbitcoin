@@ -441,8 +441,10 @@ fn abort_and_funding_records_route_correctly() {
     }
 
     // reenter_all covers every record and returns one tick each.
-    let (ticks, failed) = RecoveryDriver::reenter_all(&store, &chain).unwrap();
-    assert!(failed.is_empty());
+    let scan = RecoveryDriver::reenter_all(&store, &chain).unwrap();
+    assert!(scan.unreadable.is_empty());
+    assert!(scan.failed.is_empty());
+    let ticks = scan.ticks;
     assert_eq!(ticks.len(), 3, "three records scanned");
     assert!(ticks.iter().any(|(sid, t)| *sid == sid_abort && matches!(t, RecoveryTick::Refund(_))));
     assert!(ticks.iter().any(|(sid, t)| *sid == sid_unfunded && matches!(t, RecoveryTick::Funding { refund: None })));
@@ -1315,7 +1317,58 @@ fn refunded_sl_own_mempool_refund_is_not_a_reveal() {
     }
 
     // And a whole-store scan stays Ok (the record does not poison the scan).
-    let (ticks, failed) = RecoveryDriver::reenter_all(&store, &chain).unwrap();
-    assert!(failed.is_empty());
-    assert_eq!(ticks.len(), 1);
+    let scan = RecoveryDriver::reenter_all(&store, &chain).unwrap();
+    assert!(scan.unreadable.is_empty());
+    assert!(scan.failed.is_empty());
+    assert_eq!(scan.ticks.len(), 1);
+}
+
+/// Task E (scan robustness, HIGH): one damaged record must NOT poison the whole
+/// scan. `reenter_all` isolates each per-record failure into
+/// `RecoveryScan::failed` and keeps going, so a lost/corrupt possession file on
+/// ONE swap surfaces loudly WITHOUT hiding another swap's deadline (before the
+/// fix, the `?` in the scan loop aborted every record at the first Err).
+#[test]
+fn one_damaged_record_does_not_poison_the_scan() {
+    let s = released_swap();
+    // Lose the possession file: reenter_released's up-front restore now Errs.
+    let poss = s.store.get(&s.sid).unwrap().unwrap().possession_record.unwrap();
+    std::fs::remove_file(&poss).unwrap();
+
+    // A second, healthy swap behind it: a pre-funding Funding record (nothing
+    // locked — a clean Funding { refund: None } tick).
+    let healthy = [0xE1u8; 32];
+    s.store
+        .put(&SwapRecord {
+            swap_session_id: healthy,
+            role: Role::SecretHolder,
+            phase: SwapPhase::Funding,
+            params: Params::testnet_provisional(),
+            s_height: 0,
+            sweep_escrow_height: 0,
+            our_escrow_outpoint: None,
+            their_escrow_outpoint: None,
+            pre_armed_refund: None,
+            completion_tx: None,
+            setup_tx: None,
+            possession_record: None,
+        })
+        .unwrap();
+
+    let scan = RecoveryDriver::reenter_all(&s.store, &s.chain).unwrap();
+    // The .swap files are readable; only the possession file is gone.
+    assert!(scan.unreadable.is_empty());
+    // The damaged swap surfaces per-record, loudly — never silently dropped.
+    assert!(
+        scan.failed.iter().any(|(sid, _)| *sid == s.sid),
+        "the damaged record must surface in `failed`, got {:?}",
+        scan.failed
+    );
+    // The healthy swap STILL gets its tick despite the sibling's corruption.
+    assert!(
+        scan.ticks
+            .iter()
+            .any(|(sid, t)| *sid == healthy && matches!(t, RecoveryTick::Funding { refund: None })),
+        "a sibling's corruption must not hide the healthy swap's tick"
+    );
 }

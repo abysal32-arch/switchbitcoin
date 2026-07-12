@@ -620,8 +620,9 @@ fn swap_app_funded_abort_routes_to_refunding() {
     // here is re-entered by recover() as the refund decision (escrow funded,
     // refund immature → Wait).
     assert_eq!(engine.store().get(&sid).unwrap().unwrap().phase, SwapPhase::AbortRefund);
-    let (ticks, failed) = SwapApp::recover(&engine, &chain).unwrap();
-    assert!(failed.is_empty());
+    let scan = SwapApp::recover(&engine, &chain).unwrap();
+    assert!(scan.unreadable.is_empty() && scan.failed.is_empty());
+    let ticks = scan.ticks;
     assert_eq!(ticks.len(), 1);
     assert_eq!(ticks[0].0, sid);
     assert!(
@@ -753,7 +754,7 @@ fn awaiting_verification_escalates_to_refund_at_maturity() {
         "the escalation advances the early record to AbortRefund"
     );
     // recover() from here drives the refund broadcast (matured, unspent).
-    let (ticks, _) = SwapApp::recover(&engine, &view).unwrap();
+    let ticks = SwapApp::recover(&engine, &view).unwrap().ticks;
     assert!(
         matches!(ticks[0].1, RecoveryTick::Refund(AbortAction::BroadcastRefund)),
         "got {:?}",
@@ -845,7 +846,7 @@ fn record_less_funded_abort_classifies_refunding_via_the_chain() {
         SwapPhase::AbortRefund,
         "the terminal wrote the missing early record and advanced it"
     );
-    let (ticks, _) = SwapApp::recover(&engine, &chain).unwrap();
+    let ticks = SwapApp::recover(&engine, &chain).unwrap().ticks;
     assert_eq!(ticks.len(), 1);
     assert!(matches!(ticks[0].1, RecoveryTick::Refund(_)), "got {:?}", ticks[0].1);
 
@@ -1035,8 +1036,9 @@ fn early_funding_record_survives_crash_and_recovers() {
 
     // (b) recover() re-enters the crashed swap from the record alone: escrow
     // funded, refund immature → Wait; at CSV maturity → BroadcastRefund.
-    let (ticks, failed) = SwapApp::recover(&engine2, &chain).unwrap();
-    assert!(failed.is_empty());
+    let scan = SwapApp::recover(&engine2, &chain).unwrap();
+    assert!(scan.unreadable.is_empty() && scan.failed.is_empty());
+    let ticks = scan.ticks;
     assert_eq!(ticks.len(), 1);
     assert_eq!(ticks[0].0, sid);
     assert!(
@@ -1047,7 +1049,7 @@ fn early_funding_record_survives_crash_and_recovers() {
     while chain.tip_height() < base + 200 {
         chain.mine();
     }
-    let (ticks, _) = SwapApp::recover(&engine2, &chain).unwrap();
+    let ticks = SwapApp::recover(&engine2, &chain).unwrap().ticks;
     assert!(
         matches!(ticks[0].1, RecoveryTick::Funding { refund: Some(AbortAction::BroadcastRefund) }),
         "matured: recover routes to the refund broadcast, got {:?}",
@@ -1233,13 +1235,13 @@ fn swap_app_recover_delegates_to_recovery_driver() {
     engine.store().put(&rec(SwapPhase::AbortRefund)).unwrap();
 
     // SwapApp::recover returns the same scan RecoveryDriver::reenter_all does.
-    let (via_app, failed_app) = SwapApp::recover(&engine, &chain).unwrap();
-    let (via_driver, failed_driver) = RecoveryDriver::reenter_all(engine.store(), &chain).unwrap();
-    assert_eq!(via_app, via_driver, "SwapApp::recover must delegate to RecoveryDriver");
-    assert_eq!(failed_app, failed_driver);
-    assert_eq!(via_app.len(), 1);
-    assert_eq!(via_app[0].0, sid);
-    assert!(matches!(via_app[0].1, RecoveryTick::Refund(_)));
+    let via_app = SwapApp::recover(&engine, &chain).unwrap();
+    let via_driver = RecoveryDriver::reenter_all(engine.store(), &chain).unwrap();
+    assert_eq!(via_app.ticks, via_driver.ticks, "SwapApp::recover must delegate to RecoveryDriver");
+    assert_eq!(via_app.unreadable, via_driver.unreadable);
+    assert_eq!(via_app.ticks.len(), 1);
+    assert_eq!(via_app.ticks[0].0, sid);
+    assert!(matches!(via_app.ticks[0].1, RecoveryTick::Refund(_)));
 }
 
 /// A real signed spend of `outpoint` (for the reveal fixture), so the sim gives
@@ -1673,7 +1675,7 @@ fn record_less_abort_with_setup_still_in_mempool_classifies_refunding() {
     // drives the standing refund over the now-funded escrow.
     chain.mine();
     assert!(chain.authoritative_funding_height(our_op).is_some());
-    let (ticks, _) = SwapApp::recover(&engine, &chain).unwrap();
+    let ticks = SwapApp::recover(&engine, &chain).unwrap().ticks;
     assert_eq!(ticks.len(), 1);
     assert!(matches!(ticks[0].1, RecoveryTick::Refund(_)), "got {:?}", ticks[0].1);
 }
@@ -2120,8 +2122,9 @@ fn eternal_mangled_reveal_never_strands_sl() {
     // witness and must fall back to the (now confirmed) refund decision.
     // Before the restore_and_extract fallback fix, this Err-POISONED the
     // whole recovery scan — recover() itself failed, forever.
-    let (ticks, failed) = SwapApp::recover(&engine, &degraded).unwrap();
-    assert!(failed.is_empty());
+    let scan = SwapApp::recover(&engine, &degraded).unwrap();
+    assert!(scan.unreadable.is_empty() && scan.failed.is_empty());
+    let ticks = scan.ticks;
     assert_eq!(ticks.len(), 1);
     assert!(
         matches!(
@@ -2154,7 +2157,7 @@ fn eternal_mangled_reveal_never_strands_sl() {
 
     // (5) A post-terminal recovery scan re-validates the Refunded record
     // against the chain and reports it at rest — still under the lying view.
-    let (ticks, _) = SwapApp::recover(&engine, &degraded).unwrap();
+    let ticks = SwapApp::recover(&engine, &degraded).unwrap().ticks;
     assert!(matches!(ticks[0].1, RecoveryTick::Settled), "got {:?}", ticks[0].1);
 }
 
@@ -2236,7 +2239,8 @@ fn swap_app_startup_heals_phantoms_then_recovers() {
         .unwrap();
 
     // STEPS 2+3 in ONE call.
-    let (reconcile, (ticks, failed)) = SwapApp::startup(&mut engine, &chain).unwrap();
+    let (reconcile, scan) = SwapApp::startup(&mut engine, &chain).unwrap();
+    let reconcile = reconcile.expect("reconcile succeeds on a writable ledger");
 
     // Step 2 healed the phantom (swept by the lease pass, permanently Spent).
     assert_eq!(reconcile.leases.swept, vec![phantom_pre]);
@@ -2245,12 +2249,161 @@ fn swap_app_startup_heals_phantoms_then_recovers() {
 
     // Step 3 re-entered the recoverable swap: funded escrow → the standing
     // pre-armed refund is surfaced (immature → Wait decision).
-    assert!(failed.is_empty());
+    assert!(scan.unreadable.is_empty() && scan.failed.is_empty());
+    let ticks = scan.ticks;
     assert_eq!(ticks.len(), 1);
     assert_eq!(ticks[0].0, rec_sid);
     assert!(
         matches!(ticks[0].1, RecoveryTick::Funding { refund: Some(_) }),
         "the funded Funding record must surface its refund, got {:?}",
         ticks[0].1
+    );
+}
+
+// ============================================================================
+// TASK E: scan robustness — live_lessees folds unreadable records; startup
+// decouples the scan from the reconcile persist.
+// ============================================================================
+
+/// Task E (MEDIUM): an UNREADABLE record (a transient read fault — here a
+/// `<sid>.swap` that became a directory, so `fs::read` fails and `open` routes
+/// it to `Unreadable`, not quarantine) must be treated as LIVE by
+/// `live_lessees`, so `SwapEngine::open`'s chain-blind lease reconcile does NOT
+/// release a live in-flight swap's funding-coin lease. Dropping it would let a
+/// later swap re-select the coin and double-spend the in-flight Setup. The sid
+/// is recovered from the filename; the lease survives.
+#[test]
+fn unreadable_record_keeps_its_funding_lease_across_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let params = Params::testnet_provisional();
+    let sid_a = [0xA5u8; 32];
+
+    // A pre-encumbrance coin leased to live swap A (its ledger is persisted).
+    let coin = onboard_one_coin(dir.path(), params.pre_encumbrance_sats(), sid_a);
+
+    // A's live Funding record, written BEFORE any engine open, so the lease is
+    // held by a real live swap rather than an orphan.
+    {
+        let (store, _) =
+            swapkey::wallet::store::SwapStore::open(dir.path(), &ModeledEnclave).unwrap();
+        store
+            .put(&SwapRecord {
+                swap_session_id: sid_a,
+                role: Role::SecretHolder,
+                phase: SwapPhase::Funding,
+                params: params.clone(),
+                s_height: 0,
+                sweep_escrow_height: 0,
+                our_escrow_outpoint: None,
+                their_escrow_outpoint: None,
+                pre_armed_refund: None,
+                completion_tx: None,
+                setup_tx: None,
+                possession_record: None,
+            })
+            .unwrap();
+    }
+
+    // Transient read fault on A's record: replace the `.swap` file with a
+    // directory so `fs::read` fails (Unreadable, not quarantine).
+    let swap_file = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.extension().map(|x| x == "swap").unwrap_or(false))
+        .expect("A's .swap record file");
+    std::fs::remove_file(&swap_file).unwrap();
+    std::fs::create_dir(&swap_file).unwrap();
+
+    // Reopen: the chain-blind reconcile must KEEP A's lease (unreadable = live).
+    let (engine, _) = SwapEngine::open(
+        dir.path(),
+        &ModeledEnclave,
+        Box::new(ModeledKeySource::new(&ModeledEnclave)),
+        &ModeledTrustRoot,
+    )
+    .unwrap();
+    let c = engine.ledger().find(&coin).expect("coin still tracked");
+    assert_eq!(
+        c.state,
+        CoinState::Leased,
+        "an unreadable record's funding lease must be preserved, not released"
+    );
+    assert_eq!(c.lessee, Some(sid_a));
+}
+
+/// Task E (MEDIUM): `SwapApp::startup` must SURFACE the recovery scan even when
+/// the reconcile ledger-persist fails (disk full / locked ledger). Recovery
+/// reads only the store + chain, so a swap at a hard CSV refund deadline still
+/// gets its `BroadcastRefund` tick — the reconcile failure is returned
+/// alongside the scan, never allowed to suppress it.
+#[test]
+fn startup_surfaces_the_scan_even_when_reconcile_persist_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let params = Params::testnet_provisional();
+    // Create a ledger (its orphan lease releases harmlessly at open).
+    onboard_one_coin(dir.path(), params.pre_encumbrance_sats(), [0x01u8; 32]);
+
+    // A mature, funded AbortRefund swap whose standing refund must be driven.
+    let (a, b) = (keypair(), keypair());
+    let internal = canonical_internal_key(a.pk, b.pk).unwrap();
+    let escrow = Escrow::new(&internal, &a.pk, params.delta_early).unwrap();
+    let dest = escrow.funding_script_pubkey().clone();
+    let our_op = OutPoint::new(txid_from(0xE7), 0);
+    let s_height = 700_000u32;
+    let refund = PreArmedRefund::arm(
+        &escrow,
+        our_op,
+        params.escrow_amount_sats(),
+        &a.sk,
+        dest,
+        params.tier_d_sats,
+        params.anchor_sats,
+        s_height,
+    )
+    .unwrap();
+    let chain = SimChain::new(refund.csv_maturity_height());
+    chain.fund(our_op, s_height);
+
+    let (mut engine, _) = SwapEngine::open(
+        dir.path(),
+        &ModeledEnclave,
+        Box::new(ModeledKeySource::new(&ModeledEnclave)),
+        &ModeledTrustRoot,
+    )
+    .unwrap();
+    let sid = [0xE9u8; 32];
+    let mut rec = SwapRecord {
+        swap_session_id: sid,
+        role: Role::SecretHolder,
+        phase: SwapPhase::Funding,
+        params: params.clone(),
+        s_height: 0,
+        sweep_escrow_height: 0,
+        our_escrow_outpoint: Some(our_op),
+        their_escrow_outpoint: Some(OutPoint::new(txid_from(0xEA), 0)),
+        pre_armed_refund: Some(refund),
+        completion_tx: None,
+        setup_tx: None,
+        possession_record: None,
+    };
+    for phase in [SwapPhase::Funding, SwapPhase::AbortRefund] {
+        rec.phase = phase;
+        engine.store().put(&rec).unwrap();
+    }
+
+    // Block the ledger persist: a DIRECTORY at the tmp path makes File::create
+    // fail, so reconcile_with_chain's unconditional persist returns Err.
+    std::fs::create_dir(dir.path().join("ledger.bin.tmp")).unwrap();
+
+    let (reconcile, scan) = SwapApp::startup(&mut engine, &chain).unwrap();
+    assert!(reconcile.is_err(), "the reconcile ledger persist must have failed");
+    // The scan STILL ran despite the reconcile Err: the funded, matured refund
+    // is surfaced (a hard CSV deadline must not be blocked by a ledger write).
+    assert_eq!(scan.ticks.len(), 1);
+    assert_eq!(scan.ticks[0].0, sid);
+    assert!(
+        matches!(scan.ticks[0].1, RecoveryTick::Refund(AbortAction::BroadcastRefund)),
+        "a reconcile write failure must not suppress a hard-deadline refund tick, got {:?}",
+        scan.ticks[0].1
     );
 }

@@ -859,8 +859,10 @@ impl SwapStore {
 }
 
 /// `<64 hex>.swap` -> sid. Anything else (tmp files, quarantine, lock file,
-/// strangers) is not a record.
-fn sid_from_path(path: &Path) -> Option<[u8; 32]> {
+/// strangers) is not a record. `pub(crate)` so `live_lessees` can recover the
+/// sid of a record that failed to LOAD (a transient read fault) and still treat
+/// its lease as live — an unreadable record must never look orphaned.
+pub(crate) fn sid_from_path(path: &Path) -> Option<[u8; 32]> {
     let name = path.file_name()?.to_str()?;
     let stem = name.strip_suffix(".swap")?;
     if stem.len() != 64 {
