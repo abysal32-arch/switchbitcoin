@@ -29,10 +29,25 @@
 //!
 //! # Engine boundary (consistent with increments 1-3)
 //! The driver DECIDES and reads chain state; the CALLER performs every
-//! broadcast. The only writes this driver makes are the two the recovery
+//! broadcast. The only writes this driver makes are the ones the recovery
 //! itself owns: persisting the finalized claim as `Completing` before it is
-//! handed back (rule 3), and marking a confirmed completion `Completed`. It
-//! never touches the frozen settlement-core surface.
+//! handed back (rule 3), marking a confirmed completion `Completed` — and the
+//! chain-proven-supersede routings out of a false terminal (`Completed ->
+//! AbortRefund` / `Refunded -> Completing` / `Completing -> AbortRefund`),
+//! taken only under SPENDER ATTRIBUTION (the confirmed spend is provably not
+//! ours / provably the counterparty's completion). It never touches the
+//! frozen settlement-core surface.
+//!
+//! # Spender attribution (never a spender-blind terminal)
+//! Every terminal this driver persists or re-validates asks WHO spent, not
+//! merely whether a spend confirmed. The swept escrow has exactly two spend
+//! paths — our completion (key path; its 64-byte witness signature IS the
+//! persisted `completion_tx`) and the counterparty's own refund leaf (script
+//! path) — so the witness comparison is a proof, not a heuristic. Our own
+//! escrow's spend is attributed by txid against the persisted pre-armed
+//! refund (the same who-spent rule as the live `our_refund_confirmed`
+//! terminal and `AbortDriver`). A view that cannot report the spender leaves
+//! the record honestly non-terminal — never a guessed `Settled`.
 
 use std::path::PathBuf;
 
@@ -132,8 +147,8 @@ impl RecoveryDriver {
         chain: &impl AuthoritativeChainView,
     ) -> Result<RecoveryTick> {
         match rec.phase {
-            SwapPhase::Completed => Self::reenter_completed(rec, chain),
-            SwapPhase::Refunded => Self::reenter_refunded(rec, chain),
+            SwapPhase::Completed => Self::reenter_completed(store, rec, chain),
+            SwapPhase::Refunded => Self::reenter_refunded(store, rec, chain),
             SwapPhase::Signing => Ok(RecoveryTick::RewritePending),
             SwapPhase::Funding => Self::reenter_funding(rec, chain),
             SwapPhase::Released => Self::reenter_released(store, rec, chain),
@@ -146,20 +161,49 @@ impl RecoveryDriver {
     /// audit finding: a reorg can revert a shallowly-confirmed completion, and
     /// mapping the record straight to `Settled` would leave recovery blind to
     /// an escrow that is contestable again). Our completion swept the
-    /// counterparty escrow (`their_escrow_outpoint`); if that spend is still
-    /// CONFIRMED the swap is genuinely done (`Settled`). If a reorg reverted it
-    /// (the completion fell back to mempool / the output is unspent again), we
-    /// rebroadcast the persisted completion signature — idempotent, exactly the
-    /// `Completing` babysit — so the settled leg is re-established rather than
-    /// silently abandoned. (A deep reorg in which the COUNTERPARTY then refunds
-    /// its own escrow is an unrecoverable, mainnet-implausible edge — 144+ block
-    /// reorg — and simply reads `Settled`; documented, out of scope.)
-    fn reenter_completed(rec: &SwapRecord, chain: &dyn AuthoritativeChainView) -> Result<RecoveryTick> {
+    /// counterparty escrow (`their_escrow_outpoint`); `Settled` requires that
+    /// spend to be CONFIRMED **and provably ours** — the spending witness's
+    /// key-path signature must equal the persisted completion signature.
+    /// `Completed` is persisted the moment the signature is finalized, BEFORE
+    /// any broadcast confirms, so a confirmed spend of the swept escrow can be
+    /// the counterparty's own refund leaf (we lost the sweep race) — a
+    /// spender-blind `Settled` would record a lost swap as a permanent "paid"
+    /// terminal AND leave our own funded escrow unguarded by every scan. On a
+    /// provably-foreign confirmed spend the record re-enters the abort path
+    /// (`Completed -> AbortRefund`, chain-proven supersede) so our escrow's
+    /// standing pre-armed refund is driven. An unattributable spend (view
+    /// reports no witness) stays honestly non-terminal (`Wait`) — a false
+    /// `Settled` abandons a funded escrow, and driving the refund on a spend
+    /// that might be OUR OWN completion would take both sides. If a reorg
+    /// reverted the spend entirely, we rebroadcast the persisted completion
+    /// signature — idempotent, exactly the `Completing` babysit.
+    fn reenter_completed(
+        store: &SwapStore,
+        rec: &SwapRecord,
+        chain: &dyn AuthoritativeChainView,
+    ) -> Result<RecoveryTick> {
         let swept = rec
             .their_escrow_outpoint
             .ok_or(Error::Ordering("Completed record without the swept escrow outpoint"))?;
         if spend_confirmed(chain, swept) {
-            return Ok(RecoveryTick::Settled);
+            let Ok(final_sig) = completion_sig(rec) else {
+                // No persisted signature to attribute against (not a shape our
+                // own writers produce): nothing actionable — report Settled
+                // rather than fabricate work from an unverifiable record.
+                return Ok(RecoveryTick::Settled);
+            };
+            return match swept_spend_is_ours(chain, swept, &final_sig) {
+                Some(true) => Ok(RecoveryTick::Settled),
+                Some(false) => {
+                    // Provably foreign: our completion did NOT sweep. Undo the
+                    // false "paid" terminal and drive our own escrow's exit.
+                    let mut next = rec.clone();
+                    next.phase = SwapPhase::AbortRefund;
+                    store.put(&next)?;
+                    Ok(RecoveryTick::Refund(Self::abort_action(&next, chain)?))
+                }
+                None => Ok(RecoveryTick::Refund(AbortAction::Wait)),
+            };
         }
         // Reverted: rebroadcast our completion if we retained its signature.
         match completion_sig(rec) {
@@ -171,17 +215,57 @@ impl RecoveryDriver {
     }
 
     /// `Refunded` — RE-VALIDATED like `Completed`. Our refund spent our own
-    /// escrow (`our_escrow_outpoint`); if that spend is still CONFIRMED the
-    /// funds are genuinely reclaimed (`Settled`). If a reorg reverted it, the
-    /// escrow is live again — re-enter the completion-supersedes refund decision
-    /// (`AbortDriver`: rebroadcast the refund at maturity, or take the swap if a
-    /// counterparty completion is now winning), never a false `Settled`.
-    fn reenter_refunded(rec: &SwapRecord, chain: &dyn AuthoritativeChainView) -> Result<RecoveryTick> {
+    /// escrow (`our_escrow_outpoint`); `Settled` requires that spend to be
+    /// CONFIRMED **and the spender to BE our refund** (txid match against the
+    /// persisted pre-armed refund — the same who-spent rule as the live
+    /// `our_refund_confirmed` terminal). Spender-blind, a shallow reorg that
+    /// replaces our 1-conf refund with the counterparty's timelock-free
+    /// completion would read `Settled` while t sits revealed on chain — an SL
+    /// holding G1 possession would never take the swap and lose D. So on a
+    /// spend that is not provably ours: an SL with possession EXECUTES
+    /// take-the-swap from the observed reveal (`Refunded -> Completing`,
+    /// chain-proven supersede — the same executor as the `AbortRefund`
+    /// re-entry); otherwise the `AbortDriver` decision resolves it honestly
+    /// (`Completed` for a named foreign confirmed spend, `Wait` for an
+    /// unreportable spender — never a guessed terminal — and the refund
+    /// re-drive when a reorg reverted the spend entirely).
+    fn reenter_refunded(
+        store: &SwapStore,
+        rec: &SwapRecord,
+        chain: &dyn AuthoritativeChainView,
+    ) -> Result<RecoveryTick> {
         let our_escrow = rec
             .our_escrow_outpoint
             .ok_or(Error::Ordering("Refunded record without our escrow outpoint"))?;
         if spend_confirmed(chain, our_escrow) {
-            return Ok(RecoveryTick::Settled);
+            let ours = rec
+                .pre_armed_refund
+                .as_ref()
+                .and_then(refund_txid)
+                .zip(chain.spend_txid(our_escrow))
+                .is_some_and(|(mine, seen)| mine == seen);
+            if ours {
+                return Ok(RecoveryTick::Settled);
+            }
+        }
+        // Not (or no longer) settled by our own refund. If the counterparty's
+        // completion is the (possibly reorg-replacing) spender it revealed t:
+        // an SL with possession takes the swap instead of abandoning it. The
+        // `spend_is_our_refund` guard keeps this from firing on OUR OWN refund
+        // sitting in the mempool (a script-path witness whose first element is
+        // a 64-byte sig, which `observe_reveal` would otherwise surface as a
+        // spurious reveal — driving a needless restore that Errs on a
+        // migrated/pruned possession file).
+        if rec.role == Role::SecretLearner
+            && rec.possession_record.is_some()
+            && !Self::swept_claim_futile(rec, chain)
+            && !Self::spend_is_our_refund(rec, chain, our_escrow)
+        {
+            if let Some(reveal) = ClaimScheduler::observe_reveal(chain, our_escrow) {
+                if let Some(tick) = Self::restore_and_extract(store, rec, chain, &reveal)? {
+                    return Ok(tick);
+                }
+            }
         }
         Ok(RecoveryTick::Refund(Self::abort_action(rec, chain)?))
     }
@@ -203,15 +287,24 @@ impl RecoveryDriver {
         rec: &SwapRecord,
         chain: &dyn AuthoritativeChainView,
     ) -> Result<RecoveryTick> {
-        if rec.role == Role::SecretLearner && rec.possession_record.is_some() {
+        if rec.role == Role::SecretLearner
+            && rec.possession_record.is_some()
+            && !Self::swept_claim_futile(rec, chain)
+        {
             if let Some(our_escrow) = rec.our_escrow_outpoint {
-                if let Some(reveal) = ClaimScheduler::observe_reveal(chain, our_escrow) {
-                    if let Some(tick) = Self::restore_and_extract(store, rec, chain, &reveal)? {
-                        return Ok(tick);
+                // Never treat OUR OWN (mempool) refund of E_sl as the reveal —
+                // its script-path witness carries a leading 64-byte sig that
+                // `observe_reveal` would surface, forcing a needless restore
+                // that Errs on a lost possession file (poisoning the scan).
+                if !Self::spend_is_our_refund(rec, chain, our_escrow) {
+                    if let Some(reveal) = ClaimScheduler::observe_reveal(chain, our_escrow) {
+                        if let Some(tick) = Self::restore_and_extract(store, rec, chain, &reveal)? {
+                            return Ok(tick);
+                        }
+                        // The witness failed extraction (mangled — a degraded
+                        // source, not a claim): keep the plain refund decision
+                        // below; a genuine reveal is picked up on the next scan.
                     }
-                    // The witness failed extraction (mangled — a degraded
-                    // source, not a claim): keep the plain refund decision
-                    // below; a genuine reveal is picked up on the next scan.
                 }
             }
         }
@@ -355,14 +448,16 @@ impl RecoveryDriver {
         // not only once SH completes.
         let _validated = Possessing::restore_secret_learner(record_path, &rec.swap_session_id)?;
 
-        if let Some(reveal) = ClaimScheduler::observe_reveal(chain, our_escrow) {
-            if let Some(tick) = Self::restore_and_extract(store, rec, chain, &reveal)? {
-                return Ok(tick);
+        if !Self::swept_claim_futile(rec, chain) {
+            if let Some(reveal) = ClaimScheduler::observe_reveal(chain, our_escrow) {
+                if let Some(tick) = Self::restore_and_extract(store, rec, chain, &reveal)? {
+                    return Ok(tick);
+                }
+                // The observed witness failed extraction (mangled — a degraded/
+                // lying source): fall through to the SAME safe fallback as no
+                // reveal at all. A hard Err here would poison the whole scan
+                // forever on a source that never heals.
             }
-            // The observed witness failed extraction (mangled — a degraded/
-            // lying source): fall through to the SAME safe fallback as no
-            // reveal at all. A hard Err here would poison the whole scan
-            // forever on a source that never heals.
         }
         // No reveal (or none usable): SH has not completed. The safe fallback
         // is the AbortDriver decision on OUR escrow — wait, refund at maturity,
@@ -382,8 +477,15 @@ impl RecoveryDriver {
 
     /// `Completing`: the finalized completion signature was persisted before
     /// broadcast. Rebroadcast it (the caller finalizes the tx from the sig +
-    /// template, as at the live boundary), and mark `Completed` once our
-    /// completion has swept the counterparty escrow.
+    /// template, as at the live boundary), and mark `Completed` once **our**
+    /// completion has swept the counterparty escrow — attributed by the
+    /// spending witness against the persisted signature, never by a bare
+    /// "spent, confirmed". A confirmed FOREIGN spend (the counterparty's own
+    /// refund leaf / a superseding claim) means we LOST the sweep: the record
+    /// routes `Completing -> AbortRefund` so our own escrow's exit is driven
+    /// and the loss stays visible, instead of freezing a lost swap as a
+    /// permanent false `Completed`. An unattributable confirmed spend keeps
+    /// the honest non-terminal babysit (`confirmed: false`).
     fn reenter_completing(
         store: &SwapStore,
         rec: &SwapRecord,
@@ -394,17 +496,65 @@ impl RecoveryDriver {
         let swept = rec
             .their_escrow_outpoint
             .ok_or(Error::Ordering("Completing record without the swept escrow outpoint"))?;
-        let confirmed = matches!(chain.spend_status(swept), crate::chain::SpendStatus::Confirmed(_));
-        if confirmed {
-            let mut next = rec.clone();
-            next.phase = SwapPhase::Completed;
-            store.put(&next)?;
+        if spend_confirmed(chain, swept) {
+            return match swept_spend_is_ours(chain, swept, &final_sig) {
+                Some(true) => {
+                    let mut next = rec.clone();
+                    next.phase = SwapPhase::Completed;
+                    store.put(&next)?;
+                    Ok(RecoveryTick::Rebroadcast { final_sig, confirmed: true })
+                }
+                Some(false) => {
+                    let mut next = rec.clone();
+                    next.phase = SwapPhase::AbortRefund;
+                    store.put(&next)?;
+                    Ok(RecoveryTick::Refund(Self::abort_action(&next, chain)?))
+                }
+                None => Ok(RecoveryTick::Rebroadcast { final_sig, confirmed: false }),
+            };
         }
-        Ok(RecoveryTick::Rebroadcast { final_sig, confirmed })
+        Ok(RecoveryTick::Rebroadcast { final_sig, confirmed: false })
+    }
+
+    /// TRUE iff the escrow OUR claim would sweep (`their_escrow_outpoint`) is
+    /// already CONFIRMED-spent by a tx that is provably not our claim — the
+    /// take-the-swap executor would derive a claim that can never confirm, and
+    /// persisting it as `Completing` would flip-flop forever with
+    /// `reenter_completing`'s foreign-spend routing (`-> AbortRefund -> extract
+    /// -> Completing -> ...`). At the phases that consult this (`Released` /
+    /// `AbortRefund` / `Refunded`) a persisted claim can exist only from a
+    /// prior `Completing` detour; with none persisted, ANY confirmed spend is
+    /// foreign (rule 3: our claim is persisted `Completing` before it is ever
+    /// handed out to broadcast). An unreportable witness never declares
+    /// futility — the executor stays available and the resulting `Completing`
+    /// babysit is honestly non-terminal either way.
+    fn swept_claim_futile(rec: &SwapRecord, chain: &dyn AuthoritativeChainView) -> bool {
+        let Some(swept) = rec.their_escrow_outpoint else { return false };
+        if !spend_confirmed(chain, swept) {
+            return false;
+        }
+        match (completion_sig(rec).ok(), chain.spending_witness_sig(swept)) {
+            (Some(ours), Some(w)) => w != ours,
+            (Some(_), None) => false,
+            (None, _) => true,
+        }
     }
 
     /// The completion-supersedes decision on our escrow, shared by the
-    /// `AbortRefund` and funded-`Funding` paths.
+    /// `AbortRefund`, funded-`Funding`, and foreign-swept re-routing paths.
+    ///
+    /// FORWARD-OR-REFUND both-sides guard (first, before any refund decision):
+    /// if OUR OWN completion has provably swept the counterparty escrow we went
+    /// FORWARD on that leg — we are paid — so broadcasting our own escrow's
+    /// refund on top would take BOTH sides (the counterparty is denied E_ours
+    /// while we keep E_theirs). `AbortDriver` reads only our own escrow, so it
+    /// cannot see this; without the guard a matured, still-unspent E_ours would
+    /// return `BroadcastRefund` even though our completion already swept
+    /// E_theirs (reachable when a shallow reorg flips the swept escrow back to
+    /// our completion after the record was routed to `AbortRefund`/`Refunded`).
+    /// On a provably-ours swept spend we report `Completed` (the leg went
+    /// through), never a refund. Conservative: an unspent/foreign/unattributable
+    /// swept escrow reads through to the normal decision.
     fn abort_action(rec: &SwapRecord, chain: &dyn AuthoritativeChainView) -> Result<AbortAction> {
         let our_escrow = rec
             .our_escrow_outpoint
@@ -413,7 +563,46 @@ impl RecoveryDriver {
             .pre_armed_refund
             .as_ref()
             .ok_or(Error::Deadline("abort path without a pre-armed refund (G2)"))?;
+        if Self::our_completion_swept(rec, chain) {
+            return Ok(AbortAction::Completed);
+        }
         Ok(AbortDriver::next_abort_action(chain, our_escrow, refund, refund_txid(refund)))
+    }
+
+    /// TRUE iff OUR OWN completion has (provably) swept the counterparty escrow
+    /// — mempool OR confirmed. The complement of the foreign-spend attribution:
+    /// the swept escrow's spending witness key-path signature equals our
+    /// persisted completion signature (the only key-path spend of that escrow).
+    /// Conservative FALSE on an unspent swept escrow, an unattributable witness,
+    /// or a record with no persisted completion signature (e.g. a `Funding`
+    /// record — no completion exists, so this never mis-fires pre-settlement).
+    fn our_completion_swept(rec: &SwapRecord, chain: &dyn AuthoritativeChainView) -> bool {
+        let Some(swept) = rec.their_escrow_outpoint else { return false };
+        if matches!(chain.spend_status(swept), crate::chain::SpendStatus::Unspent) {
+            return false;
+        }
+        matches!(
+            (completion_sig(rec).ok(), chain.spending_witness_sig(swept)),
+            (Some(ours), Some(w)) if w == ours
+        )
+    }
+
+    /// TRUE iff `escrow`'s current spend (mempool or confirmed) is OUR OWN
+    /// pre-armed refund, by txid — the same who-spent rule as the live
+    /// `our_refund_confirmed` / `AbortDriver`. Keeps the take-the-swap executor
+    /// from firing on our own refund's script-path witness (which
+    /// `observe_reveal` surfaces as a leading 64-byte sig). Unreportable spender
+    /// reads FALSE (the extraction attempt then self-limits: a non-reveal
+    /// witness fails extraction to the safe fallback).
+    fn spend_is_our_refund(
+        rec: &SwapRecord,
+        chain: &dyn AuthoritativeChainView,
+        escrow: OutPoint,
+    ) -> bool {
+        matches!(
+            (rec.pre_armed_refund.as_ref().and_then(refund_txid), chain.spend_txid(escrow)),
+            (Some(mine), Some(seen)) if mine == seen
+        )
     }
 }
 
@@ -423,6 +612,22 @@ impl RecoveryDriver {
 /// terminal's defining spend is not (or no longer) on chain — re-drive.
 fn spend_confirmed(chain: &dyn AuthoritativeChainView, outpoint: OutPoint) -> bool {
     matches!(chain.spend_status(outpoint), crate::chain::SpendStatus::Confirmed(_))
+}
+
+/// Attribute the SWEPT escrow's spend against our persisted completion
+/// signature. `Some(true)` — provably OUR completion: the spender's key-path
+/// witness signature equals `final_sig` (our completion is the escrow's only
+/// key-path spend, so equality is a proof). `Some(false)` — provably FOREIGN:
+/// the view reports the spending witness and it does not match (the only other
+/// spend path is the counterparty's own script-path refund leaf). `None` — the
+/// view cannot report the witness: attribution is impossible, never guess a
+/// terminal from it.
+fn swept_spend_is_ours(
+    chain: &dyn AuthoritativeChainView,
+    swept: OutPoint,
+    final_sig: &[u8; 64],
+) -> Option<bool> {
+    chain.spending_witness_sig(swept).map(|w| &w == final_sig)
 }
 
 /// The txid of our own pre-armed refund, for the `AbortDriver`'s

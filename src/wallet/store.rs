@@ -160,8 +160,9 @@ impl SwapPhase {
 }
 
 /// The allowed phase graph. Everything not listed is an ordering violation.
-/// Note the two load-bearing ABSENCES: no edge out of a terminal phase, and
-/// no `AbortRefund -> Signing` (a dead session is never resumed — INV-4).
+/// The load-bearing ABSENCES: no `AbortRefund -> Signing` (a dead session is
+/// never resumed — INV-4), no in-place update of a terminal record, and no
+/// exit from a terminal EXCEPT the two chain-proven-supersede edges below.
 /// `AbortRefund -> Completed` is completion-supersedes: the refund driver
 /// discovers the counterparty's completion winning and takes the swap.
 /// `AbortRefund -> Completing` is the SL half of the same rule: SH's
@@ -170,6 +171,18 @@ impl SwapPhase {
 /// and babysat exactly like any `Completing`. No signing session resumes
 /// (the claim derives from the possession record + the on-chain reveal
 /// alone), so INV-4's absence is untouched.
+///
+/// The two CHAIN-PROVEN-SUPERSEDE exits from a terminal (recovery-owned; a
+/// live driver never takes them — a terminal was only ever persisted from a
+/// confirmed spend, and only the chain can prove that spend was reverted or
+/// misattributed):
+/// - `Completed -> AbortRefund`: the swept escrow's confirmed spend is
+///   ATTRIBUTED (spending witness vs the persisted completion signature) to a
+///   FOREIGN tx — the counterparty's own refund/claim won, so the recorded
+///   "paid" terminal is false and our own escrow's exit must be driven.
+/// - `Refunded -> Completing`: the mirror — our recorded refund was reorged
+///   out and the counterparty's completion confirmed instead, revealing t;
+///   recovery executes take-the-swap (rule 3 persist, then babysit).
 fn transition_ok(from: SwapPhase, to: SwapPhase) -> bool {
     use SwapPhase::*;
     if from == to {
@@ -192,6 +205,8 @@ fn transition_ok(from: SwapPhase, to: SwapPhase) -> bool {
             | (AbortRefund, Refunded)
             | (AbortRefund, Completed)
             | (AbortRefund, Completing)
+            | (Completed, AbortRefund)
+            | (Refunded, Completing)
     )
 }
 

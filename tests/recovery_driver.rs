@@ -726,7 +726,18 @@ fn std_p2tr_spk() -> bitcoin::ScriptBuf {
     bitcoin::ScriptBuf::from_bytes(v)
 }
 fn spend_of(outpoint: OutPoint, out_sats: u64) -> Vec<u8> {
+    spend_with_witness(outpoint, out_sats, None)
+}
+/// A minimal v3 spend of `outpoint`; `witness_sig` = `Some(sig)` makes it a
+/// key-path-shaped spend (single 64-byte witness element) so the recovery
+/// driver's spender attribution can read it, `None` leaves the witness empty
+/// (an UNATTRIBUTABLE spend — `spending_witness_sig` reports nothing).
+fn spend_with_witness(outpoint: OutPoint, out_sats: u64, witness_sig: Option<[u8; 64]>) -> Vec<u8> {
     use bitcoin::{absolute, transaction::Version, Amount, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+    let mut witness = Witness::new();
+    if let Some(sig) = witness_sig {
+        witness.push(sig);
+    }
     let tx = Transaction {
         version: Version(3),
         lock_time: absolute::LockTime::ZERO,
@@ -734,7 +745,7 @@ fn spend_of(outpoint: OutPoint, out_sats: u64) -> Vec<u8> {
             previous_output: outpoint,
             script_sig: ScriptBuf::new(),
             sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-            witness: Witness::new(),
+            witness,
         }],
         output: vec![TxOut { value: Amount::from_sat(out_sats), script_pubkey: std_p2tr_spk() }],
     };
@@ -781,10 +792,11 @@ fn terminal_records_are_revalidated_against_reorg() {
         possession_record: None,
     };
 
-    // --- Completed, swept escrow still CONFIRMED-spent → Settled. ---
+    // --- Completed, swept escrow still CONFIRMED-spent BY OUR COMPLETION
+    // (key-path witness == the persisted signature) → Settled. ---
     let good = SimChain::new(s_height);
     good.fund(their_escrow, s_height);
-    good.broadcast(&spend_of(their_escrow, unit - 500)).unwrap();
+    good.broadcast(&spend_with_witness(their_escrow, unit - 500, Some([0xcdu8; 64]))).unwrap();
     good.mine();
     assert_eq!(
         RecoveryDriver::reenter_one(&store, &rec(SwapPhase::Completed), &good).unwrap(),
@@ -802,10 +814,11 @@ fn terminal_records_are_revalidated_against_reorg() {
         other => panic!("a reverted Completed must rebroadcast, got {other:?}"),
     }
 
-    // --- Refunded, our refund still CONFIRMED-spent → Settled. ---
-    let good_r = SimChain::new(s_height);
+    // --- Refunded, our escrow still CONFIRMED-spent BY OUR OWN REFUND (the
+    // record's pre-armed refund tx itself — txid attribution) → Settled. ---
+    let good_r = SimChain::new(refund.csv_maturity_height());
     good_r.fund(our_escrow, s_height);
-    good_r.broadcast(&spend_of(our_escrow, unit - 500)).unwrap();
+    good_r.broadcast(refund.tx_bytes()).expect("mature refund accepted");
     good_r.mine();
     assert_eq!(
         RecoveryDriver::reenter_one(&store, &rec(SwapPhase::Refunded), &good_r).unwrap(),
@@ -820,4 +833,489 @@ fn terminal_records_are_revalidated_against_reorg() {
         RecoveryTick::Refund(AbortAction::BroadcastRefund) => {}
         other => panic!("a reverted Refunded must re-drive the refund, got {other:?}"),
     }
+}
+
+/// Spend-attribution cluster (Feature-3 audit, HIGH): a confirmed FOREIGN
+/// spend of the swept escrow — the counterparty's own refund of the escrow we
+/// were sweeping — must never be read as OUR completion. `reenter_completing`
+/// must not persist `Completed` (a false "paid" terminal that unguards our own
+/// funded escrow forever); it routes `Completing -> AbortRefund` so the
+/// standing pre-armed refund on OUR escrow is surfaced, and at CSV maturity
+/// the refund is driven.
+#[test]
+fn completing_foreign_spend_routes_to_abort_not_completed() {
+    let params = Params::testnet_provisional();
+    let s_height = 800_000u32;
+    let unit = params.escrow_amount_sats();
+
+    let a = keypair();
+    let b = keypair();
+    let internal = swapkey::settlement::state_machine::canonical_internal_key(a.pk, b.pk).unwrap();
+    let escrow = Escrow::new(&internal, &a.pk, params.delta_early).unwrap();
+    let dest = escrow.funding_script_pubkey().clone();
+    let our_escrow = OutPoint::new(txid_from(0x70), 0);
+    let their_escrow = OutPoint::new(txid_from(0x71), 0);
+    let refund = PreArmedRefund::arm(
+        &escrow, our_escrow, unit, &a.sk, dest, params.tier_d_sats, params.anchor_sats, s_height,
+    )
+    .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _) = SwapStore::open(dir.path(), &ModeledEnclave).unwrap();
+    let mut rec = SwapRecord {
+        swap_session_id: [0x61u8; 32],
+        role: Role::SecretHolder,
+        phase: SwapPhase::Funding,
+        params: params.clone(),
+        s_height,
+        sweep_escrow_height: s_height,
+        our_escrow_outpoint: Some(our_escrow),
+        their_escrow_outpoint: Some(their_escrow),
+        pre_armed_refund: Some(refund.clone()),
+        completion_tx: Some(vec![0xcdu8; 64]),
+        setup_tx: None,
+        possession_record: None,
+    };
+    // Legal ladder to the phase under test (new records start in Funding).
+    for phase in [SwapPhase::Funding, SwapPhase::Signing, SwapPhase::Completing] {
+        rec.phase = phase;
+        store.put(&rec).unwrap();
+    }
+
+    // The counterparty's own (dead-device) refund of the escrow WE sweep
+    // confirms: a key-path-shaped witness that is NOT our completion sig.
+    let chain = SimChain::new(s_height);
+    chain.fund(our_escrow, s_height);
+    chain.fund(their_escrow, s_height);
+    chain.broadcast(&spend_with_witness(their_escrow, unit - 500, Some([0xabu8; 64]))).unwrap();
+    chain.mine();
+
+    let got = store.get(&rec.swap_session_id).unwrap().unwrap();
+    match RecoveryDriver::reenter_one(&store, &got, &chain).unwrap() {
+        // Our escrow is untouched and the refund immature → Wait, but NEVER a
+        // confirmed Rebroadcast and NEVER a Completed terminal.
+        RecoveryTick::Refund(AbortAction::Wait) => {}
+        other => panic!("foreign swept spend must surface the refund decision, got {other:?}"),
+    }
+    assert_eq!(
+        store.get(&rec.swap_session_id).unwrap().unwrap().phase,
+        SwapPhase::AbortRefund,
+        "a lost sweep must route Completing -> AbortRefund, not freeze a false Completed"
+    );
+
+    // At CSV maturity the AbortRefund re-entry drives the refund broadcast.
+    while chain.tip_height() < refund.csv_maturity_height() {
+        chain.mine();
+    }
+    let got = store.get(&rec.swap_session_id).unwrap().unwrap();
+    match RecoveryDriver::reenter_one(&store, &got, &chain).unwrap() {
+        RecoveryTick::Refund(AbortAction::BroadcastRefund) => {}
+        other => panic!("matured refund on our escrow must be driven, got {other:?}"),
+    }
+}
+
+/// Same cluster, unattributable spend: the view reports the swept escrow's
+/// spend as confirmed but cannot report the spending witness. Recovery must
+/// stay honestly non-terminal — no `Completed` persist, no guessed `Settled`,
+/// and (for a `Completed` record) no refund drive either, since the spend
+/// might be OUR OWN completion and refunding on top would take both sides.
+#[test]
+fn unattributable_swept_spend_stays_nonterminal() {
+    let params = Params::testnet_provisional();
+    let s_height = 800_000u32;
+    let unit = params.escrow_amount_sats();
+
+    let a = keypair();
+    let b = keypair();
+    let internal = swapkey::settlement::state_machine::canonical_internal_key(a.pk, b.pk).unwrap();
+    let escrow = Escrow::new(&internal, &a.pk, params.delta_early).unwrap();
+    let dest = escrow.funding_script_pubkey().clone();
+    let our_escrow = OutPoint::new(txid_from(0x72), 0);
+    let their_escrow = OutPoint::new(txid_from(0x73), 0);
+    let refund = PreArmedRefund::arm(
+        &escrow, our_escrow, unit, &a.sk, dest, params.tier_d_sats, params.anchor_sats, s_height,
+    )
+    .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _) = SwapStore::open(dir.path(), &ModeledEnclave).unwrap();
+    let put_at = |sid: u8, phases: &[SwapPhase]| -> SwapRecord {
+        let mut rec = SwapRecord {
+            swap_session_id: [sid; 32],
+            role: Role::SecretHolder,
+            phase: SwapPhase::Funding,
+            params: params.clone(),
+            s_height,
+            sweep_escrow_height: s_height,
+            our_escrow_outpoint: Some(our_escrow),
+            their_escrow_outpoint: Some(their_escrow),
+            pre_armed_refund: Some(refund.clone()),
+            completion_tx: Some(vec![0xcdu8; 64]),
+            setup_tx: None,
+            possession_record: None,
+        };
+        store.put(&rec).unwrap();
+        for phase in phases {
+            rec.phase = *phase;
+            store.put(&rec).unwrap();
+        }
+        rec
+    };
+
+    // Confirmed spend with an EMPTY witness: `spending_witness_sig` = None.
+    let chain = SimChain::new(s_height);
+    chain.fund(our_escrow, s_height);
+    chain.fund(their_escrow, s_height);
+    chain.broadcast(&spend_of(their_escrow, unit - 500)).unwrap();
+    chain.mine();
+
+    // Completing: keep babysitting, unconfirmed — never advance the record.
+    let completing = put_at(0x62, &[SwapPhase::Signing, SwapPhase::Completing]);
+    match RecoveryDriver::reenter_one(&store, &completing, &chain).unwrap() {
+        RecoveryTick::Rebroadcast { confirmed: false, .. } => {}
+        other => panic!("unattributable spend must stay an unconfirmed babysit, got {other:?}"),
+    }
+    assert_eq!(store.get(&[0x62; 32]).unwrap().unwrap().phase, SwapPhase::Completing);
+
+    // Completed: honestly non-terminal Wait — no Settled, no refund drive.
+    let completed =
+        put_at(0x63, &[SwapPhase::Signing, SwapPhase::Completing, SwapPhase::Completed]);
+    match RecoveryDriver::reenter_one(&store, &completed, &chain).unwrap() {
+        RecoveryTick::Refund(AbortAction::Wait) => {}
+        other => panic!("unattributable spend must never settle a Completed, got {other:?}"),
+    }
+    assert_eq!(store.get(&[0x63; 32]).unwrap().unwrap().phase, SwapPhase::Completed);
+}
+
+/// Spend-attribution cluster (HIGH, `reenter_completed`): a Completed record
+/// whose swept-escrow spend confirms as a provably FOREIGN tx (we lost the
+/// race with zero reorg — the completion never made it) must re-enter the
+/// abort path so OUR OWN funded escrow is driven to its refund, not read
+/// `Settled` forever.
+#[test]
+fn completed_foreign_spend_reenters_abort() {
+    let params = Params::testnet_provisional();
+    let s_height = 800_000u32;
+    let unit = params.escrow_amount_sats();
+
+    let a = keypair();
+    let b = keypair();
+    let internal = swapkey::settlement::state_machine::canonical_internal_key(a.pk, b.pk).unwrap();
+    let escrow = Escrow::new(&internal, &a.pk, params.delta_early).unwrap();
+    let dest = escrow.funding_script_pubkey().clone();
+    let our_escrow = OutPoint::new(txid_from(0x74), 0);
+    let their_escrow = OutPoint::new(txid_from(0x75), 0);
+    let refund = PreArmedRefund::arm(
+        &escrow, our_escrow, unit, &a.sk, dest, params.tier_d_sats, params.anchor_sats, s_height,
+    )
+    .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _) = SwapStore::open(dir.path(), &ModeledEnclave).unwrap();
+    let mut rec = SwapRecord {
+        swap_session_id: [0x64u8; 32],
+        role: Role::SecretHolder,
+        phase: SwapPhase::Funding,
+        params: params.clone(),
+        s_height,
+        sweep_escrow_height: s_height,
+        our_escrow_outpoint: Some(our_escrow),
+        their_escrow_outpoint: Some(their_escrow),
+        pre_armed_refund: Some(refund.clone()),
+        completion_tx: Some(vec![0xcdu8; 64]),
+        setup_tx: None,
+        possession_record: None,
+    };
+    // Legal ladder to the Completed terminal (new records start in Funding).
+    for phase in [
+        SwapPhase::Funding,
+        SwapPhase::Signing,
+        SwapPhase::Completing,
+        SwapPhase::Completed,
+    ] {
+        rec.phase = phase;
+        store.put(&rec).unwrap();
+    }
+
+    let chain = SimChain::new(s_height);
+    chain.fund(our_escrow, s_height);
+    chain.fund(their_escrow, s_height);
+    chain.broadcast(&spend_with_witness(their_escrow, unit - 500, Some([0xabu8; 64]))).unwrap();
+    chain.mine();
+
+    let got = store.get(&rec.swap_session_id).unwrap().unwrap();
+    match RecoveryDriver::reenter_one(&store, &got, &chain).unwrap() {
+        RecoveryTick::Refund(AbortAction::Wait) => {}
+        other => panic!("foreign spend of the swept escrow must not settle, got {other:?}"),
+    }
+    assert_eq!(
+        store.get(&rec.swap_session_id).unwrap().unwrap().phase,
+        SwapPhase::AbortRefund,
+        "the false 'paid' terminal must be undone (Completed -> AbortRefund)"
+    );
+
+    // From AbortRefund the matured refund is driven like any abort.
+    while chain.tip_height() < refund.csv_maturity_height() {
+        chain.mine();
+    }
+    let got = store.get(&rec.swap_session_id).unwrap().unwrap();
+    match RecoveryDriver::reenter_one(&store, &got, &chain).unwrap() {
+        RecoveryTick::Refund(AbortAction::BroadcastRefund) => {}
+        other => panic!("matured refund must be driven after the false terminal, got {other:?}"),
+    }
+}
+
+/// Spend-attribution cluster (HIGH, `reenter_refunded`): a Refunded SL record
+/// whose escrow spend is now the COUNTERPARTY'S COMPLETION (a shallow reorg
+/// replaced our 1-conf refund with SH's timelock-free completion) must not
+/// read `Settled` — t is revealed on chain and the SL holds G1 possession, so
+/// recovery EXECUTES take-the-swap (`Refunded -> Completing`, rule 3) and the
+/// claim is driven to `Completed`.
+#[test]
+fn refunded_foreign_completion_executes_take_the_swap() {
+    let s = released_swap();
+
+    // The wallet had recorded the refund terminal before the reorg:
+    // Released -> AbortRefund -> Refunded (both edges legal).
+    let mut rec = s.store.get(&s.sid).unwrap().unwrap();
+    rec.phase = SwapPhase::AbortRefund;
+    s.store.put(&rec).unwrap();
+    rec.phase = SwapPhase::Refunded;
+    s.store.put(&rec).unwrap();
+
+    // Post-reorg chain reality: E_sl is spent-confirmed by SH's COMPLETION
+    // (key-path reveal), not by our refund.
+    s.chain.broadcast(&s.comp_sh_final).expect("Comp->SH accepted");
+    s.chain.mine();
+    assert!(matches!(s.chain.spend_status(s.op_comp_sh), SpendStatus::Confirmed(_)));
+
+    let got = s.store.get(&s.sid).unwrap().unwrap();
+    let final_sig = match RecoveryDriver::reenter_one(&s.store, &got, &s.chain).unwrap() {
+        RecoveryTick::Extract { final_sig: Some(sig), .. } => sig,
+        other => panic!("a reorged-out refund with t revealed must take the swap, got {other:?}"),
+    };
+    assert_eq!(
+        s.store.get(&s.sid).unwrap().unwrap().phase,
+        SwapPhase::Completing,
+        "rule 3: the extracted claim is persisted before it is handed back"
+    );
+
+    // Drive the claim home: broadcast, confirm, finalize.
+    let finalized = finalize_key_spend(s.comp_sl_spend, final_sig);
+    s.chain.broadcast(&finalized).expect("Comp->SL accepted");
+    s.chain.mine();
+    let got = s.store.get(&s.sid).unwrap().unwrap();
+    match RecoveryDriver::reenter_one(&s.store, &got, &s.chain).unwrap() {
+        RecoveryTick::Rebroadcast { confirmed: true, .. } => {}
+        other => panic!("confirmed claim must finalize, got {other:?}"),
+    }
+    assert_eq!(s.store.get(&s.sid).unwrap().unwrap().phase, SwapPhase::Completed);
+}
+
+/// The lost-race SL shape + flip-flop stability: an SL whose extracted claim
+/// (persisted `Completing`) loses E_sh to SH's late refund must (1) never
+/// freeze a false `Completed`, (2) route to `AbortRefund` with the loss
+/// visible (`Refund(Completed)` — E_sl was swept by SH's completion), and
+/// (3) STAY there: the take-the-swap executor must not re-extract a claim
+/// whose swept escrow is confirmed-foreign (else the record would flip-flop
+/// `AbortRefund <-> Completing` forever).
+#[test]
+fn completing_sl_lost_race_is_stable_loss_not_false_completed() {
+    let s = released_swap();
+
+    // SH's completion lands (the reveal); recovery extracts and persists the
+    // claim (Released -> Completing) but the claim is NOT broadcast (crash).
+    s.chain.broadcast(&s.comp_sh_final).expect("Comp->SH accepted");
+    s.chain.mine();
+    let rec = s.store.get(&s.sid).unwrap().unwrap();
+    match RecoveryDriver::reenter_one(&s.store, &rec, &s.chain).unwrap() {
+        RecoveryTick::Extract { final_sig: Some(_), .. } => {}
+        other => panic!("expected the claim extraction, got {other:?}"),
+    }
+    assert_eq!(s.store.get(&s.sid).unwrap().unwrap().phase, SwapPhase::Completing);
+
+    // SH's late refund of E_sh confirms first — SL lost the claim race.
+    let unit = s.store.get(&s.sid).unwrap().unwrap().params.escrow_amount_sats();
+    s.chain
+        .broadcast(&spend_with_witness(s.op_comp_sl, unit - 500, Some([0xabu8; 64])))
+        .expect("SH's late refund accepted");
+    s.chain.mine();
+
+    // (1)+(2): the loss is surfaced, never recorded as success.
+    let rec = s.store.get(&s.sid).unwrap().unwrap();
+    match RecoveryDriver::reenter_one(&s.store, &rec, &s.chain).unwrap() {
+        RecoveryTick::Refund(AbortAction::Completed) => {}
+        other => panic!("lost race must surface as a superseded abort, got {other:?}"),
+    }
+    assert_eq!(s.store.get(&s.sid).unwrap().unwrap().phase, SwapPhase::AbortRefund);
+
+    // (3): re-scanning is STABLE — the futile claim is not re-extracted.
+    let rec = s.store.get(&s.sid).unwrap().unwrap();
+    match RecoveryDriver::reenter_one(&s.store, &rec, &s.chain).unwrap() {
+        RecoveryTick::Refund(AbortAction::Completed) => {}
+        other => panic!("the lost-race decision must be stable, got {other:?}"),
+    }
+    assert_eq!(
+        s.store.get(&s.sid).unwrap().unwrap().phase,
+        SwapPhase::AbortRefund,
+        "no AbortRefund <-> Completing flip-flop on a confirmed-foreign swept escrow"
+    );
+}
+
+/// FORWARD-OR-REFUND both-sides guard (adversarial review of Task D): a record
+/// at `AbortRefund`/`Refunded` whose SWEPT escrow is confirmed-spent BY OUR OWN
+/// completion (witness == the persisted completion sig — reachable when a
+/// shallow reorg flips the swept escrow back to our completion after the record
+/// was routed to the abort path) must NEVER drive our own escrow's refund: we
+/// are already paid on that leg, and refunding E_ours on top takes BOTH sides.
+/// The decision is `Completed`, never `BroadcastRefund`.
+#[test]
+fn abort_never_refunds_when_our_completion_already_swept() {
+    let params = Params::testnet_provisional();
+    let s_height = 800_000u32;
+    let unit = params.escrow_amount_sats();
+
+    let a = keypair();
+    let b = keypair();
+    let internal = swapkey::settlement::state_machine::canonical_internal_key(a.pk, b.pk).unwrap();
+    let escrow = Escrow::new(&internal, &a.pk, params.delta_early).unwrap();
+    let dest = escrow.funding_script_pubkey().clone();
+    let our_escrow = OutPoint::new(txid_from(0xA0), 0);
+    let their_escrow = OutPoint::new(txid_from(0xA1), 0);
+    let refund = PreArmedRefund::arm(
+        &escrow, our_escrow, unit, &a.sk, dest, params.tier_d_sats, params.anchor_sats, s_height,
+    )
+    .unwrap();
+    let ours: [u8; 64] = [0xcdu8; 64]; // our persisted completion signature
+
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _) = SwapStore::open(dir.path(), &ModeledEnclave).unwrap();
+    let mut rec = SwapRecord {
+        swap_session_id: [0x91u8; 32],
+        role: Role::SecretHolder,
+        phase: SwapPhase::Funding,
+        params: params.clone(),
+        s_height,
+        sweep_escrow_height: s_height,
+        our_escrow_outpoint: Some(our_escrow),
+        their_escrow_outpoint: Some(their_escrow),
+        pre_armed_refund: Some(refund.clone()),
+        completion_tx: Some(ours.to_vec()),
+        setup_tx: None,
+        possession_record: None,
+    };
+    for phase in [
+        SwapPhase::Funding,
+        SwapPhase::Signing,
+        SwapPhase::Completing,
+        SwapPhase::AbortRefund,
+    ] {
+        rec.phase = phase;
+        store.put(&rec).unwrap();
+    }
+
+    // Swept escrow confirmed-spent by OUR completion (witness == ours); our own
+    // escrow unspent and the refund matured (the state that WOULD BroadcastRefund).
+    let chain = SimChain::new(s_height);
+    chain.fund(our_escrow, s_height);
+    chain.fund(their_escrow, s_height);
+    chain.broadcast(&spend_with_witness(their_escrow, unit - 500, Some(ours))).unwrap();
+    chain.mine();
+    while chain.tip_height() < refund.csv_maturity_height() {
+        chain.mine();
+    }
+
+    // AbortRefund: Completed, never the both-sides BroadcastRefund.
+    let got = store.get(&rec.swap_session_id).unwrap().unwrap();
+    assert_eq!(
+        RecoveryDriver::reenter_one(&store, &got, &chain).unwrap(),
+        RecoveryTick::Refund(AbortAction::Completed),
+        "our completion swept the counterparty escrow — refunding our own would take both sides"
+    );
+
+    // Same guard at Refunded (record later recorded Refunded; a reorg then left
+    // our escrow unspent while our completion still holds the swept escrow).
+    rec.phase = SwapPhase::Refunded;
+    store.put(&rec).unwrap();
+    let got = store.get(&rec.swap_session_id).unwrap().unwrap();
+    assert_eq!(
+        RecoveryDriver::reenter_one(&store, &got, &chain).unwrap(),
+        RecoveryTick::Refund(AbortAction::Completed),
+        "Refunded re-validation must not drive a both-sides refund either"
+    );
+}
+
+/// Task D regression: a Refunded SL record whose OWN pre-armed refund sits in
+/// the mempool on E_sl (a script-path witness whose leading element is a
+/// 64-byte sig) must NOT be mistaken for the counterparty's reveal. Before the
+/// `spend_is_our_refund` guard, `reenter_refunded` ran `restore_and_extract` on
+/// it, which Errs on a migrated/pruned possession file and (via the `?` in
+/// `reenter_all`) poisoned the whole scan. It must fall through to the honest
+/// refund decision (Wait — our own refund is in flight), and the scan stays Ok.
+#[test]
+fn refunded_sl_own_mempool_refund_is_not_a_reveal() {
+    let params = Params::testnet_provisional();
+    let s_height = 800_000u32;
+    let unit = params.escrow_amount_sats();
+
+    let a = keypair();
+    let b = keypair();
+    let internal = swapkey::settlement::state_machine::canonical_internal_key(a.pk, b.pk).unwrap();
+    let escrow = Escrow::new(&internal, &a.pk, params.delta_early).unwrap();
+    let dest = escrow.funding_script_pubkey().clone();
+    let our_escrow = OutPoint::new(txid_from(0xB0), 0);
+    let their_escrow = OutPoint::new(txid_from(0xB1), 0);
+    let refund = PreArmedRefund::arm(
+        &escrow, our_escrow, unit, &a.sk, dest, params.tier_d_sats, params.anchor_sats, s_height,
+    )
+    .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _) = SwapStore::open(dir.path(), &ModeledEnclave).unwrap();
+    // A possession pointer whose file is gone (device migration / pruned).
+    let bogus = dir.path().join("gone.possession");
+    let mut rec = SwapRecord {
+        swap_session_id: [0xB2u8; 32],
+        role: Role::SecretLearner,
+        phase: SwapPhase::Funding,
+        params: params.clone(),
+        s_height,
+        sweep_escrow_height: s_height,
+        our_escrow_outpoint: Some(our_escrow),
+        their_escrow_outpoint: Some(their_escrow),
+        pre_armed_refund: Some(refund.clone()),
+        completion_tx: None,
+        setup_tx: None,
+        possession_record: Some(bogus),
+    };
+    for phase in [
+        SwapPhase::Funding,
+        SwapPhase::Signing,
+        SwapPhase::AbortRefund,
+        SwapPhase::Refunded,
+    ] {
+        rec.phase = phase;
+        store.put(&rec).unwrap();
+    }
+
+    // Our own matured refund is broadcast but back in the mempool (its 1-conf
+    // reorged out / not yet re-mined). The swept escrow is untouched.
+    let chain = SimChain::new(refund.csv_maturity_height());
+    chain.fund(our_escrow, s_height);
+    chain.fund(their_escrow, s_height);
+    chain.broadcast(refund.tx_bytes()).unwrap();
+    assert!(matches!(chain.spend_status(our_escrow), SpendStatus::InMempool));
+
+    // reenter_one: the honest in-flight-refund decision, NOT an Err from a
+    // spurious restore attempt.
+    let got = store.get(&rec.swap_session_id).unwrap().unwrap();
+    match RecoveryDriver::reenter_one(&store, &got, &chain).unwrap() {
+        RecoveryTick::Refund(AbortAction::Wait) => {}
+        other => panic!("our own mempool refund must not trigger extraction, got {other:?}"),
+    }
+
+    // And a whole-store scan stays Ok (the record does not poison the scan).
+    let (ticks, failed) = RecoveryDriver::reenter_all(&store, &chain).unwrap();
+    assert!(failed.is_empty());
+    assert_eq!(ticks.len(), 1);
 }
