@@ -1067,6 +1067,98 @@ fn completed_foreign_spend_reenters_abort() {
     }
 }
 
+/// F6 REGRESSION (Task F review): an SH `Completed` record whose BOTH escrows
+/// read foreign-confirmed-spent must REST. The swept escrow's foreign spend
+/// routes the record toward `AbortRefund`, but the abort decision on our own
+/// (also foreign-spent) escrow walks straight back to the SH `Completed`
+/// supersede terminal — before the fix every scan re-persisted the
+/// `Completed → AbortRefund → Completed` round-trip, churning the store
+/// forever (and a crash inside the hop left a transient non-terminal on
+/// disk). Consecutive re-entries must return the same tick, keep the phase at
+/// `Completed`, and perform NO store write at all — proven by deleting the
+/// record file: a re-persisting scan would recreate it (or Err, since an
+/// `AbortRefund` put with no prior record is an illegal first phase).
+#[test]
+fn completed_sh_with_both_escrows_foreign_spent_rests_stably() {
+    let params = Params::testnet_provisional();
+    let s_height = 800_000u32;
+    let unit = params.escrow_amount_sats();
+
+    let a = keypair();
+    let b = keypair();
+    let internal = swapkey::settlement::state_machine::canonical_internal_key(a.pk, b.pk).unwrap();
+    let escrow = Escrow::new(&internal, &a.pk, params.delta_early).unwrap();
+    let dest = escrow.funding_script_pubkey().clone();
+    let our_escrow = OutPoint::new(txid_from(0x7A), 0);
+    let their_escrow = OutPoint::new(txid_from(0x7B), 0);
+    let refund = PreArmedRefund::arm(
+        &escrow, our_escrow, unit, &a.sk, dest, params.tier_d_sats, params.anchor_sats, s_height,
+    )
+    .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _) = SwapStore::open(dir.path(), &ModeledEnclave).unwrap();
+    let sid = [0x66u8; 32];
+    let mut rec = SwapRecord {
+        swap_session_id: sid,
+        role: Role::SecretHolder,
+        phase: SwapPhase::Funding,
+        params: params.clone(),
+        s_height,
+        sweep_escrow_height: s_height,
+        our_escrow_outpoint: Some(our_escrow),
+        their_escrow_outpoint: Some(their_escrow),
+        pre_armed_refund: Some(refund),
+        completion_tx: Some(vec![0xcdu8; 64]),
+        setup_tx: None,
+        possession_record: None,
+    };
+    // Legal ladder to the Completed terminal (new records start in Funding).
+    for phase in [
+        SwapPhase::Funding,
+        SwapPhase::Signing,
+        SwapPhase::Completing,
+        SwapPhase::Completed,
+    ] {
+        rec.phase = phase;
+        store.put(&rec).unwrap();
+    }
+
+    // BOTH escrows foreign-confirmed-spent: the swept escrow by a witness that
+    // is not our completion sig, our own escrow by a tx that is not our refund.
+    let chain = SimChain::new(s_height);
+    chain.fund(our_escrow, s_height);
+    chain.fund(their_escrow, s_height);
+    chain.broadcast(&spend_with_witness(their_escrow, unit - 500, Some([0xabu8; 64]))).unwrap();
+    chain.broadcast(&spend_with_witness(our_escrow, unit - 500, Some([0xeeu8; 64]))).unwrap();
+    chain.mine();
+
+    // Two consecutive re-entries: the same supersede tick, the phase at rest.
+    for _ in 0..2 {
+        let got = store.get(&sid).unwrap().unwrap();
+        match RecoveryDriver::reenter_one(&store, &got, &chain).unwrap() {
+            RecoveryTick::Refund(AbortAction::Completed) => {}
+            other => panic!("expected the stable supersede tick, got {other:?}"),
+        }
+        assert_eq!(
+            store.get(&sid).unwrap().unwrap().phase,
+            SwapPhase::Completed,
+            "the record must rest at Completed, not oscillate through AbortRefund"
+        );
+    }
+
+    // No-write proof: with the record file gone, the fixed path must not touch
+    // the store at all — same tick, and the file must NOT reappear.
+    let rec_path = dir.path().join(format!("{}.swap", hex32(&sid)));
+    let in_memory = store.get(&sid).unwrap().unwrap();
+    std::fs::remove_file(&rec_path).unwrap();
+    match RecoveryDriver::reenter_one(&store, &in_memory, &chain).unwrap() {
+        RecoveryTick::Refund(AbortAction::Completed) => {}
+        other => panic!("expected the stable supersede tick, got {other:?}"),
+    }
+    assert!(!rec_path.exists(), "re-entry re-persisted a record already at its terminal");
+}
+
 /// Spend-attribution cluster (HIGH, `reenter_refunded`): a Refunded SL record
 /// whose escrow spend is now the COUNTERPARTY'S COMPLETION (a shallow reorg
 /// replaced our 1-conf refund with SH's timelock-free completion) must not

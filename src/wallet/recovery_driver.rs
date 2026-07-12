@@ -221,10 +221,23 @@ impl RecoveryDriver {
                 Some(false) => {
                     // Provably foreign: our completion did NOT sweep. Undo the
                     // false "paid" terminal and drive our own escrow's exit.
+                    // The abort decision is taken BEFORE any persist (it reads
+                    // only the chain + the record's outpoints, never the
+                    // phase): when it walks straight back to `Completed` for an
+                    // SH — our own escrow is ALSO foreign-confirmed-spent, so
+                    // the supersede terminal is the very phase the record
+                    // already rests at — re-persisting the Completed →
+                    // AbortRefund → Completed round-trip every scan would churn
+                    // the store forever (and a crash inside the hop would leave
+                    // a transient non-terminal on disk). Leave the record at
+                    // rest and report the decision.
                     let mut next = rec.clone();
                     next.phase = SwapPhase::AbortRefund;
-                    store.put(&next)?;
                     let action = Self::abort_action(&next, chain)?;
+                    if action == AbortAction::Completed && next.role == Role::SecretHolder {
+                        return Ok(RecoveryTick::Refund(action));
+                    }
+                    store.put(&next)?;
                     Self::persist_abort_terminal(store, &next, action)?;
                     Ok(RecoveryTick::Refund(action))
                 }

@@ -571,6 +571,14 @@ impl SwapApp {
         if child_fee == 0 || child_fee > MAX_BUMP_FEE_SATS {
             return Ok(BackstopRun::Decided(base));
         }
+        // Heal pending CPFP-change reserves BEFORE the gate is read (F5 live
+        // heal): a prior bump parks its child's change `PendingConfirm`, and
+        // the ONLY path back to leasable `Unspent` is this heal. Wired solely
+        // into the startup reconcile, a long-lived process would deplete one
+        // reserve per bump and read an empty pool until a restart — the exact
+        // "pool silently disabled" failure the pending-park exists to prevent.
+        // Cheap per tick: no pending change means no chain reads and no persist.
+        engine.ledger_mut().heal_pending_reserve_changes(chain)?;
         let reserve_available = engine.ledger().has_leasable_reserve(child_fee);
 
         // Pass 2 — re-decide with the correctly-sized gate; only now can the

@@ -1578,6 +1578,112 @@ fn backstop_execute_short_circuits_a_futile_zero_fee_bump() {
     );
 }
 
+/// A SECOND record-less funded swap over an EXISTING engine + chain (same
+/// shape as [`record_less_funded_with_reserve`], minus the wallet/reserve
+/// provisioning): our escrow confirmed, refund matured. For regressions that
+/// need two swaps sharing one wallet's reserve pool in one process lifetime.
+fn second_record_less_funded_app(
+    engine: &SwapEngine,
+    chain: &SimChain,
+    seed: u8,
+) -> (SwapApp, u64, Vec<tempfile::TempDir>) {
+    let params = Params::testnet_provisional();
+    let escrow_amt = params.escrow_amount_sats();
+    let d = params.tier_d_sats;
+    let base = chain.tip_height();
+
+    let (sh, sl) = loop {
+        let a = keypair();
+        let b = keypair();
+        if vp(&a.pk).to_bytes() < vp(&b.pk).to_bytes() {
+            break (b, a);
+        } else if vp(&b.pk).to_bytes() < vp(&a.pk).to_bytes() {
+            break (a, b);
+        }
+    };
+    let internal = canonical_internal_key(sh.pk, sl.pk).unwrap();
+    let e_ours = Escrow::new(&internal, &sl.pk, params.delta_early).unwrap();
+    let e_theirs = Escrow::new(&internal, &sh.pk, params.delta_early).unwrap();
+
+    let our_op = OutPoint::new(txid_from(seed), 0);
+    let their_op = OutPoint::new(txid_from(seed.wrapping_add(1)), 0);
+    chain.fund_with_amount(our_op, base, escrow_amt);
+
+    let dest = e_ours.funding_script_pubkey().clone();
+    let comp = build_completion(&e_ours, our_op, escrow_amt, dest.clone(), d, params.anchor_sats).unwrap();
+    let refund =
+        PreArmedRefund::arm(&e_ours, our_op, escrow_amt, &sl.sk, dest, d, params.anchor_sats, base).unwrap();
+    let maturity = refund.csv_maturity_height();
+    let refund_fee = escrow_amt - d - params.anchor_sats;
+    let receipt = confirm_watchtower_handoff(&refund, refund.fingerprint()).unwrap();
+
+    let lease = tempfile::tempdir().unwrap();
+    let possession = tempfile::tempdir().unwrap();
+    let ctx = make_ctx(
+        sl.sk, sh.pk, our_op, their_op, escrow_amt, comp.sighash, comp.sighash, refund, None,
+        e_ours.merkle_root(), e_theirs.merkle_root(), e_ours.output_key_xonly(),
+        e_theirs.output_key_xonly(), lease.path().to_path_buf(), possession.path().to_path_buf(),
+        receipt, OutPoint::new(txid_from(seed.wrapping_add(2)), 0),
+    );
+    let app = SwapApp::begin(engine, ctx, PeerSession::new([0u8; 32], Box::new(DeadEnd)), base + 500, 0)
+        .unwrap();
+    while chain.tip_height() < maturity {
+        chain.mine();
+    }
+    (app, refund_fee, vec![lease, possession])
+}
+
+/// F5 REGRESSION (Task F review): the CPFP-change reserve pool must replenish
+/// MID-SESSION, not only at startup. One provisioned reserve; bump #1 spends
+/// it and parks the child's change `PendingConfirm`; the package confirms; a
+/// SECOND swap's stalled refund must then find the change leasable and bump —
+/// with NO manual `reconcile_reserves` call and NO restart in between. Before
+/// the fix the live loop read the gate without ever running the heal, so
+/// under sustained congestion the pool depleted one reserve per bump and the
+/// backstop stayed silently disabled until the process restarted — the exact
+/// failure the pending-park (F5) set out to prevent.
+#[test]
+fn backstop_execute_replenishes_the_reserve_pool_mid_session() {
+    let mut f = record_less_funded_with_reserve(750_000, 0xF1);
+    f.chain.set_congestion(f.refund_fee + 5_000);
+
+    // Bump #1 consumes the ONLY provisioned reserve; its change parks pending.
+    let change_op = match f.app.backstop_execute(&mut f.engine, &f.chain, 50, None, None).unwrap() {
+        BackstopRun::Executed {
+            decision: BackstopTick::Bump { target: BumpTarget::Refund },
+            outcome: BumpOutcome::Submitted { reserve_outpoint, change_outpoint, .. },
+        } => {
+            assert_eq!(reserve_outpoint, f.reserve_op);
+            change_outpoint
+        }
+        other => panic!("bump #1 should have executed, got {other:?}"),
+    };
+    assert_eq!(f.engine.ledger().find(&f.reserve_op).unwrap().state, CoinState::Spent);
+    assert_eq!(f.engine.ledger().find(&change_op).unwrap().state, CoinState::PendingConfirm);
+
+    // The package confirms: swap #1 is done and the change is a real UTXO —
+    // but the ledger still says PendingConfirm (no restart, no startup heal).
+    f.chain.mine();
+    assert_eq!(f.engine.ledger().find(&change_op).unwrap().state, CoinState::PendingConfirm);
+
+    // A second swap's refund stalls under the same congestion. Its
+    // backstop_execute must activate the confirmed change into the pool
+    // ITSELF and bump from it.
+    let (app2, refund_fee2, _dirs2) = second_record_less_funded_app(&f.engine, &f.chain, 0xF8);
+    f.chain.set_congestion(refund_fee2 + 5_000);
+    match app2.backstop_execute(&mut f.engine, &f.chain, 50, None, None).unwrap() {
+        BackstopRun::Executed {
+            decision: BackstopTick::Bump { target: BumpTarget::Refund },
+            outcome: BumpOutcome::Submitted { reserve_outpoint, .. },
+        } => assert_eq!(
+            reserve_outpoint, change_op,
+            "bump #2 must lease the healed change from bump #1"
+        ),
+        other => panic!("the pool must replenish mid-session (F5 live heal), got {other:?}"),
+    }
+    assert_eq!(f.engine.ledger().find(&change_op).unwrap().state, CoinState::Spent);
+}
+
 // ============================================================================
 // Feature-2 audit: the funded discriminator's two blind spots (findings G/L)
 // and the pre-record backstop's lying-source suppression (finding H).
