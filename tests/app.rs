@@ -2004,7 +2004,6 @@ fn eternal_mangled_reveal_never_strands_sl() {
         PreArmedRefund::arm(&escrow_e_sl, sl_escrow_op, escrow_amt, &sl.sk, dest, d, params.anchor_sats, s_height)
             .unwrap();
     let maturity = sl_refund.csv_maturity_height();
-    let refund_for_terminal = sl_refund.clone();
     let sl_receipt = confirm_watchtower_handoff(&sl_refund, sl_refund.fingerprint()).unwrap();
 
     // The DEGRADED view SL operates through: the witness it serves for E_sl
@@ -2116,14 +2115,11 @@ fn eternal_mangled_reveal_never_strands_sl() {
     chain.mine(); // the refund confirms
     assert!(matches!(chain.spend_status(sl_escrow_op), SpendStatus::Confirmed(_)));
 
-    // Even with our refund CONFIRMED the lie persists -- and still cannot
-    // mislead the live instance into a false terminal in either direction.
-    assert_eq!(app.poll(&mut engine, &degraded).unwrap(), AppTick::AwaitingReveal);
-
-    // (3) Terminal reconciliation UNDER THE LYING VIEW. reenter_released
-    // observes the mangled witness; it must fall back to the refund decision
-    // (before the restore_and_extract fallback fix, this Err-poisoned the
-    // whole recovery scan) and report the confirmed refund.
+    // (3) Terminal reconciliation UNDER THE LYING VIEW — recovery first, on
+    // the still-`Released` record: reenter_released observes the mangled
+    // witness and must fall back to the (now confirmed) refund decision.
+    // Before the restore_and_extract fallback fix, this Err-POISONED the
+    // whole recovery scan — recover() itself failed, forever.
     let (ticks, failed) = SwapApp::recover(&engine, &degraded).unwrap();
     assert!(failed.is_empty());
     assert_eq!(ticks.len(), 1);
@@ -2136,38 +2132,28 @@ fn eternal_mangled_reveal_never_strands_sl() {
         ticks[0].1
     );
 
-    // The caller routes the swap onto its abort path (SwapEngine::abort's
-    // Released -> AbortRefund move, driven at the store here -- abort itself
-    // is engine-internal).
-    let mut rec = engine.store().get(&sid).unwrap().unwrap();
-    rec.phase = SwapPhase::AbortRefund;
-    engine.store().put(&rec).unwrap();
-
-    // reenter_abort_refund's completion-supersedes EXECUTOR also observes the
-    // mangled witness (SL + possession present) -- it too must fall back to
-    // the plain refund decision instead of erroring the scan.
-    let (ticks, _) = SwapApp::recover(&engine, &degraded).unwrap();
-    assert!(
-        matches!(ticks[0].1, RecoveryTick::Refund(AbortAction::Refunded)),
-        "the AbortRefund executor must skip an extraction-failing witness, got {:?}",
-        ticks[0].1
-    );
-
-    // The refund confirmed -> the record reaches its true terminal.
-    let ctx2 = make_ctx(
-        sl.sk, sh.pk, sl_escrow_op, sh_escrow_op, escrow_amt, msg_sh, msg_sl,
-        refund_for_terminal.clone(), None, root_sh, root_sl, ok_sh, ok_sl,
-        lease_sl.path().to_path_buf(), possession_store.path().to_path_buf(),
-        confirm_watchtower_handoff(&refund_for_terminal, refund_for_terminal.fingerprint()).unwrap(),
-        sl_pre,
-    );
-    engine.record_refunded(&ctx2).unwrap();
+    // (4) THE APP'S OWN TERMINAL (settle-phase refund reconciliation): the
+    // next poll discriminates the confirmed spender — it IS our pre-armed
+    // refund — terminates as Refunding, and advances the record
+    // Released → AbortRefund → Refunded through the engine. No store
+    // surgery, no rebuilt context: the composed loop closes its own swap.
+    match app.poll(&mut engine, &degraded).unwrap() {
+        AppTick::Refunding(reason) => {
+            assert!(reason.contains("refund confirmed"), "got {reason:?}")
+        }
+        other => panic!("a confirmed own-refund must terminate the app, got {other:?}"),
+    }
+    assert!(app.is_terminal());
     assert_eq!(
         engine.store().get(&sid).unwrap().unwrap().phase,
         SwapPhase::Refunded,
         "forward-or-refund closed: the eternally-mangled reveal ended in Refunded"
     );
-    // And SL's funds are genuinely reclaimed on the REAL chain by OUR refund.
-    let comp_sl_unusable = comp_sl; // never finalized -- no valid reveal ever existed
-    drop(comp_sl_unusable);
+    // The terminal is cached — re-polls under the unchanged lie stay put.
+    assert!(matches!(app.poll(&mut engine, &degraded).unwrap(), AppTick::Refunding(_)));
+
+    // (5) A post-terminal recovery scan re-validates the Refunded record
+    // against the chain and reports it at rest — still under the lying view.
+    let (ticks, _) = SwapApp::recover(&engine, &degraded).unwrap();
+    assert!(matches!(ticks[0].1, RecoveryTick::Settled), "got {:?}", ticks[0].1);
 }

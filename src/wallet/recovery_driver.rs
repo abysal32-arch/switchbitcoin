@@ -429,7 +429,7 @@ fn spend_confirmed(chain: &dyn AuthoritativeChainView, outpoint: OutPoint) -> bo
 /// ours-vs-theirs spend discrimination. `None` if the stored bytes cannot be
 /// decoded (conservative: `AbortDriver` then treats an unknown spend as a
 /// winning completion rather than double-spending).
-fn refund_txid(refund: &PreArmedRefund) -> Option<Txid> {
+pub(crate) fn refund_txid(refund: &PreArmedRefund) -> Option<Txid> {
     let tx: bitcoin::Transaction =
         bitcoin::consensus::encode::deserialize(refund.tx_bytes()).ok()?;
     Some(tx.compute_txid())

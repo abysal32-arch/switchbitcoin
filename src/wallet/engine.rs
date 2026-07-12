@@ -719,7 +719,7 @@ impl SwapEngine {
     /// already superseded), leaving the pre-armed refund as the exit.
     /// Best-effort + idempotent — the refund driver / watchtower owns it from
     /// here, so this never fails the caller.
-    fn abort(&self, ctx: &SwapContext) {
+    pub(crate) fn abort(&self, ctx: &SwapContext) {
         let Ok(sid) = Self::swap_session_id(ctx) else { return };
         if let Ok(Some(mut rec)) = self.store.get(&sid) {
             if !matches!(rec.phase, SwapPhase::Completed | SwapPhase::Refunded) {

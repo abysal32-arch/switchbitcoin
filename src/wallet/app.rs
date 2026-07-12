@@ -742,8 +742,40 @@ impl SwapApp {
         // so the retained `Possessing` survives for the next poll.
         if matches!(status, DriveStatus::Completed { .. } | DriveStatus::Refunding(_)) {
             self.phase = AppPhase::Terminal(tick);
+            return Ok(tick);
+        }
+        // AwaitingReveal reconciliation against OUR OWN CONFIRMED REFUND: the
+        // dead-device tower (`backstop_tick`) fires the pre-armed refund at
+        // CSV maturity independent of this loop, and once that refund
+        // CONFIRMS the swap is over — the reveal can never appear on a spent
+        // escrow. Without this, the poll loop re-drives `AwaitingReveal`
+        // forever (a permanently mangled/lying reveal source sustains it —
+        // the eternal-mangled bound) and the record never leaves `Released`
+        // through the app. The discrimination is the same who-spent rule the
+        // `AbortDriver` terminal uses: Confirmed spend AND the spender txid
+        // IS our refund's. A confirmed spend that is NOT ours (SH's
+        // completion) stays AwaitingReveal — settle's own extraction path
+        // owns that (a valid reveal completes; a mangled one re-drives), and
+        // an unreportable spender stays honestly non-terminal.
+        if matches!(status, DriveStatus::AwaitingReveal) && self.our_refund_confirmed(chain) {
+            engine.abort(&self.ctx); // Released → AbortRefund (idempotent, best-effort)
+            engine.record_refunded(&self.ctx)?; // AbortRefund → Refunded
+            let tick = AppTick::Refunding("pre-armed refund confirmed on chain; funds reclaimed");
+            self.phase = AppPhase::Terminal(tick);
+            return Ok(tick);
         }
         Ok(tick)
+    }
+
+    /// True iff OUR escrow's spend is CONFIRMED and the spender IS our own
+    /// pre-armed refund (by txid). Both reads are authoritative on the dual
+    /// view; a view that cannot report the spender txid never matches
+    /// (honestly non-terminal, same rule as `AbortDriver`'s reconciliation).
+    fn our_refund_confirmed(&self, chain: &impl AuthoritativeChainView) -> bool {
+        matches!(chain.spend_status(self.ctx.our_escrow_op), SpendStatus::Confirmed(_))
+            && crate::wallet::recovery_driver::refund_txid(&self.ctx.pre_armed_refund)
+                .zip(chain.spend_txid(self.ctx.our_escrow_op))
+                .is_some_and(|(mine, seen)| mine == seen)
     }
 
     /// Classify a pre-funding abort into a terminal: with our escrow funded (or
