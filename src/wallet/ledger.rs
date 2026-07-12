@@ -334,7 +334,7 @@ pub struct SplitPlan {
 /// ([`Ledger::reconcile_leases_with_chain`]): the outpoints marked `Spent`
 /// because the chain confirms them gone (the phantom heal), and the orphaned
 /// leases released back to `Unspent`.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct LeaseReconcile {
     /// Leased-or-unspent coins the chain confirms spent → now `Spent`.
     pub swept: Vec<OutPoint>,

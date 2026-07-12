@@ -18,9 +18,9 @@ use swapkey::settlement::state_machine::{
 use swapkey::tx::escrow::Escrow;
 use swapkey::tx::txbuild::{build_completion, finalize_key_spend, sign_schnorr_single};
 use swapkey::wallet::driver::{DriveStatus, SwapDriver};
-use swapkey::wallet::engine::{SwapContext, SwapEngine, SwapOutcome};
+use swapkey::wallet::engine::{ChainReconcile, SwapContext, SwapEngine, SwapOutcome};
 use swapkey::wallet::keys::ModeledKeySource;
-use swapkey::wallet::ledger::{acknowledge_phase0, Ledger, WalletClock, PHASE0_WARNING};
+use swapkey::wallet::ledger::{acknowledge_phase0, CoinState, Ledger, WalletClock, PHASE0_WARNING};
 use swapkey::wallet::manifest::ModeledTrustRoot;
 use swapkey::wallet::store::{ModeledEnclave, SwapPhase};
 use swapkey::{Error, Result};
@@ -1043,4 +1043,102 @@ fn wrong_csv_swept_escrow_refuses_to_release_and_refunds() {
         engine.store().get(&sid).unwrap().unwrap().phase,
         SwapPhase::AbortRefund
     );
+}
+
+/// TASK 2 (the composed startup seam): a fresh chain-blind `open` followed by
+/// ONE `reconcile_with_chain` call heals BOTH phantom kinds --
+///
+///   1. the FUNDING-COIN phantom: a pre-encumbrance coin leased to a swap
+///      that never wrote a record, whose Setup confirmed on chain; the
+///      chain-blind open releases the orphaned lease back to `Unspent`,
+///      re-exposing a coin the chain already spent (a later lease would
+///      re-select it and fail every submit forever);
+///   2. the RESERVE phantom: a CPFP bump child consumed the reserve on chain
+///      but the crash lost the ledger persist, so the coin still counts
+///      spendable.
+///
+/// The canonical sequence is open -> reconcile_with_chain -> recover; this
+/// pins step 2's composed heal (per-class reports, both coins permanently
+/// `Spent`) and its idempotence.
+#[test]
+fn fresh_open_plus_reconcile_with_chain_heals_both_phantom_kinds() {
+    let params = Params::testnet_provisional();
+    let pre_enc = params.pre_encumbrance_sats();
+    let dir = tempfile::tempdir().unwrap();
+
+    // Onboard: one deposit split into a pre-encumbrance coin + change, the
+    // change promoted into the Reserve pool (the 2a provisioning path).
+    let (pre_phantom, reserve_phantom, reserve_amt) = {
+        let ack = acknowledge_phase0(PHASE0_WARNING).unwrap();
+        let mut ledger = Ledger::create(dir.path(), &ModeledEnclave, ack).unwrap();
+        let keys = ModeledKeySource::new(&ModeledEnclave);
+        let (idx, spk) = ledger.next_deposit_address(&keys).unwrap();
+        let dep = OutPoint::new(txid_from(0xD1), 0);
+        ledger
+            .register_deposit(
+                dep,
+                pre_enc + 80_000 + 2_000,
+                100,
+                idx,
+                &spk,
+                &keys,
+                Some(acknowledge_phase0(PHASE0_WARNING).unwrap()),
+            )
+            .unwrap();
+        let plan = ledger.split_deposit(dep, &params, 2_000, &keys).unwrap();
+        ledger.confirm_split(plan.txid, 150, &FixedClock(1_000)).unwrap();
+        let change_op = OutPoint::new(plan.txid, plan.change_vout.expect("change output"));
+        ledger.promote_change_to_reserve(change_op).unwrap();
+        let reserve_amt = ledger.find(&change_op).unwrap().amount_sats;
+
+        // Phantom 1: leased to a swap that never wrote a SwapRecord.
+        let coin = ledger
+            .lease_pre_encumbrance(pre_enc, &FixedClock(u64::MAX), u32::MAX, [0xCCu8; 32])
+            .unwrap()
+            .expect("a mature pre-encumbrance coin");
+        (coin.outpoint, change_op, reserve_amt)
+    }; // ledger dropped -- the single-instance lock releases for the reopen
+
+    // Both phantoms are CONFIRMED SPENT on chain (the Setup / the bump child
+    // landed) while the ledger still counts them spendable.
+    let chain = SimChain::new(200);
+    chain.fund_with_amount(pre_phantom, 200, pre_enc);
+    chain.broadcast(&spend_std(pre_phantom, pre_enc - 500)).unwrap();
+    chain.fund_with_amount(reserve_phantom, 200, reserve_amt);
+    chain.broadcast(&spend_std(reserve_phantom, reserve_amt - 500)).unwrap();
+    chain.mine();
+    assert!(matches!(chain.spend_status(pre_phantom), SpendStatus::Confirmed(_)));
+    assert!(matches!(chain.spend_status(reserve_phantom), SpendStatus::Confirmed(_)));
+
+    // STEP 1 -- fresh chain-blind open: the orphaned lease is released, which
+    // RE-EXPOSES the spent pre-encumbrance coin as `Unspent` (the phantom this
+    // seam exists to heal); the spent reserve also still reads `Unspent`.
+    let (mut engine, actions) = SwapEngine::open(
+        dir.path(),
+        &ModeledEnclave,
+        Box::new(ModeledKeySource::new(&ModeledEnclave)),
+        &ModeledTrustRoot,
+    )
+    .unwrap();
+    assert!(actions.is_empty(), "no store records -> no recovery actions");
+    assert_eq!(
+        engine.ledger().find(&pre_phantom).unwrap().state,
+        CoinState::Unspent,
+        "the chain-blind open re-exposed the on-chain-spent coin -- the phantom"
+    );
+    assert_eq!(engine.ledger().find(&reserve_phantom).unwrap().state, CoinState::Unspent);
+
+    // STEP 2 -- the composed chain-aware reconcile heals BOTH in one call,
+    // with per-class reports (reserves swept by the Reserve pass, the
+    // pre-encumbrance coin by the lease pass).
+    let report = engine.reconcile_with_chain(&chain).unwrap();
+    assert_eq!(report.reserves_swept, vec![reserve_phantom]);
+    assert_eq!(report.leases.swept, vec![pre_phantom]);
+    assert!(report.leases.released.is_empty());
+    assert_eq!(engine.ledger().find(&pre_phantom).unwrap().state, CoinState::Spent);
+    assert_eq!(engine.ledger().find(&reserve_phantom).unwrap().state, CoinState::Spent);
+
+    // Idempotent: a second run over the healed ledger reports nothing.
+    let again = engine.reconcile_with_chain(&chain).unwrap();
+    assert_eq!(again, ChainReconcile::default());
 }

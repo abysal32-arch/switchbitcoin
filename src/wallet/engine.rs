@@ -113,6 +113,20 @@ pub enum DriveStatus {
     Refunding(&'static str),
 }
 
+/// The combined report of the composed post-open chain reconciliation
+/// ([`SwapEngine::reconcile_with_chain`]): what each of the two phantom heals
+/// swept/released. Empty vectors on a clean startup (no crash straddled a
+/// submit→persist window).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ChainReconcile {
+    /// Reserve coins the chain confirms spent but the ledger still counted
+    /// spendable — now `Spent` (the CPFP-bump submit→persist phantom).
+    pub reserves_swept: Vec<OutPoint>,
+    /// The lease pass: confirmed-spent leasable coins swept to `Spent` (the
+    /// funding-coin phantom) + orphaned leases released to `Unspent`.
+    pub leases: crate::wallet::ledger::LeaseReconcile,
+}
+
 /// The result of entering settlement ([`SwapEngine::enter_settlement`], Phase A):
 /// the live `Possessing` to RETAIN across settlement steps, or the pre-armed
 /// refund exit if the interlocked adaptor exchange routed there.
@@ -140,6 +154,12 @@ impl SwapEngine {
     /// prior crash, and surface the SwapStore recovery actions (INV-2 aborts,
     /// post-release restorations). The ledger MUST already exist (onboarding
     /// created it); this is the operating path, not first-run.
+    ///
+    /// This is STEP 1 of the canonical startup sequence — deliberately
+    /// chain-blind (a wallet must open even with the backend down). Follow it
+    /// with [`reconcile_with_chain`](Self::reconcile_with_chain) (step 2, the
+    /// chain-aware phantom heals) and then `SwapApp::recover` (step 3) — see
+    /// `reconcile_with_chain`'s docs for the full sequence rationale.
     pub fn open(
         dir: &std::path::Path,
         enclave: &dyn EnclaveKeyProvider,
@@ -218,6 +238,41 @@ impl SwapEngine {
     ) -> Result<crate::wallet::ledger::LeaseReconcile> {
         let live = live_lessees(&self.store)?;
         self.ledger.reconcile_leases_with_chain(&live, chain)
+    }
+
+    /// The COMPOSED post-open chain reconciliation — THE startup seam. The
+    /// canonical wallet startup sequence is:
+    ///
+    /// ```text
+    ///   1. SwapEngine::open(..)               — chain-BLIND: store recovery
+    ///      actions surface, orphaned leases release (live-record check only).
+    ///   2. engine.reconcile_with_chain(chain) — THIS: both chain-aware phantom
+    ///      heals, before any lease/bump decision reads the ledger.
+    ///   3. SwapApp::recover(&engine, chain)   — re-enter every non-terminal
+    ///      swap from its record (refund broadcasts, Setup re-submits, claims).
+    /// ```
+    ///
+    /// `open` cannot do step 2 itself (it deliberately takes no chain — a
+    /// wallet must open even when the backend is down), and both heals are
+    /// no-ops unless a crash straddled a submit→persist window, so a caller
+    /// that skips step 2 loses only the phantom heals, never funds. But the
+    /// phantoms are real: a `Leased`-or-`Unspent` coin the chain already
+    /// confirms SPENT (a pre-funding abort's confirmed Setup whose
+    /// `run_exchange` mark-spent never ran, or a CPFP bump child's consumed
+    /// reserve whose ledger persist was lost) would be re-selected by the
+    /// deterministic lease pickers and then fail every `submit_package`
+    /// forever. Runs [`reconcile_reserves`](Self::reconcile_reserves) first
+    /// (the Reserve-class sweep, keeping the per-class reports meaningful),
+    /// then [`reconcile_leases_with_chain`](Self::reconcile_leases_with_chain)
+    /// (whose sweep also covers the Reserve class — the overlap is deliberate
+    /// defense in depth; both passes are idempotent). Returns both reports.
+    pub fn reconcile_with_chain(
+        &mut self,
+        chain: &dyn crate::chain::AuthoritativeChainView,
+    ) -> Result<ChainReconcile> {
+        let reserves_swept = self.reconcile_reserves(chain)?;
+        let leases = self.reconcile_leases_with_chain(chain)?;
+        Ok(ChainReconcile { reserves_swept, leases })
     }
 
     /// Execute a decided CPFP bump against this wallet's ledger + enclave seam
