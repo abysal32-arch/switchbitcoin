@@ -174,7 +174,7 @@ impl RecoveryDriver {
             SwapPhase::Completed => Self::reenter_completed(store, rec, chain),
             SwapPhase::Refunded => Self::reenter_refunded(store, rec, chain),
             SwapPhase::Signing => Ok(RecoveryTick::RewritePending),
-            SwapPhase::Funding => Self::reenter_funding(rec, chain),
+            SwapPhase::Funding => Self::reenter_funding(store, rec, chain),
             SwapPhase::Released => Self::reenter_released(store, rec, chain),
             SwapPhase::Completing => Self::reenter_completing(store, rec, chain),
             SwapPhase::AbortRefund => Self::reenter_abort_refund(store, rec, chain),
@@ -224,7 +224,9 @@ impl RecoveryDriver {
                     let mut next = rec.clone();
                     next.phase = SwapPhase::AbortRefund;
                     store.put(&next)?;
-                    Ok(RecoveryTick::Refund(Self::abort_action(&next, chain)?))
+                    let action = Self::abort_action(&next, chain)?;
+                    Self::persist_abort_terminal(store, &next, action)?;
+                    Ok(RecoveryTick::Refund(action))
                 }
                 None => Ok(RecoveryTick::Refund(AbortAction::Wait)),
             };
@@ -340,7 +342,13 @@ impl RecoveryDriver {
         if let Some(tick) = Self::rebroadcast_setup_if_unconfirmed(rec, chain) {
             return Ok(tick);
         }
-        Ok(RecoveryTick::Refund(Self::abort_action(rec, chain)?))
+        let action = Self::abort_action(rec, chain)?;
+        // F6: persist the refund-side terminal (AbortRefund → Refunded, or → the
+        // SH Completed supersede) so the record settles instead of lingering
+        // non-terminal forever. Non-terminal actions (Wait/BroadcastRefund/
+        // TakeTheSwap) leave the record where it is.
+        Self::persist_abort_terminal(store, rec, action)?;
+        Ok(RecoveryTick::Refund(action))
     }
 
     /// The never-confirming-Setup recovery arm: if our escrow is NOT yet
@@ -419,7 +427,11 @@ impl RecoveryDriver {
     /// `Funding`: if our escrow is confirmed on chain the standing pre-armed
     /// refund is the exit (a stuck funding still unwinds safely); otherwise
     /// nothing is locked and resuming needs a fresh driver + transport.
-    fn reenter_funding(rec: &SwapRecord, chain: &dyn AuthoritativeChainView) -> Result<RecoveryTick> {
+    fn reenter_funding(
+        store: &SwapStore,
+        rec: &SwapRecord,
+        chain: &dyn AuthoritativeChainView,
+    ) -> Result<RecoveryTick> {
         // AUTHORITATIVE read (matching the rebroadcast arm below, `terminate_abort`,
         // and this module's stated intent): a lying source that HIDES a real
         // confirmation must not be able to suppress our standing pre-armed refund.
@@ -440,6 +452,11 @@ impl RecoveryDriver {
             if let Some(tick) = Self::rebroadcast_setup_if_unconfirmed(rec, chain) {
                 return Ok(tick);
             }
+        }
+        // F6: a funded Funding record whose refund already CONFIRMED settles
+        // (Funding → AbortRefund → Refunded) instead of being rescanned forever.
+        if let Some(action) = refund {
+            Self::persist_abort_terminal(store, rec, action)?;
         }
         Ok(RecoveryTick::Funding { refund })
     }
@@ -498,6 +515,10 @@ impl RecoveryDriver {
             refund,
             refund_txid(refund),
         );
+        // F6: a Released SL whose dead-device refund already CONFIRMED settles
+        // (Released → AbortRefund → Refunded) instead of re-restoring the
+        // possession record and re-deciding on every future scan.
+        Self::persist_abort_terminal(store, rec, action)?;
         Ok(RecoveryTick::Extract { final_sig: None, fallback: action })
     }
 
@@ -534,7 +555,9 @@ impl RecoveryDriver {
                     let mut next = rec.clone();
                     next.phase = SwapPhase::AbortRefund;
                     store.put(&next)?;
-                    Ok(RecoveryTick::Refund(Self::abort_action(&next, chain)?))
+                    let action = Self::abort_action(&next, chain)?;
+                    Self::persist_abort_terminal(store, &next, action)?;
+                    Ok(RecoveryTick::Refund(action))
                 }
                 None => Ok(RecoveryTick::Rebroadcast { final_sig, confirmed: false }),
             };
@@ -564,6 +587,49 @@ impl RecoveryDriver {
             (Some(_), None) => false,
             (None, _) => true,
         }
+    }
+
+    /// Persist a recovery-discovered refund-side TERMINAL, walking the legal
+    /// phase graph from the record's current phase (finding: recovery drove the
+    /// forward terminals — Completing→Completed — but never the refund-side ones,
+    /// so an `AbortRefund`/`Funding`/`Released` record whose refund confirmed
+    /// stayed non-terminal FOREVER: rescanned every startup, kept in
+    /// `live_lessees`, its `restore_secret_learner` re-run every scan, the
+    /// user-facing state never "settled"). This mirrors the driver's existing
+    /// `Completing→Completed` finalize (module rule 3).
+    ///
+    /// Persists only a PROVEN terminal: `AbortAction::Refunded` (AbortDriver
+    /// already required a `spend_txid` match against OUR refund) → `Refunded`,
+    /// for any role; `AbortAction::Completed` → `Completed` only for an SH
+    /// record (where it means OUR completion won). An SL `Completed` is the
+    /// lost-race supersede — there is no "lost" terminal, and recording it
+    /// `Completed` would be false-success accounting, so it stays non-terminal
+    /// (the loss surfaces each scan). Best-effort like `SwapEngine::abort`: the
+    /// terminal is chain-proven, so a store hiccup just leaves the record to be
+    /// re-terminalized next scan — never a false terminal.
+    fn persist_abort_terminal(
+        store: &SwapStore,
+        rec: &SwapRecord,
+        action: AbortAction,
+    ) -> Result<()> {
+        let terminal = match (action, rec.role) {
+            (AbortAction::Refunded, _) => SwapPhase::Refunded,
+            (AbortAction::Completed, Role::SecretHolder) => SwapPhase::Completed,
+            _ => return Ok(()),
+        };
+        if matches!(rec.phase, SwapPhase::Completed | SwapPhase::Refunded) {
+            return Ok(());
+        }
+        let mut cur = rec.clone();
+        // Pre-AbortRefund records hop through AbortRefund first (both are legal
+        // single edges: Funding|Released → AbortRefund, then → the terminal).
+        if !matches!(cur.phase, SwapPhase::AbortRefund) {
+            cur.phase = SwapPhase::AbortRefund;
+            store.put(&cur)?;
+        }
+        cur.phase = terminal;
+        store.put(&cur)?;
+        Ok(())
     }
 
     /// The completion-supersedes decision on our escrow, shared by the

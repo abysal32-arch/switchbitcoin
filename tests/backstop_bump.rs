@@ -160,16 +160,24 @@ fn refund_bump_submits_package_and_spends_the_reserve() {
         SpendStatus::InMempool | SpendStatus::Confirmed(_)
     ));
 
-    // Finding-1 fix: the child change is TRACKED as a new Reserve coin, so the
-    // reserve value never leaks out of the ledger and the pool survives the
-    // bump. change = anchor + reserve − child_fee; only the (small) fee leaves.
+    // The child change is TRACKED as a new Reserve coin (the reserve value never
+    // leaks out of the ledger). change = anchor + reserve − child_fee.
     assert_eq!(change_outpoint, OutPoint::new(child_txid, 0));
     let change = ledger.find(&change_outpoint).expect("child change tracked as a coin");
-    assert_eq!(change.state, CoinState::Unspent);
+    // F5: PENDING until the child confirms — NOT leasable yet (an unconfirmed
+    // change that could still evict must never poison the pool).
+    assert_eq!(change.state, CoinState::PendingConfirm);
     assert_eq!(change.amount_sats, change_amount);
     let child_fee = (anchor_sats + reserve_amount) - change_amount;
     assert!(child_fee > 0 && child_fee < 10_000, "only the child fee leaves the pool");
-    assert!(ledger.has_leasable_reserve(1), "the pool is replenished by the change");
+    assert!(!ledger.has_leasable_reserve(1), "a pending change is not leasable yet");
+
+    // Once the child CONFIRMS, the startup heal activates the change into the
+    // leasable pool — replenishing it only after the change is real on chain.
+    chain.mine();
+    ledger.heal_pending_reserve_changes(&chain).unwrap();
+    assert_eq!(ledger.find(&change_outpoint).unwrap().state, CoinState::Unspent);
+    assert!(ledger.has_leasable_reserve(1), "the confirmed change replenishes the pool");
 }
 
 /// A COMPLETION bump links the reserve to the swap, so it needs the typed
@@ -372,4 +380,110 @@ fn run_cpfp_bump_self_heals_a_phantom_reserve_on_submit_failure() {
     // re-leased to fail again — the pool is not disabled.
     assert_eq!(ledger.find(&reserve_op).unwrap().state, CoinState::Spent);
     assert!(!ledger.has_leasable_reserve(1));
+}
+
+/// F4 (belt-and-braces): run_cpfp_bump must NOT bump a parent that is already
+/// CONFIRMED — it returns NoBump WITHOUT leasing or spending the reserve. A
+/// confirmed parent needs no CPFP; bumping it would burn a reserve key on a
+/// mined tx (the classifier guards its own side, but this is the last line
+/// before a reserve is issued, covering any stale caller observation).
+#[test]
+fn bump_refuses_a_confirmed_parent() {
+    let (mut ledger, keys, reserve_op, reserve_amount, _dir) = provision_reserve();
+    let chain = SimChain::new(500_000);
+    let anchor_sats = 240u64;
+    let parent_input = OutPoint::new(txid(0x0C), 0);
+    seed_chain(&chain, parent_input, reserve_op, reserve_amount);
+    let (parent_bytes, parent_txid, parent_vsize) =
+        parent_with_anchor(parent_input, 500_000, anchor_sats);
+
+    // Confirm the parent on chain (spend_txid(parent_input) == parent_txid).
+    chain.broadcast(&parent_bytes).unwrap();
+    chain.mine();
+    assert!(matches!(chain.spend_status(parent_input), SpendStatus::Confirmed(_)));
+
+    let out = run_cpfp_bump(
+        &mut ledger,
+        &keys,
+        &chain,
+        CpfpBumpRequest {
+            target: BumpTarget::Refund,
+            linkage_ack: None,
+            lessee: [0xEE; 32],
+            parent_bytes: &parent_bytes,
+            parent_anchor: OutPoint::new(parent_txid, ANCHOR_VOUT),
+            anchor_value_sats: anchor_sats,
+            parent_fee_sats: 200,
+            parent_vsize_vb: parent_vsize,
+            target_feerate_sat_vb: 10,
+            change_key_index: 0,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(out, BumpOutcome::NoBump, "a confirmed parent is not bumped");
+    // The reserve was never leased/spent — the pool is intact.
+    assert_eq!(ledger.find(&reserve_op).unwrap().state, CoinState::Unspent);
+    assert!(ledger.has_leasable_reserve(1));
+}
+
+/// F5: an EVICTED CPFP child must not permanently poison the reserve pool. On a
+/// successful bump the change is parked `PendingConfirm` (source reserve as
+/// `parent`); if the package is then evicted (congestion worsens), the source
+/// reserve reads chain-Unspent again while the change never materialized. The
+/// startup heal drops the phantom change AND restores the source reserve, so
+/// the pool is leasable again — never silently disabled in the exact congestion
+/// the backstop exists for.
+#[test]
+fn evicted_cpfp_child_does_not_poison_the_reserve_pool() {
+    let (mut ledger, keys, reserve_op, reserve_amount, _dir) = provision_reserve();
+    let chain = SimChain::new(500_000);
+    let anchor_sats = 240u64;
+    let parent_input = OutPoint::new(txid(0x0D), 0);
+    seed_chain(&chain, parent_input, reserve_op, reserve_amount);
+    let (parent_bytes, parent_txid, parent_vsize) =
+        parent_with_anchor(parent_input, 500_000, anchor_sats);
+
+    let out = run_cpfp_bump(
+        &mut ledger,
+        &keys,
+        &chain,
+        CpfpBumpRequest {
+            target: BumpTarget::Refund,
+            linkage_ack: None,
+            lessee: [0xEE; 32],
+            parent_bytes: &parent_bytes,
+            parent_anchor: OutPoint::new(parent_txid, ANCHOR_VOUT),
+            anchor_value_sats: anchor_sats,
+            parent_fee_sats: 200,
+            parent_vsize_vb: parent_vsize,
+            target_feerate_sat_vb: 10,
+            change_key_index: 0,
+        },
+    )
+    .unwrap();
+    let change_op = match out {
+        BumpOutcome::Submitted { change_outpoint, .. } => change_outpoint,
+        BumpOutcome::NoBump => panic!("the bump should have submitted"),
+    };
+    assert_eq!(ledger.find(&reserve_op).unwrap().state, CoinState::Spent);
+    assert_eq!(ledger.find(&change_op).unwrap().state, CoinState::PendingConfirm);
+
+    // Congestion worsens: the package is EVICTED (child + change gone; the
+    // source reserve is chain-Unspent again but still ledger-Spent — the poison).
+    chain.evict(reserve_op);
+    assert!(matches!(chain.spend_status(reserve_op), SpendStatus::Unspent));
+
+    // The startup heal drops the phantom change and RESTORES the source reserve.
+    ledger.heal_pending_reserve_changes(&chain).unwrap();
+    assert!(ledger.find(&change_op).is_none(), "the phantom change is dropped");
+    assert_eq!(
+        ledger.find(&reserve_op).unwrap().state,
+        CoinState::Unspent,
+        "the source reserve is restored, not stranded Spent"
+    );
+    assert!(
+        ledger.has_leasable_reserve(1),
+        "the pool is not disabled — the reserve is leasable again"
+    );
 }

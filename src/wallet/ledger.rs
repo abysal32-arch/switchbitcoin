@@ -1227,18 +1227,95 @@ impl Ledger {
                 outpoint: change_outpoint,
                 amount_sats: change_amount_sats,
                 class: CoinClass::Reserve,
-                state: CoinState::Unspent,
+                // PENDING, not Unspent (finding: an evicted CPFP child left the
+                // change tracked Unspent-but-nonexistent, poisoning lease
+                // selection, while the source reserve stayed Spent — the pool
+                // silently disabled). `lease_reserve`/`has_leasable_reserve`
+                // only consider `Unspent`, so a `PendingConfirm` change can
+                // never be selected; the startup heal
+                // (`heal_pending_reserve_changes`) activates it to `Unspent`
+                // once the child confirms, or drops it and restores the source
+                // reserve if the child evicted.
+                state: CoinState::PendingConfirm,
                 key_purpose: KeyPurpose::Reserve,
                 key_index: change_key_index,
                 created_height: height,
                 delay_or_eligible_unix: 0,
                 eligible_height: 0,
                 deposit_linked,
-                parent: None,
+                // The SOURCE reserve, so the heal can restore it if the child
+                // evicts (this coin's provenance is the reserve it replaced).
+                parent: Some(reserve_outpoint),
                 lessee: None,
                 split_tx: None,
                 split_attempts: Vec::new(),
             });
+            Ok(())
+        })
+    }
+
+    /// Chain-aware resolution of PENDING CPFP-change reserves — the startup heal
+    /// for the evicted-child pool-poison (finding). Every `spend_reserve_into_
+    /// change` parks the child's change `PendingConfirm` with `parent` = the
+    /// source reserve; this pass resolves each against the authoritative chain:
+    ///   - child CONFIRMED (the change outpoint is a funded UTXO) → activate the
+    ///     change `PendingConfirm → Unspent` (it (re)joins the leasable pool);
+    ///   - child EVICTED (the source reserve reads chain-`Unspent` again and the
+    ///     change never materialized) → drop the phantom change record AND
+    ///     restore the source reserve `Spent → Unspent` (heals BOTH sides, so
+    ///     the pool is never silently disabled by a dropped package);
+    ///   - still in flight (child in the mempool → the source reads `InMempool`)
+    ///     → leave `PendingConfirm` for a later scan.
+    ///
+    /// Reads are taken first (immutable), then applied in ONE persist. A no-op
+    /// (nothing pending) does not persist.
+    pub fn heal_pending_reserve_changes(
+        &mut self,
+        chain: &dyn crate::chain::AuthoritativeChainView,
+    ) -> Result<()> {
+        enum Heal {
+            Activate(OutPoint),
+            Evict { change: OutPoint, source: OutPoint },
+        }
+        let mut heals = Vec::new();
+        for c in &self.coins {
+            if c.class != CoinClass::Reserve || c.state != CoinState::PendingConfirm {
+                continue;
+            }
+            let Some(source) = c.parent else { continue };
+            if chain.authoritative_funding_height(c.outpoint).is_some() {
+                heals.push(Heal::Activate(c.outpoint));
+            } else if matches!(
+                chain.spend_status(source),
+                crate::chain::SpendStatus::Unspent
+            ) {
+                heals.push(Heal::Evict { change: c.outpoint, source });
+            }
+        }
+        if heals.is_empty() {
+            return Ok(());
+        }
+        self.transact(|l| {
+            for h in &heals {
+                match h {
+                    Heal::Activate(op) => {
+                        if let Some(c) = l.find_mut(op) {
+                            c.state = CoinState::Unspent;
+                        }
+                    }
+                    Heal::Evict { change, source } => {
+                        l.coins.retain(|c| &c.outpoint != change);
+                        if let Some(c) = l.find_mut(source) {
+                            // Restore only a reserve WE marked Spent for this bump
+                            // (never resurrect a coin spent by anything else).
+                            if c.state == CoinState::Spent {
+                                c.state = CoinState::Unspent;
+                                c.lessee = None;
+                            }
+                        }
+                    }
+                }
+            }
             Ok(())
         })
     }

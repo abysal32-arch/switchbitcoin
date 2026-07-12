@@ -40,14 +40,50 @@ use crate::chain::{AuthoritativeChainView, SpendStatus};
 use crate::settlement::refund::{PreArmedRefund, Watchtower, WatchtowerReceipt};
 use crate::wallet::ledger::{BumpTarget, LinkageAck};
 use crate::Result;
-use bitcoin::OutPoint;
+use bitcoin::{OutPoint, Txid};
 
 /// The own-device watchtower driver: the refund tower plus the escrow it
 /// guards, polled by the background loop.
 pub struct WatchtowerDriver {
     tower: Watchtower,
     escrow_outpoint: OutPoint,
+    /// Arm-time PREDICTED maturity (`predicted_S + csv_blocks`). Fallback only:
+    /// the fire gate prefers the CHAIN-DERIVED maturity (see `effective_maturity`).
     csv_maturity_height: u32,
+    /// The refund's relative CSV in blocks, decoded from the signed refund's
+    /// input nSequence at arm time — lets the fire gate recompute maturity from
+    /// the escrow's REAL funding height instead of the arm-time prediction
+    /// (finding: an arm-time-optimistic maturity fires an immature refund and,
+    /// mapping the rejection to a fee-floor stall, hammers it every tick).
+    /// `None` if it could not be decoded (falls back to the prediction).
+    csv_blocks: Option<u32>,
+    /// The refund's own txid, decoded at arm time — lets the in-mempool arm
+    /// tell OUR relayed-but-unconfirmed refund (an actionable silent-backstop
+    /// stall) from a counterparty completion in the mempool (never ours to
+    /// bump). `None` if it could not be decoded (stays conservatively Idle).
+    refund_txid: Option<Txid>,
+}
+
+/// Decode the two arm-time metadata the fire gate needs from the signed refund
+/// bytes: the relative CSV in blocks (input nSequence) and the refund's txid.
+/// Best-effort — either is `None` on an undecodable tx (the gate then falls
+/// back to the arm-time maturity / stays Idle, never a false fire or stall).
+fn decode_refund_meta(tx_bytes: &[u8]) -> (Option<u32>, Option<Txid>) {
+    let Ok(tx) = bitcoin::consensus::encode::deserialize::<bitcoin::Transaction>(tx_bytes) else {
+        return (None, None);
+    };
+    let txid = Some(tx.compute_txid());
+    let csv = tx.input.first().and_then(|i| {
+        let s = i.sequence.to_consensus_u32();
+        // A block-based relative lock: enabled (bit 31 clear) and NOT time-based
+        // (bit 22 clear). The block count is the low 16 bits.
+        if s & (1 << 31) == 0 && s & (1 << 22) == 0 {
+            Some(s & 0x0000_FFFF)
+        } else {
+            None
+        }
+    });
+    (csv, txid)
 }
 
 /// The outcome of one watchtower poll.
@@ -83,42 +119,106 @@ impl WatchtowerDriver {
         receipt: &WatchtowerReceipt,
     ) -> Result<Self> {
         let csv_maturity_height = refund.csv_maturity_height();
+        let (csv_blocks, refund_txid) = decode_refund_meta(refund.tx_bytes());
         let tower = Watchtower::arm(refund, escrow_outpoint, receipt)?;
-        Ok(WatchtowerDriver { tower, escrow_outpoint, csv_maturity_height })
+        Ok(WatchtowerDriver {
+            tower,
+            escrow_outpoint,
+            csv_maturity_height,
+            csv_blocks,
+            refund_txid,
+        })
     }
 
     /// One poll of the background loop. Idempotent and crash-safe: it
     /// re-reads chain state every call, so a restart just re-evaluates.
+    ///
+    /// `refund_congested` is the caller's observation that the current relay
+    /// floor is above what an ALREADY-RELAYED refund pays — the only signal
+    /// that distinguishes a healthy in-mempool refund (about to confirm) from
+    /// one stuck below the confirmation feerate (which the silent backstop must
+    /// CPFP). It matters ONLY in the in-mempool arm; the unspent-arm fire and
+    /// its own broadcast-time relay stall are detected internally.
     ///
     /// Requires an [`AuthoritativeChainView`]: this is the standalone
     /// second-device watchtower's fund-deciding surface (it decides the
     /// terminal `StandDown` and fires the pre-armed refund from `spend_status`),
     /// and a lying explorer fabricating a `Confirmed` spend must never be able
     /// to stand the tower down on a still-unspent escrow.
-    pub fn tick(&self, chain: &impl AuthoritativeChainView) -> Result<WatchtowerTick> {
+    pub fn tick(
+        &self,
+        chain: &impl AuthoritativeChainView,
+        refund_congested: bool,
+    ) -> Result<WatchtowerTick> {
         match chain.spend_status(self.escrow_outpoint) {
             // A completion won or our own refund already confirmed: terminal.
             SpendStatus::Confirmed(_) => Ok(WatchtowerTick::StandDown),
-            // A completion pending in the mempool is TRANSIENT (it may evict);
-            // keep watching rather than standing down forever.
-            SpendStatus::InMempool => Ok(WatchtowerTick::Idle),
-            SpendStatus::Unspent => {
-                // Not matured yet → nothing to fire (Ok(false) from poll).
-                if chain.tip_height() < self.csv_maturity_height {
-                    return Ok(WatchtowerTick::Idle);
+            // A spend pending in the mempool. WHO it is matters (finding: an
+            // in-mempool refund below the confirmation feerate was never
+            // bumped — `InMempool` was unconditionally `Idle`). Our OWN refund
+            // relayed but possibly stuck under a fee spike is an ACTIONABLE
+            // stall the silent backstop can CPFP (`submit_package` dedups an
+            // already-known parent). A counterparty completion in the mempool
+            // is transient and NOT ours to bump — stay Idle, and stay Idle on
+            // an unreportable spender (never bump against a possible completion).
+            SpendStatus::InMempool => {
+                if refund_congested && self.spend_is_our_refund(chain) {
+                    Ok(WatchtowerTick::RefundStalledBelowFeeFloor)
+                } else {
+                    Ok(WatchtowerTick::Idle)
                 }
-                // Matured: try to fire. A broadcast failure here is the
-                // refund's fee falling below the relay floor (congestion
-                // beyond Δ_fee) — surface it as an ACTIONABLE stall the outer
-                // loop routes to the silent backstop, NOT a bare error that
-                // strands the escrow past the deadline with a dead device.
-                match self.tower.poll(chain) {
-                    Ok(true) => Ok(WatchtowerTick::FiredRefund),
-                    Ok(false) => Ok(WatchtowerTick::Idle),
-                    Err(_) => Ok(WatchtowerTick::RefundStalledBelowFeeFloor),
+            }
+            SpendStatus::Unspent => {
+                // Fire on the CHAIN-DERIVED maturity, not the arm-time
+                // PREDICTION (finding): the refund is necessarily armed BEFORE
+                // the Setup confirms, so `csv_maturity_height = predicted_S +
+                // csv_blocks` is a guess. Firing at the predicted height while
+                // the Setup confirmed later (or still sits unconfirmed)
+                // broadcasts an immature/unfunded refund the chain rejects —
+                // and mapping THAT to a fee-floor stall would hammer it and burn
+                // a reserve key index per tick. Until the escrow's authoritative
+                // funding height is known it isn't funded, so nothing can fire.
+                match self.effective_maturity(chain) {
+                    Some(m) if chain.tip_height() >= m => match self.tower.poll(chain) {
+                        Ok(true) => Ok(WatchtowerTick::FiredRefund),
+                        Ok(false) => Ok(WatchtowerTick::Idle),
+                        // A rejection at/after the CHAIN-DERIVED maturity is a
+                        // genuine relay/fee-policy stall (congestion beyond
+                        // Δ_fee), not an immaturity artifact — the immature case
+                        // is excluded by the maturity gate above → the
+                        // actionable silent-backstop stall.
+                        Err(_) => Ok(WatchtowerTick::RefundStalledBelowFeeFloor),
+                    },
+                    _ => Ok(WatchtowerTick::Idle),
                 }
             }
         }
+    }
+
+    /// The maturity height to fire at: `funding_height + csv_blocks` from the
+    /// CHAIN when the escrow's authoritative funding height is known, else the
+    /// arm-time prediction only when `csv_blocks` could not be decoded (never a
+    /// false "not matured"). `None` when the escrow has no authoritative funding
+    /// height yet — it isn't funded, so there is nothing to fire.
+    fn effective_maturity(&self, chain: &impl AuthoritativeChainView) -> Option<u32> {
+        match (
+            chain.authoritative_funding_height(self.escrow_outpoint),
+            self.csv_blocks,
+        ) {
+            (Some(h), Some(csv)) => Some(h.saturating_add(csv)),
+            (Some(_), None) => Some(self.csv_maturity_height),
+            (None, _) => None,
+        }
+    }
+
+    /// Is the escrow's current spend OUR OWN pre-armed refund, by txid? The
+    /// same who-spent rule the backstop's `reveal_is_public` and the app's
+    /// `our_refund_confirmed` use. Unreportable spender ⇒ false (conservative).
+    fn spend_is_our_refund(&self, chain: &impl AuthoritativeChainView) -> bool {
+        matches!(
+            (self.refund_txid, chain.spend_txid(self.escrow_outpoint)),
+            (Some(mine), Some(seen)) if mine == seen
+        )
     }
 }
 
@@ -302,15 +402,15 @@ mod tests {
         let driver = WatchtowerDriver::arm(refund, escrow, &receipt).unwrap();
 
         // Before maturity: idle (nothing to fire).
-        assert_eq!(driver.tick(&chain).unwrap(), WatchtowerTick::Idle);
+        assert_eq!(driver.tick(&chain, false).unwrap(), WatchtowerTick::Idle);
         // At maturity, owner offline: the tower fires the refund itself.
         while chain.tip_height() < maturity {
             chain.mine();
         }
-        assert_eq!(driver.tick(&chain).unwrap(), WatchtowerTick::FiredRefund);
+        assert_eq!(driver.tick(&chain, false).unwrap(), WatchtowerTick::FiredRefund);
         chain.mine();
         // Now confirmed: stand down.
-        assert_eq!(driver.tick(&chain).unwrap(), WatchtowerTick::StandDown);
+        assert_eq!(driver.tick(&chain, false).unwrap(), WatchtowerTick::StandDown);
     }
 
     /// If a completion wins first, the watchtower stands down and never
@@ -333,7 +433,7 @@ mod tests {
         while chain.tip_height() < maturity + 10 {
             chain.mine();
         }
-        assert_eq!(driver.tick(&chain).unwrap(), WatchtowerTick::StandDown);
+        assert_eq!(driver.tick(&chain, false).unwrap(), WatchtowerTick::StandDown);
     }
 
     #[test]
@@ -410,12 +510,126 @@ mod tests {
         // Congestion floor above the refund's fee: broadcast would be rejected.
         chain.set_congestion(50_000);
         assert_eq!(
-            driver.tick(&chain).unwrap(),
+            driver.tick(&chain, false).unwrap(),
             WatchtowerTick::RefundStalledBelowFeeFloor,
             "a congested matured refund must be an actionable stall, not a bare Err"
         );
         // Congestion clears: it fires.
         chain.set_congestion(0);
-        assert_eq!(driver.tick(&chain).unwrap(), WatchtowerTick::FiredRefund);
+        assert_eq!(driver.tick(&chain, false).unwrap(), WatchtowerTick::FiredRefund);
+    }
+
+    /// F2: the fire gate uses the CHAIN-DERIVED maturity (funding height +
+    /// csv_blocks), not the arm-time PREDICTION. A Setup that confirms LATER
+    /// than predicted must NOT make the tower fire (and then hammer/misreport a
+    /// stall on) an immature refund at the predicted height.
+    #[test]
+    fn fire_gate_uses_chain_derived_maturity_not_the_arm_prediction() {
+        let escrow = op(6);
+        let csv = 144u16;
+        let predicted_s = 700_000u32;
+        let arm_maturity = predicted_s + csv as u32; // the arm-time guess
+        let real_funding = predicted_s + 5; // Setup confirms 5 blocks late
+        let real_maturity = real_funding + csv as u32;
+
+        let chain = SimChain::new(predicted_s);
+        let refund =
+            PreArmedRefund::from_signed_tx(spend_of(escrow, 990_000, Some(csv)), arm_maturity).unwrap();
+        let receipt = confirm_watchtower_handoff(&refund, refund.fingerprint()).unwrap();
+        let driver = WatchtowerDriver::arm(refund, escrow, &receipt).unwrap();
+
+        while chain.tip_height() < real_funding {
+            chain.mine();
+        }
+        chain.fund(escrow, real_funding);
+
+        // At the ARM-TIME predicted maturity the chain-derived maturity is not
+        // reached → Idle. (Before the fix: a rejected immature broadcast
+        // misreported as RefundStalledBelowFeeFloor, hammered every tick.)
+        while chain.tip_height() < arm_maturity {
+            chain.mine();
+        }
+        assert_eq!(driver.tick(&chain, false).unwrap(), WatchtowerTick::Idle);
+
+        // At the REAL (chain-derived) maturity it fires.
+        while chain.tip_height() < real_maturity {
+            chain.mine();
+        }
+        assert_eq!(driver.tick(&chain, false).unwrap(), WatchtowerTick::FiredRefund);
+    }
+
+    /// F2 corner: an escrow with NO authoritative funding height yet (its Setup
+    /// still sits unconfirmed in the mempool past the arm-time maturity) has
+    /// nothing to fire — Idle, never a stall on a not-yet-existent escrow.
+    #[test]
+    fn unfunded_escrow_past_arm_maturity_is_idle_not_a_stall() {
+        let escrow = op(9);
+        let csv = 144u16;
+        let arm_maturity = 500_000 + csv as u32;
+        let chain = SimChain::new(500_000);
+        // Escrow never funded on chain.
+        let refund =
+            PreArmedRefund::from_signed_tx(spend_of(escrow, 990_000, Some(csv)), arm_maturity).unwrap();
+        let receipt = confirm_watchtower_handoff(&refund, refund.fingerprint()).unwrap();
+        let driver = WatchtowerDriver::arm(refund, escrow, &receipt).unwrap();
+        while chain.tip_height() < arm_maturity + 10 {
+            chain.mine();
+        }
+        assert_eq!(driver.tick(&chain, false).unwrap(), WatchtowerTick::Idle);
+    }
+
+    /// F3: an already-relayed OWN refund stuck in the mempool surfaces as an
+    /// actionable stall ONLY when the caller observes congestion — a healthy
+    /// in-mempool refund (about to confirm) stays Idle.
+    #[test]
+    fn in_mempool_own_refund_stalls_only_when_congested() {
+        let escrow = op(7);
+        let csv = 144u16;
+        let funding = 650_000u32;
+        let maturity = funding + csv as u32;
+        let chain = SimChain::new(funding);
+        chain.fund(escrow, funding);
+        let refund =
+            PreArmedRefund::from_signed_tx(spend_of(escrow, 990_000, Some(csv)), maturity).unwrap();
+        let receipt = confirm_watchtower_handoff(&refund, refund.fingerprint()).unwrap();
+        let driver = WatchtowerDriver::arm(refund, escrow, &receipt).unwrap();
+
+        // Fire at maturity; the refund relays into the mempool.
+        while chain.tip_height() < maturity {
+            chain.mine();
+        }
+        assert_eq!(driver.tick(&chain, false).unwrap(), WatchtowerTick::FiredRefund);
+        assert!(matches!(chain.spend_status(escrow), SpendStatus::InMempool));
+
+        // Not congested → Idle (healthy, about to confirm).
+        assert_eq!(driver.tick(&chain, false).unwrap(), WatchtowerTick::Idle);
+        // Congested → the silent-backstop stall (previously Idle FOREVER).
+        assert_eq!(
+            driver.tick(&chain, true).unwrap(),
+            WatchtowerTick::RefundStalledBelowFeeFloor
+        );
+    }
+
+    /// F3 counter-case: a COUNTERPARTY completion in the mempool must NEVER be
+    /// bumped, even under congestion — we never CPFP against a possible
+    /// completion (that would fight our own paid leg).
+    #[test]
+    fn in_mempool_counterparty_completion_never_bumps() {
+        let escrow = op(8);
+        let csv = 144u16;
+        let funding = 660_000u32;
+        let maturity = funding + csv as u32;
+        let chain = SimChain::new(funding);
+        chain.fund(escrow, funding);
+        let refund =
+            PreArmedRefund::from_signed_tx(spend_of(escrow, 990_000, Some(csv)), maturity).unwrap();
+        let receipt = confirm_watchtower_handoff(&refund, refund.fingerprint()).unwrap();
+        let driver = WatchtowerDriver::arm(refund, escrow, &receipt).unwrap();
+
+        // A counterparty completion (no timelock, a DIFFERENT tx) enters the mempool.
+        chain.broadcast(&spend_of(escrow, 995_000, None)).unwrap();
+        assert!(matches!(chain.spend_status(escrow), SpendStatus::InMempool));
+
+        assert_eq!(driver.tick(&chain, true).unwrap(), WatchtowerTick::Idle);
     }
 }

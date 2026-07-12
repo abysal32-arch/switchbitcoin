@@ -464,19 +464,30 @@ impl SwapApp {
         reserve_available: bool,
     ) -> Result<BackstopTick> {
         let sid = SwapEngine::swap_session_id(&self.ctx)?;
-        match engine.store().get(&sid)? {
+        // Three-state read — Some / None / UNREADABLE. A store read Err must
+        // never suppress the dead-device refund fire: the same fail-safe as
+        // `terminate_abort`'s `read_err` rule (an Err must not collapse into
+        // "no record and nothing locked"). A damaged/unreadable record is
+        // treated as record-less, so it falls to the refund-only tower arm
+        // below — the tower needs only the escrow + chain, so a corrupt record
+        // can never keep the pre-armed refund from firing at CSV maturity.
+        // An Err (unreadable/damaged record) fails safe to `None` — the
+        // record-less refund-only arm below still fires the dead-device refund.
+        let record = engine.store().get(&sid).unwrap_or_default();
+        match record {
             Some(rec) => self.backstop.tick(&rec, chain, congested, reserve_available),
-            // No durable record yet. Still guard a funded-but-record-less escrow's
-            // dead-device refund (the pre-`Proceed` funded-abort case); nothing
-            // locked ⇒ Idle. AUTHORITATIVE read, matching `terminate_abort`,
-            // `reenter_funding`, and `rebroadcast_setup_if_unconfirmed`: a lying
-            // source that HIDES a real confirmation must not be able to suppress
-            // the standing pre-armed refund (the agreement-required read
-            // collapses to `None` on any single-source disagreement, which would
-            // keep the tower Idle past CSV maturity on a liar's say-so).
+            // No durable (or no readable) record. Still guard a funded escrow's
+            // dead-device refund (the pre-`Proceed` funded-abort case, and now
+            // the damaged-record case); nothing locked ⇒ Idle. AUTHORITATIVE
+            // read, matching `terminate_abort`, `reenter_funding`, and
+            // `rebroadcast_setup_if_unconfirmed`: a lying source that HIDES a
+            // real confirmation must not be able to suppress the standing
+            // pre-armed refund (the agreement-required read collapses to `None`
+            // on any single-source disagreement, which would keep the tower
+            // Idle past CSV maturity on a liar's say-so).
             None => {
                 if chain.authoritative_funding_height(self.ctx.our_escrow_op).is_some() {
-                    self.backstop.tick_refund_only(chain, reserve_available)
+                    self.backstop.tick_refund_only(chain, reserve_available, congested)
                 } else {
                     Ok(BackstopTick::Idle)
                 }

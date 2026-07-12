@@ -217,6 +217,11 @@ impl SwapEngine {
         &mut self,
         chain: &dyn crate::chain::AuthoritativeChainView,
     ) -> Result<Vec<OutPoint>> {
+        // Resolve pending CPFP-change reserves FIRST (activate a confirmed
+        // child's change into the leasable pool, or drop an evicted phantom and
+        // restore its source reserve — the pool-poison heal), then sweep any
+        // confirmed-spent reserves.
+        self.ledger.heal_pending_reserve_changes(chain)?;
         self.ledger.sweep_spent_reserves(chain)
     }
 

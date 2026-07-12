@@ -1407,7 +1407,9 @@ fn backstop_execute_bumps_a_stalled_refund_autonomously() {
     // reserve is spent in the ledger, and the child change is a fresh coin.
     assert!(matches!(chain.spend_status(our_op), SpendStatus::InMempool));
     assert_eq!(engine.ledger().find(&reserve_op).unwrap().state, CoinState::Spent);
-    assert_eq!(engine.ledger().find(&change_op).unwrap().state, CoinState::Unspent);
+    // F5: the child change is PENDING until it confirms (an unconfirmed change
+    // that could evict must not re-enter the leasable pool).
+    assert_eq!(engine.ledger().find(&change_op).unwrap().state, CoinState::PendingConfirm);
 
     // Confirm: the refund lands; the loop quiesces (StandDown → Idle).
     chain.mine();
@@ -1416,6 +1418,10 @@ fn backstop_execute_bumps_a_stalled_refund_autonomously() {
         BackstopRun::Decided(BackstopTick::Idle) => {}
         other => panic!("a confirmed refund must quiesce, got {other:?}"),
     }
+    // The confirmed child's change activates into the leasable pool via the
+    // reserve-reconcile heal (the change outpoint is now a funded UTXO).
+    engine.reconcile_reserves(&chain).unwrap();
+    assert_eq!(engine.ledger().find(&change_op).unwrap().state, CoinState::Unspent);
 }
 
 /// Shared fixture for the backstop_execute regression tests: a record-less

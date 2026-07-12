@@ -1227,19 +1227,43 @@ fn abort_never_refunds_when_our_completion_already_swept() {
         chain.mine();
     }
 
-    // AbortRefund: Completed, never the both-sides BroadcastRefund.
+    // AbortRefund: Completed, never the both-sides BroadcastRefund. F6 also
+    // terminalizes it (our completion genuinely swept — Completed is the real
+    // terminal), so the record advances AbortRefund → Completed.
     let got = store.get(&rec.swap_session_id).unwrap().unwrap();
     assert_eq!(
         RecoveryDriver::reenter_one(&store, &got, &chain).unwrap(),
         RecoveryTick::Refund(AbortAction::Completed),
         "our completion swept the counterparty escrow — refunding our own would take both sides"
     );
+    assert_eq!(
+        store.get(&rec.swap_session_id).unwrap().unwrap().phase,
+        SwapPhase::Completed,
+        "an SH whose completion swept terminalizes Completed, not a both-sides refund"
+    );
 
-    // Same guard at Refunded (record later recorded Refunded; a reorg then left
-    // our escrow unspent while our completion still holds the swept escrow).
-    rec.phase = SwapPhase::Refunded;
-    store.put(&rec).unwrap();
-    let got = store.get(&rec.swap_session_id).unwrap().unwrap();
+    // Same guard on a SEPARATE record recorded Refunded (a reorg left our escrow
+    // unspent while our completion still holds the swept escrow): the Refunded
+    // re-validation must not drive a both-sides refund either.
+    let mut rec2 = SwapRecord {
+        swap_session_id: [0x92u8; 32],
+        role: Role::SecretHolder,
+        phase: SwapPhase::Funding,
+        params: params.clone(),
+        s_height,
+        sweep_escrow_height: s_height,
+        our_escrow_outpoint: Some(our_escrow),
+        their_escrow_outpoint: Some(their_escrow),
+        pre_armed_refund: Some(refund.clone()),
+        completion_tx: Some(ours.to_vec()),
+        setup_tx: None,
+        possession_record: None,
+    };
+    for phase in [SwapPhase::Funding, SwapPhase::AbortRefund, SwapPhase::Refunded] {
+        rec2.phase = phase;
+        store.put(&rec2).unwrap();
+    }
+    let got = store.get(&rec2.swap_session_id).unwrap().unwrap();
     assert_eq!(
         RecoveryDriver::reenter_one(&store, &got, &chain).unwrap(),
         RecoveryTick::Refund(AbortAction::Completed),
@@ -1370,5 +1394,105 @@ fn one_damaged_record_does_not_poison_the_scan() {
             .iter()
             .any(|(sid, t)| *sid == healthy && matches!(t, RecoveryTick::Funding { refund: None })),
         "a sibling's corruption must not hide the healthy swap's tick"
+    );
+}
+
+/// Task F6: recovery now PERSISTS the refund-side terminal. An AbortRefund
+/// record whose own pre-armed refund confirmed advances AbortRefund → Refunded
+/// on the first scan (so it drops out of live_lessees and is not rescanned
+/// forever), and a second scan reads it Settled.
+#[test]
+fn abort_refund_over_confirmed_own_refund_terminalizes() {
+    let params = Params::testnet_provisional();
+    let s_height = 800_000u32;
+    let unit = params.escrow_amount_sats();
+    let a = keypair();
+    let b = keypair();
+    let internal = swapkey::settlement::state_machine::canonical_internal_key(a.pk, b.pk).unwrap();
+    let escrow = Escrow::new(&internal, &a.pk, params.delta_early).unwrap();
+    let dest = escrow.funding_script_pubkey().clone();
+    let our_escrow = OutPoint::new(txid_from(0xC0), 0);
+    let refund = PreArmedRefund::arm(
+        &escrow, our_escrow, unit, &a.sk, dest, params.tier_d_sats, params.anchor_sats, s_height,
+    )
+    .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _) = SwapStore::open(dir.path(), &ModeledEnclave).unwrap();
+    let mut rec = SwapRecord {
+        swap_session_id: [0xC1u8; 32],
+        role: Role::SecretHolder,
+        phase: SwapPhase::Funding,
+        params: params.clone(),
+        s_height,
+        sweep_escrow_height: s_height,
+        our_escrow_outpoint: Some(our_escrow),
+        their_escrow_outpoint: Some(OutPoint::new(txid_from(0xC2), 0)),
+        pre_armed_refund: Some(refund.clone()),
+        completion_tx: None,
+        setup_tx: None,
+        possession_record: None,
+    };
+    for phase in [SwapPhase::Funding, SwapPhase::AbortRefund] {
+        rec.phase = phase;
+        store.put(&rec).unwrap();
+    }
+
+    // Our own pre-armed refund confirms on chain.
+    let chain = SimChain::new(refund.csv_maturity_height());
+    chain.fund(our_escrow, s_height);
+    chain.broadcast(refund.tx_bytes()).unwrap();
+    chain.mine();
+
+    // First scan: the Refunded signal, and the record terminalizes.
+    let got = store.get(&rec.swap_session_id).unwrap().unwrap();
+    assert_eq!(
+        RecoveryDriver::reenter_one(&store, &got, &chain).unwrap(),
+        RecoveryTick::Refund(AbortAction::Refunded)
+    );
+    assert_eq!(
+        store.get(&rec.swap_session_id).unwrap().unwrap().phase,
+        SwapPhase::Refunded,
+        "the confirmed refund must terminalize the record, not linger AbortRefund"
+    );
+
+    // Second scan reads it Settled (via reenter_refunded).
+    let got = store.get(&rec.swap_session_id).unwrap().unwrap();
+    assert_eq!(
+        RecoveryDriver::reenter_one(&store, &got, &chain).unwrap(),
+        RecoveryTick::Settled
+    );
+}
+
+/// Task F6: a Released SL record whose dead-device refund confirmed (the core
+/// Feature-3 scenario) terminalizes Released → AbortRefund → Refunded instead
+/// of re-restoring the possession record and re-deciding every future scan.
+#[test]
+fn released_dead_device_refund_confirmed_terminalizes() {
+    let s = released_swap();
+    let refund = s.store.get(&s.sid).unwrap().unwrap().pre_armed_refund.unwrap();
+
+    // Mature and confirm SL's own pre-armed refund of E_sl.
+    while s.chain.tip_height() < refund.csv_maturity_height() {
+        s.chain.mine();
+    }
+    s.chain.broadcast(refund.tx_bytes()).expect("mature refund accepted");
+    s.chain.mine();
+
+    let got = s.store.get(&s.sid).unwrap().unwrap();
+    match RecoveryDriver::reenter_one(&s.store, &got, &s.chain).unwrap() {
+        RecoveryTick::Extract { final_sig: None, fallback: AbortAction::Refunded } => {}
+        other => panic!("a confirmed dead-device refund must fall back Refunded, got {other:?}"),
+    }
+    assert_eq!(
+        s.store.get(&s.sid).unwrap().unwrap().phase,
+        SwapPhase::Refunded,
+        "the Released record must terminalize once its refund confirms"
+    );
+    // Settled thereafter.
+    let got = s.store.get(&s.sid).unwrap().unwrap();
+    assert_eq!(
+        RecoveryDriver::reenter_one(&s.store, &got, &s.chain).unwrap(),
+        RecoveryTick::Settled
     );
 }

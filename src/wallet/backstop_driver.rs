@@ -136,7 +136,10 @@ impl BackstopDriver {
         //    `Some` = the refund side handled this tick; `None` (Idle/StandDown) =
         //    fall through to the COMPLETION side, a DIFFERENT escrow (E_theirs)
         //    whose stalled sweep can outlive the refund escrow standing down.
-        if let Some(tick) = self.refund_side(chain, reserve_available)? {
+        //    `congested` (the caller's fee-floor observation) also feeds the
+        //    refund side so an ALREADY-RELAYED refund stuck below the
+        //    confirmation feerate is surfaced as a bump, not left Idle forever.
+        if let Some(tick) = self.refund_side(chain, reserve_available, congested)? {
             return Ok(tick);
         }
 
@@ -172,19 +175,25 @@ impl BackstopDriver {
         &self,
         chain: &impl AuthoritativeChainView,
         reserve_available: bool,
+        refund_congested: bool,
     ) -> Result<BackstopTick> {
-        Ok(self.refund_side(chain, reserve_available)?.unwrap_or(BackstopTick::Idle))
+        Ok(self
+            .refund_side(chain, reserve_available, refund_congested)?
+            .unwrap_or(BackstopTick::Idle))
     }
 
     /// The REFUND-side decision, shared by [`tick`](Self::tick) and
     /// [`tick_refund_only`](Self::tick_refund_only): `Some` when the tower fired
-    /// or the refund is congested, `None` (Idle/StandDown) when it needs nothing.
+    /// or the refund is congested (broadcast-time OR relayed-but-stuck), `None`
+    /// (Idle/StandDown) when it needs nothing. `refund_congested` lets the tower
+    /// surface an already-in-mempool refund below the confirmation feerate.
     fn refund_side(
         &self,
         chain: &impl AuthoritativeChainView,
         reserve_available: bool,
+        refund_congested: bool,
     ) -> Result<Option<BackstopTick>> {
-        Ok(match self.tower.tick(chain)? {
+        Ok(match self.tower.tick(chain, refund_congested)? {
             WatchtowerTick::FiredRefund => Some(BackstopTick::FiredRefund),
             WatchtowerTick::RefundStalledBelowFeeFloor => {
                 let action = backstop_decision(StalledTx::Refund, true, reserve_available, None);
@@ -292,6 +301,26 @@ pub fn run_cpfp_bump(
         req.parent_vsize_vb,
     );
 
+    // F4 belt-and-braces: NEVER bump a parent that is already CONFIRMED. If the
+    // outpoint the parent spends is confirmed-spent by the parent's own txid,
+    // the parent is mined and a CPFP child would burn a reserve accelerating
+    // nothing. Covers Setup/Refund/Completion uniformly against any stale caller
+    // observation (the classifier guards its own side, but the executor is the
+    // last line before a reserve key is issued). Undecodable parent bytes fall
+    // through to the normal build, which errors — never a silent bump.
+    if let Ok(parent) =
+        bitcoin::consensus::encode::deserialize::<bitcoin::Transaction>(req.parent_bytes)
+    {
+        if let Some(input) = parent.input.first() {
+            let prev = input.previous_output;
+            if matches!(chain.spend_status(prev), SpendStatus::Confirmed(_))
+                && chain.spend_txid(prev) == Some(parent.compute_txid())
+            {
+                return Ok(BumpOutcome::NoBump);
+            }
+        }
+    }
+
     // The child change lands at a fresh, TRACKED Reserve key so it replenishes
     // the pool (derived here, never an opaque caller spk — the on-chain output
     // and the coin we later re-sign can never diverge).
@@ -395,6 +424,15 @@ pub fn classify_stalled_tx(rec: &SwapRecord, chain: &impl AuthoritativeChainView
             _ => None,
         },
         // A completion is finalized in `completion_tx`.
+        // F4: a CONFIRMED spend of the swept escrow means the leg already
+        // resolved (our completion won, or it was superseded) — nothing to
+        // bump. Guard first (mirroring the Completed arm) so an
+        // already-confirmed completion is never classified CompletionInFlight,
+        // which would let backstop_execute burn a Reserve key CPFP-ing a
+        // confirmed parent. Completed is persisted the moment the sig is
+        // finalized (before confirmation), so this state is reachable at
+        // Completing whenever the completion confirms before the record advances.
+        SwapPhase::Completing if our_completion_confirmed(rec, chain) => None,
         SwapPhase::Completing => match rec.role {
             // SL reaches Completing ONLY after observing the reveal → always
             // in-flight (never abandon).
@@ -680,6 +718,30 @@ mod tests {
         assert_eq!(classify_stalled_tx(&r, &chain), None, "confirmed output ⇒ done");
     }
 
+    /// F4: a CONFIRMED completion spend of the swept escrow at `Completing` must
+    /// classify `None` (a confirmed parent is nothing to bump), not
+    /// `CompletionInFlight` — the confirmation can land before the record
+    /// advances to `Completed`, so this state is reachable at `Completing`.
+    #[test]
+    fn classify_completing_confirmed_completion_is_done_not_in_flight() {
+        let e_theirs = op(42); // the escrow WE sweep
+        let chain = SimChain::new(100);
+        chain.fund(e_theirs, 100);
+        let r = rec(SwapPhase::Completing, Role::SecretLearner, Some(op(43)), Some(e_theirs));
+
+        // In the mempool: still in-flight (keep fighting).
+        chain.broadcast(&spend_of(e_theirs, 900_000, None)).unwrap();
+        assert_eq!(classify_stalled_tx(&r, &chain), Some(StalledTx::CompletionInFlight));
+        // Confirmed: nothing to bump (before the fix: still CompletionInFlight,
+        // which let backstop_execute burn a reserve on a confirmed parent).
+        chain.mine();
+        assert_eq!(
+            classify_stalled_tx(&r, &chain),
+            None,
+            "a confirmed completion at Completing is done"
+        );
+    }
+
     // ------- tick: composition + routing -------
 
     fn armed_tower(escrow: OutPoint, refund_amount: u64, csv: u16, maturity: u32) -> WatchtowerDriver {
@@ -745,7 +807,7 @@ mod tests {
         let driver = BackstopDriver::arm(armed_tower(e_ours, 900_000, 144, maturity));
 
         assert_eq!(
-            driver.tick_refund_only(&chain, false).unwrap(),
+            driver.tick_refund_only(&chain, false, false).unwrap(),
             BackstopTick::Idle,
             "immature refund: nothing to do"
         );
@@ -753,13 +815,13 @@ mod tests {
             chain.mine();
         }
         assert_eq!(
-            driver.tick_refund_only(&chain, false).unwrap(),
+            driver.tick_refund_only(&chain, false, false).unwrap(),
             BackstopTick::FiredRefund,
             "matured, unspent, record-less: the tower fires"
         );
         chain.mine();
         assert_eq!(
-            driver.tick_refund_only(&chain, false).unwrap(),
+            driver.tick_refund_only(&chain, false, false).unwrap(),
             BackstopTick::Idle,
             "confirmed refund: stand down maps to Idle"
         );
