@@ -55,6 +55,12 @@
 //!     refunds, consent-gated for completions), rank 6.
 
 //!
+//!   * `transport` — real peer transport (pre-alpha): blocking TCP with
+//!     u32-BE length framing behind the settlement core's `Transport` trait.
+//!     PLAINTEXT, LAN/regtest only; Tor/Noise is post-pre-alpha. Transport
+//!     failures map to `Error::Abort` → the refund path, and every received
+//!     frame still passes the `wire::parse_message` gate inside `PeerSession`.
+
 //!   * `engine` — the swap engine (rank 7): the wallet's core loop that
 //!     composes every rank into one driven, crash-recoverable swap lifecycle
 //!     (funded → exchange → settle), persisting the SwapRecord through every
@@ -74,6 +80,7 @@ pub mod manifest;
 pub mod orchestrator;
 pub mod recovery_driver;
 pub mod store;
+pub mod transport;
 
 pub use app::{AppTick, BackstopRun, StalledParent, SwapApp};
 pub use backstop_driver::{
@@ -87,3 +94,4 @@ pub use manifest::{
     SignedManifest,
 };
 pub use store::{EnclaveKeyProvider, ModeledEnclave, RecoveryAction, SwapPhase, SwapRecord, SwapStore};
+pub use transport::{TcpTransport, DEFAULT_IO_TIMEOUT, MAX_FRAME};
