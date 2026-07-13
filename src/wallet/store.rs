@@ -54,10 +54,13 @@
 //!     file wins a phase rewind. True rollback protection needs an
 //!     enclave-held monotonic counter — the same real-infra seam as the
 //!     modeled `platform_secure_key`.
-//!   * The settlement layer's possession record seals under the MODELED
-//!     platform key directly; when a real `EnclaveKeyProvider` lands, the
-//!     same key must be threaded into `write_possession_record` or the two
-//!     artifacts diverge (rank-4 / K-ENCLAVE completion item).
+//!   * RESOLVED (Task 06): the possession record now seals under the SAME
+//!     `EnclaveKeyProvider` platform key this store authenticates it with —
+//!     the engine threads `SwapStore::platform_key()` into the exchange
+//!     (`ExchangeInputs.possession_store` carries `(dir, platform_key)`), and
+//!     `restore_secret_learner` takes the key explicitly. Raw settlement
+//!     tests pass the modeled `platform_secure_key()` by hand; the two
+//!     artifacts can no longer diverge silently.
 
 use crate::settlement::params::Params;
 use crate::settlement::refund::PreArmedRefund;
@@ -753,6 +756,13 @@ impl SwapStore {
             }
         }
         Ok((store, actions))
+    }
+
+    /// The enclave platform key this store seals/authenticates under —
+    /// crate-internal so the wallet layer can seal COMPANION artifacts (the
+    /// possession record) under the same root it will authenticate them with.
+    pub(crate) fn platform_key(&self) -> [u8; 32] {
+        self.platform_key
     }
 
     /// Does the record's possession pointer resolve to a file that

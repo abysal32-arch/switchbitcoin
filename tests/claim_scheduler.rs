@@ -150,7 +150,10 @@ fn sl_claim_is_posture_delayed_reveal_observed_and_bound_holds() {
                 .unwrap(),
             adaptor_secret: None,
             lease_dir: Some(lease_sl.path().to_path_buf()),
-            possession_store: Some(store.path().to_path_buf()),
+            possession_store: Some((
+                store.path().to_path_buf(),
+                swapkey::crypto::storage::platform_secure_key(),
+            )),
             taproot_root_comp_sh: Some(root_sh),
             taproot_root_comp_sl: Some(root_sl),
             taproot_output_comp_sh: Some(ok_sh),

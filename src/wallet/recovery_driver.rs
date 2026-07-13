@@ -416,7 +416,11 @@ impl RecoveryDriver {
             .possession_record
             .as_ref()
             .ok_or(Error::Ordering("restore-and-extract without a possession pointer"))?;
-        let restored = Possessing::restore_secret_learner(record_path, &rec.swap_session_id)?;
+        let restored = Possessing::restore_secret_learner(
+            record_path,
+            &rec.swap_session_id,
+            &store.platform_key(),
+        )?;
         let observed = match ValidatedFinalSig::from_bytes(reveal) {
             Ok(o) => o,
             // Not even a valid signature encoding: a degraded source's garbage.
@@ -502,7 +506,11 @@ impl RecoveryDriver {
         // Restore up front even when no reveal is observable yet: a corrupt
         // possession record must surface NOW (the record claims G1 evidence),
         // not only once SH completes.
-        let _validated = Possessing::restore_secret_learner(record_path, &rec.swap_session_id)?;
+        let _validated = Possessing::restore_secret_learner(
+            record_path,
+            &rec.swap_session_id,
+            &store.platform_key(),
+        )?;
 
         if !Self::swept_claim_futile(rec, chain) {
             if let Some(reveal) = ClaimScheduler::observe_reveal(chain, our_escrow) {

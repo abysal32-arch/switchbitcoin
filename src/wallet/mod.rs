@@ -34,6 +34,12 @@
 //!     restarts, class-pure non-mixing coin selection, enclave-seam key
 //!     derivation (disk holds indices, never keys).
 
+//!   * `keystore` — pre-alpha SOFTWARE key custody: BIP39 seed, BIP32
+//!     per-purpose signing keys, seed-derived `platform_key` sealing root,
+//!     passphrase-encrypted at rest. A drop-in for BOTH key seams
+//!     (`EnclaveKeyProvider` + `KeySource`); NOT enclave custody, NOT for
+//!     real funds (see the module's warning header).
+
 //!   * `orchestrator` — the wallet's funding + abort decision loop over the
 //!     settlement core (rank 4). Canonical-order funding with deferred
 //!     encumbrance verification, co-funding window + Block-X policy, and the
@@ -75,6 +81,7 @@ pub mod driver;
 pub mod engine;
 pub mod funding_driver;
 pub mod keys;
+pub mod keystore;
 pub mod watchtower_driver;
 pub mod ledger;
 pub mod manifest;
@@ -94,5 +101,6 @@ pub use manifest::{
     ClaimDelayPosture, ManifestOpenReport, ManifestStore, ManifestTrustRoot, ModeledTrustRoot,
     SignedManifest,
 };
+pub use keystore::SoftwareKeyStore;
 pub use store::{EnclaveKeyProvider, ModeledEnclave, RecoveryAction, SwapPhase, SwapRecord, SwapStore};
 pub use transport::{TcpTransport, DEFAULT_IO_TIMEOUT, MAX_FRAME};

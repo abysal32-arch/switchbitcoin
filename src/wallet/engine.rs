@@ -527,7 +527,12 @@ impl SwapEngine {
             adaptor_secret: ctx.adaptor_secret.take(),
             lease_dir: Some(ctx.lease_dir.clone()),
             possession_store: match role {
-                Role::SecretLearner => Some(ctx.possession_store.clone()),
+                // Seal the G1 record under THIS wallet's platform key — the
+                // same root `SwapStore` authenticates it with (Task 06: with
+                // real custody the modeled constant no longer matches).
+                Role::SecretLearner => {
+                    Some((ctx.possession_store.clone(), self.store.platform_key()))
+                }
                 Role::SecretHolder => None,
             },
             taproot_root_comp_sh: Some(ctx.taproot_root_comp_sh),

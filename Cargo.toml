@@ -36,6 +36,12 @@ zeroize = { version = "1", features = ["derive"] } # scrub secret nonces from me
 aes-gcm = "0.10"                                   # AES-256-GCM AEAD, unique 96-bit nonces
 hkdf = "0.12"                                      # TEK = HKDF-SHA256(platform key, swap_session_id)
 sha2 = "0.10"                                      # HKDF hash
+# Software key custody (Task 06 — pre-alpha SOFTWARE store, NOT enclave custody).
+# bip39: mnemonic <-> seed only (hashing, no curve math). BIP32 derivation comes
+# from the `bitcoin` crate already pinned above. pbkdf2: passphrase -> KEK for
+# the at-rest seed sealing (symmetric KDF, Req 1 untouched).
+bip39 = { version = "2", features = ["zeroize"] }
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 
 # --- feature "bitcoind" (real-node chain backend; NOT part of the core) ------
 # Gated so the default build (and the windows-gnu test suite) carries no HTTP

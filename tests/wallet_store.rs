@@ -206,7 +206,10 @@ fn sl_crash_in_g1_window_recovers_from_store_and_claims() {
             pre_armed_refund: sl_refund,
             adaptor_secret: None,
             lease_dir: Some(lease_sl.path().to_path_buf()),
-            possession_store: Some(possession_store.path().to_path_buf()),
+            possession_store: Some((
+                possession_store.path().to_path_buf(),
+                swapkey::crypto::storage::platform_secure_key(),
+            )),
             taproot_root_comp_sh: Some(root_sh),
             taproot_root_comp_sl: Some(root_sl),
             taproot_output_comp_sh: Some(outkey_sh),
@@ -242,6 +245,7 @@ fn sl_crash_in_g1_window_recovers_from_store_and_claims() {
     let restored = Possessing::restore_secret_learner(
         rec.possession_record.as_ref().expect("path"),
         &rec.swap_session_id,
+        &swapkey::crypto::storage::platform_secure_key(),
     )
     .expect("restore from possession record");
 

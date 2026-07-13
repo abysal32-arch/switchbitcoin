@@ -167,12 +167,18 @@ pub struct ExchangeInputs {
     pub adaptor_secret: Option<AdaptorSecret>,
     /// Lease directory override (tests / alternate stores). None = default.
     pub lease_dir: Option<std::path::PathBuf>,
-    /// Durable directory for the G1 possession record. REQUIRED for SL: the
-    /// complete pre-signatures MUST be persisted before the enabling partial
-    /// is released — after release, refund is no longer a safe sink and
-    /// extraction (which needs this material) is the only path, including
-    /// across a crash/restart. Ignored for SH (its crash is refund-safe).
-    pub possession_store: Option<std::path::PathBuf>,
+    /// Durable directory for the G1 possession record, PLUS the platform key
+    /// that seals it at rest (Task 06: the record must seal under the SAME
+    /// enclave/keystore root the wallet store authenticates with — the modeled
+    /// constant only ever matched by coincidence of both sides using it; a
+    /// caller with real custody passes its enclave `platform_key()`, raw
+    /// settlement tests pass `crypto::storage::platform_secure_key()`).
+    /// REQUIRED for SL: the complete pre-signatures MUST be persisted before
+    /// the enabling partial is released — after release, refund is no longer a
+    /// safe sink and extraction (which needs this material) is the only path,
+    /// including across a crash/restart. Ignored for SH (its crash is
+    /// refund-safe).
+    pub possession_store: Option<(std::path::PathBuf, [u8; 32])>,
     /// Tapscript merkle root of the escrow Comp->SH spends (SL-funded escrow),
     /// if this is a real taproot swap. `Some` => the Comp->SH session signs
     /// under the taproot-tweaked key so the signature is valid for the funded
@@ -606,11 +612,16 @@ impl Funded {
                 // is the only path, and it needs these pre-signatures. So the
                 // possession record MUST hit durable storage before release,
                 // making the InMempool->extraction route survive crash/restart.
-                let store = inputs.possession_store.as_deref().ok_or(Error::Ordering(
-                    "SL requires a possession_store: presigs must be durable before release",
-                ))?;
+                let (store, platform_key) = inputs
+                    .possession_store
+                    .as_ref()
+                    .map(|(dir, key)| (dir.as_path(), key))
+                    .ok_or(Error::Ordering(
+                        "SL requires a possession_store: presigs must be durable before release",
+                    ))?;
                 let record_path = write_possession_record(
                     store,
+                    platform_key,
                     &swap_sid,
                     self.s_height,
                     self.sweep_escrow_height,
@@ -676,6 +687,7 @@ fn hex32(id: &[u8; 32]) -> String {
 #[allow(clippy::too_many_arguments)]
 fn write_possession_record(
     dir: &std::path::Path,
+    platform_key: &[u8; 32],
     swap_session_id: &[u8; 32],
     s_height: u32,
     sweep_escrow_height: u32,
@@ -721,11 +733,10 @@ fn write_possession_record(
         ));
     }
     // Seal at-rest under the per-swap TEK (v3.13 Phase 3): confidentiality on
-    // top of the integrity the re-verify-on-restore already provided.
-    let tek = crate::crypto::storage::derive_tek(
-        &crate::crypto::storage::platform_secure_key(),
-        swap_session_id,
-    );
+    // top of the integrity the re-verify-on-restore already provided. The
+    // caller supplies the platform key (Task 06) so the record seals under the
+    // SAME root the wallet store later authenticates it with.
+    let tek = crate::crypto::storage::derive_tek(platform_key, swap_session_id);
     let sealed = crate::crypto::storage::seal(&tek, &v)?;
     let tmp = dir.join(format!("{}.possession.tmp", hex32(swap_session_id)));
     std::fs::write(&tmp, &sealed).map_err(|_| Error::Abort("possession record write failed"))?;
@@ -802,17 +813,16 @@ impl Possessing {
     pub fn restore_secret_learner(
         record_path: &std::path::Path,
         swap_session_id: &[u8; 32],
+        platform_key: &[u8; 32],
     ) -> Result<Possessing> {
         let sealed = std::fs::read(record_path)
             .map_err(|_| Error::Abort("possession record unreadable"))?;
-        // Unseal under the per-swap TEK. A wrong swap_session_id, a tampered
-        // blob, or a truncated file all fail the GCM tag here (never a bogus
-        // possession). The AEAD is the integrity gate; the re-verification
-        // below is the semantic gate.
-        let tek = crate::crypto::storage::derive_tek(
-            &crate::crypto::storage::platform_secure_key(),
-            swap_session_id,
-        );
+        // Unseal under the per-swap TEK. A wrong swap_session_id, a wrong
+        // platform key (Task 06: the caller passes the enclave/keystore root
+        // the record was sealed under), a tampered blob, or a truncated file
+        // all fail the GCM tag here (never a bogus possession). The AEAD is
+        // the integrity gate; the re-verification below is the semantic gate.
+        let tek = crate::crypto::storage::derive_tek(platform_key, swap_session_id);
         let b = crate::crypto::storage::open(&tek, &sealed)?;
         let mut at = 0usize;
         let version: [u8; 1] = take_arr(&b, &mut at)?;
@@ -1096,7 +1106,10 @@ mod tests {
                 pre_armed_refund: refund,
                 adaptor_secret: None,
                 lease_dir: Some(lease_dir_sl.path().to_path_buf()),
-                possession_store: Some(store_dir.to_path_buf()),
+                possession_store: Some((
+                    store_dir.to_path_buf(),
+                    crate::crypto::storage::platform_secure_key(),
+                )),
                 taproot_root_comp_sh: None,
                 taproot_root_comp_sl: None,
                 taproot_output_comp_sh: None,
@@ -1249,7 +1262,10 @@ mod tests {
             pre_armed_refund: PreArmedRefund::from_signed_tx(vec![0x33; 32], s_height + 200).unwrap(),
             adaptor_secret: None,
             lease_dir: Some(lease_dir_sl.path().to_path_buf()),
-            possession_store: Some(store.path().to_path_buf()),
+            possession_store: Some((
+                store.path().to_path_buf(),
+                crate::crypto::storage::platform_secure_key(),
+            )),
             taproot_root_comp_sh: None,
             taproot_root_comp_sl: None,
             taproot_output_comp_sh: None,
@@ -1345,7 +1361,10 @@ mod tests {
             pre_armed_refund: PreArmedRefund::from_signed_tx(vec![0x33; 32], s_height + 200).unwrap(),
             adaptor_secret: None,
             lease_dir: Some(lease_dir_sl.path().to_path_buf()),
-            possession_store: Some(store.path().to_path_buf()),
+            possession_store: Some((
+                store.path().to_path_buf(),
+                crate::crypto::storage::platform_secure_key(),
+            )),
             taproot_root_comp_sh: None,
             taproot_root_comp_sl: None,
             taproot_output_comp_sh: None,
@@ -1388,7 +1407,11 @@ mod tests {
 
         // Fresh process rebuilds from the record — everything re-validated.
         let restored =
-            Possessing::restore_secret_learner(&out.possession_record, &out.swap_session_id)
+            Possessing::restore_secret_learner(
+                &out.possession_record,
+                &out.swap_session_id,
+                &crate::crypto::storage::platform_secure_key(),
+            )
                 .expect("restore from possession record");
         assert_eq!(restored.role(), Role::SecretLearner);
 
@@ -1421,7 +1444,12 @@ mod tests {
         bytes[idx] ^= 0x01;
         let bad = store.path().join("bad.possession");
         std::fs::write(&bad, &bytes).unwrap();
-        assert!(Possessing::restore_secret_learner(&bad, &out.swap_session_id).is_err());
+        assert!(Possessing::restore_secret_learner(
+            &bad,
+            &out.swap_session_id,
+            &crate::crypto::storage::platform_secure_key(),
+        )
+        .is_err());
     }
 
     /// The at-rest record is cryptographically bound to its swap: the TEK is
@@ -1439,13 +1467,23 @@ mod tests {
         );
         // Correct sid: restores.
         assert!(
-            Possessing::restore_secret_learner(&out.possession_record, &out.swap_session_id).is_ok()
+            Possessing::restore_secret_learner(
+                &out.possession_record,
+                &out.swap_session_id,
+                &crate::crypto::storage::platform_secure_key(),
+            )
+            .is_ok()
         );
         // Any other sid: the derived TEK differs, GCM auth fails, no possession.
         let mut wrong_sid = out.swap_session_id;
         wrong_sid[0] ^= 0x01;
         assert!(
-            Possessing::restore_secret_learner(&out.possession_record, &wrong_sid).is_err(),
+            Possessing::restore_secret_learner(
+                &out.possession_record,
+                &wrong_sid,
+                &crate::crypto::storage::platform_secure_key(),
+            )
+            .is_err(),
             "record must not open under a foreign swap_session_id"
         );
     }
@@ -1568,7 +1606,10 @@ mod tests {
                 pre_armed_refund: refund,
                 adaptor_secret: None,
                 lease_dir: Some(lease_dir_sl.path().to_path_buf()),
-                possession_store: Some(store.path().to_path_buf()),
+                possession_store: Some((
+                store.path().to_path_buf(),
+                crate::crypto::storage::platform_secure_key(),
+            )),
                 taproot_root_comp_sh: None,
                 taproot_root_comp_sl: None,
                 taproot_output_comp_sh: None,

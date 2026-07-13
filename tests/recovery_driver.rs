@@ -202,7 +202,10 @@ fn released_swap() -> ReleasedSwap {
             pre_armed_refund: sl_refund,
             adaptor_secret: None,
             lease_dir: Some(lease_sl.path().to_path_buf()),
-            possession_store: Some(possession_store.path().to_path_buf()),
+            possession_store: Some((
+                possession_store.path().to_path_buf(),
+                swapkey::crypto::storage::platform_secure_key(),
+            )),
             taproot_root_comp_sh: Some(root_sh),
             taproot_root_comp_sl: Some(root_sl),
             taproot_output_comp_sh: Some(outkey_sh),
