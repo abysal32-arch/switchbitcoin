@@ -747,19 +747,14 @@ pub fn refund_babysit_step(
         return Ok(Some(rec.phase));
     }
     let tick = RecoveryDriver::reenter_one(engine.store(), &rec, chain)?;
+    // The `Refunded` terminal-advance arm registers the reclaimed settlement
+    // output itself, so babysat and cold-recovered refunds are tracked alike.
     apply_recovery_tick(engine, chain, data_dir, sid, &tick, opts, log)?;
-    let terminal = engine
+    Ok(engine
         .store()
         .get(sid)?
         .map(|r| r.phase)
-        .filter(|p| matches!(p, SwapPhase::Refunded | SwapPhase::Completed));
-    if terminal == Some(SwapPhase::Refunded) && !opts.dry_run {
-        // The refund pays our own SwapDestination key: register the reclaimed
-        // coin so the wallet does not lose sight of it (Fable review).
-        let refund_bytes = rec_refund_bytes(engine, sid)?;
-        register_settlement_output(engine, chain, data_dir, sid, &refund_bytes, log);
-    }
-    Ok(terminal)
+        .filter(|p| matches!(p, SwapPhase::Refunded | SwapPhase::Completed)))
 }
 
 /// Drive OUR broadcast completion to its CONFIRMED terminal — the
@@ -885,7 +880,7 @@ fn register_settlement_output(
 /// * `RewritePending` and driver-reported damage are surfaced as ALARMS via
 ///   `log` — never silently dropped.
 pub fn apply_recovery_tick(
-    engine: &SwapEngine,
+    engine: &mut SwapEngine,
     chain: &impl AuthoritativeChainView,
     data_dir: &Path,
     sid: &[u8; 32],
@@ -907,13 +902,15 @@ pub fn apply_recovery_tick(
             Ok(())
         }
         RecoveryTick::Funding { refund } => match refund {
-            Some(action) => apply_abort_action(engine, chain, sid, *action, opts, log),
+            Some(action) => apply_abort_action(engine, chain, data_dir, sid, *action, opts, log),
             None => {
                 log(format!("{sid_hex}: funding-phase record, nothing locked yet"));
                 Ok(())
             }
         },
-        RecoveryTick::Refund(action) => apply_abort_action(engine, chain, sid, *action, opts, log),
+        RecoveryTick::Refund(action) => {
+            apply_abort_action(engine, chain, data_dir, sid, *action, opts, log)
+        }
         RecoveryTick::RebroadcastSetup { setup_tx } => {
             if opts.dry_run {
                 log(format!("{sid_hex}: dry-run — would re-submit the persisted Setup"));
@@ -925,7 +922,7 @@ pub fn apply_recovery_tick(
         }
         RecoveryTick::Extract { final_sig, fallback } => match final_sig {
             Some(sig) => broadcast_recovered_completion(engine, chain, data_dir, sid, *sig, opts, log),
-            None => apply_abort_action(engine, chain, sid, *fallback, opts, log),
+            None => apply_abort_action(engine, chain, data_dir, sid, *fallback, opts, log),
         },
         RecoveryTick::Rebroadcast { final_sig, confirmed } => {
             if *confirmed {
@@ -940,8 +937,9 @@ pub fn apply_recovery_tick(
 
 /// The caller side of an [`AbortAction`] decision on a persisted record.
 fn apply_abort_action(
-    engine: &SwapEngine,
+    engine: &mut SwapEngine,
     chain: &impl AuthoritativeChainView,
+    data_dir: &Path,
     sid: &[u8; 32],
     action: AbortAction,
     opts: &RunOptions,
@@ -994,6 +992,12 @@ fn apply_abort_action(
             }
             advance_to_refunded(engine, sid)?;
             log(format!("{sid_hex}: refund confirmed on chain — record advanced to Refunded"));
+            // The confirmed refund pays our own SwapDestination key: register
+            // the reclaimed coin HERE (the terminal-advance site), so a
+            // COLD-RECOVERED refund is ledger-tracked too — not only one
+            // babysat by a live swap process (Fable review, HIGH).
+            let refund_bytes = rec_refund_bytes(engine, sid)?;
+            register_settlement_output(engine, chain, data_dir, sid, &refund_bytes, log);
             Ok(())
         }
         AbortAction::Completed => {

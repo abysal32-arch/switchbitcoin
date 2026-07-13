@@ -54,6 +54,24 @@ use swapkey::wallet::SwapApp;
 /// real indices are small).
 const KEY_SCAN_LIMIT: u32 = 10_000;
 
+/// The wall-clock the LEASE-eligibility reads use, by network. REGTEST ONLY:
+/// reads fast-forward +73h so the onboarding decorrelation delay's WALL
+/// anchor (24–72h) is immediately satisfied — on a mine-on-demand chain wall
+/// time carries no decorrelation value, while the HEIGHT anchor (the same
+/// delay in blocks) stays fully load-bearing and must be mined out. Anchor
+/// WRITES (`confirm_split`) always use the real [`SystemClock`], and
+/// testnet keeps real delays (mainnet has no config variant at all).
+struct LeaseClock(Network);
+impl swapkey::wallet::ledger::WalletClock for LeaseClock {
+    fn now_unix(&self) -> u64 {
+        let now = swapkey::wallet::ledger::WalletClock::now_unix(&SystemClock);
+        match self.0 {
+            Network::Regtest => now.saturating_add(73 * 3600),
+            Network::Testnet => now,
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = match run(&args) {
@@ -364,7 +382,7 @@ fn startup_with_alarms(
     let mut sink = |line: String| log(&line);
     for (sid, tick) in &scan.ticks {
         if let Err(e) =
-            apply_recovery_tick(wallet.engine(), chain, &data_dir, sid, tick, opts, &mut sink)
+            apply_recovery_tick(wallet.engine_mut(), chain, &data_dir, sid, tick, opts, &mut sink)
         {
             log(&format!("ALARM: driving recovery tick for {} failed: {e}", hex32(sid)));
         }
@@ -474,6 +492,11 @@ fn write_config_template(flags: &Flags, path: &Path) -> CliResult {
         return Err("--data-dir must not contain a single-quote character".into());
     }
     let port = network.default_rpc_port();
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
     let template = format!(
         "# swapkey.toml — Swap Key pre-alpha wallet (REGTEST/TESTNET only).\n\
          # Strings are quoted; single quotes are literal (Windows paths need no escaping).\n\
@@ -777,7 +800,7 @@ fn cmd_swap(flags: &Flags) -> CliResult {
         &mut transport,
         wallet.engine_mut(),
         &chain,
-        &SystemClock,
+        &LeaseClock(network),
         network,
         &data_dir,
         session_seckey,
@@ -831,7 +854,7 @@ fn cmd_swap(flags: &Flags) -> CliResult {
         // (Fable review): a periodic whole-wallet recovery pass, excluding
         // the live swap (its ticks belong to the app above).
         if iter.is_multiple_of(12) && iter > 0 {
-            recovery_pass(&wallet, &chain, &data_dir, &opts, Some(&sid));
+            recovery_pass(&mut wallet, &chain, &data_dir, &opts, Some(&sid));
         }
         iter += 1;
         std::thread::sleep(poll);
@@ -927,7 +950,7 @@ fn guard_funded_escrow(
 /// used inside long-running loops so OTHER swaps' deadlines are never
 /// starved by the live one. `exclude` skips the live swap's own record.
 fn recovery_pass(
-    wallet: &Wallet,
+    wallet: &mut Wallet,
     chain: &impl AuthoritativeChainView,
     data_dir: &Path,
     opts: &RunOptions,
@@ -940,9 +963,15 @@ fn recovery_pass(
                 if exclude == Some(sid) {
                     continue;
                 }
-                if let Err(e) =
-                    apply_recovery_tick(wallet.engine(), chain, data_dir, sid, tick, opts, &mut sink)
-                {
+                if let Err(e) = apply_recovery_tick(
+                    wallet.engine_mut(),
+                    chain,
+                    data_dir,
+                    sid,
+                    tick,
+                    opts,
+                    &mut sink,
+                ) {
                     log(&format!("recovery tick for {} failed: {e}", hex32(sid)));
                 }
             }
@@ -1308,7 +1337,7 @@ fn begin_swap(
         &mut transport,
         wallet.engine_mut(),
         chain,
-        &SystemClock,
+        &LeaseClock(network),
         network,
         data_dir,
         session_seckey,

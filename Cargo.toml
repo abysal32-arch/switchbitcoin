@@ -71,6 +71,9 @@ required-features = ["bitcoind"]
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
+# The regtest E2E harness (tests/regtest_e2e.rs, #[ignore]) speaks raw
+# JSON-RPC to the bitcoind it spawns; test-only, not a crate dependency.
+serde_json = "1"
 # For the taproot integration test: build escrows + verify completed sigs on the
 # bitcoin (secp256k1 0.29) side. Same version the tx layer uses.
 bitcoin = "0.32"
