@@ -182,6 +182,14 @@ impl WatchtowerDriver {
                     Some(m) if chain.tip_height() >= m => match self.tower.poll(chain) {
                         Ok(true) => Ok(WatchtowerTick::FiredRefund),
                         Ok(false) => Ok(WatchtowerTick::Idle),
+                        // A real-node backend with NO VERDICT (node
+                        // unreachable / unclassified RPC failure) is NOT a
+                        // fee-policy stall: treating an outage as congestion
+                        // would fire the CPFP bump machinery against a chain
+                        // we cannot even reach, leasing/churning reserves
+                        // every tick. Idle — the tower re-polls next tick.
+                        #[cfg(feature = "bitcoind")]
+                        Err(crate::Error::Rpc(_)) => Ok(WatchtowerTick::Idle),
                         // A rejection at/after the CHAIN-DERIVED maturity is a
                         // genuine relay/fee-policy stall (congestion beyond
                         // Δ_fee), not an immaturity artifact — the immature case
@@ -517,6 +525,51 @@ mod tests {
         // Congestion clears: it fires.
         chain.set_congestion(0);
         assert_eq!(driver.tick(&chain, false).unwrap(), WatchtowerTick::FiredRefund);
+    }
+
+    /// bitcoind-backend degraded mode (review finding): a broadcast with NO
+    /// VERDICT (node unreachable ⇒ `Error::Rpc`) must read as Idle-retry, NOT
+    /// as a fee-floor stall — an outage misread as congestion fires the CPFP
+    /// bump machinery (leasing/churning reserves every tick) against a chain
+    /// the wallet cannot even reach.
+    #[cfg(feature = "bitcoind")]
+    #[test]
+    fn node_outage_at_maturity_is_idle_not_a_fee_stall() {
+        /// Reads delegate to a healthy SimChain; broadcast has no verdict.
+        struct OutageChain(SimChain);
+        impl ChainView for OutageChain {
+            fn tip_height(&self) -> u32 {
+                self.0.tip_height()
+            }
+            fn funding_height(&self, outpoint: OutPoint) -> Option<u32> {
+                self.0.funding_height(outpoint)
+            }
+            fn spend_status(&self, outpoint: OutPoint) -> SpendStatus {
+                self.0.spend_status(outpoint)
+            }
+            fn broadcast(&self, _tx_bytes: &[u8]) -> crate::Result<bitcoin::Txid> {
+                Err(crate::Error::Rpc("sendrawtransaction: transport: connection refused".into()))
+            }
+        }
+        impl AuthoritativeChainView for OutageChain {}
+
+        let escrow = op(9);
+        let maturity = 600_144u32;
+        let chain = SimChain::new(600_000);
+        chain.fund_with_amount(escrow, 600_000, 1_000_000);
+        let refund =
+            PreArmedRefund::from_signed_tx(spend_of(escrow, 999_000, Some(144)), maturity).unwrap();
+        let receipt = confirm_watchtower_handoff(&refund, refund.fingerprint()).unwrap();
+        let driver = WatchtowerDriver::arm(refund, escrow, &receipt).unwrap();
+        while chain.tip_height() < maturity {
+            chain.mine();
+        }
+        let outage = OutageChain(chain);
+        assert_eq!(
+            driver.tick(&outage, false).unwrap(),
+            WatchtowerTick::Idle,
+            "an outage is 'no verdict / retry', never a congestion stall"
+        );
     }
 
     /// F2: the fire gate uses the CHAIN-DERIVED maturity (funding height +

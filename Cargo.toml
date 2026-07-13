@@ -37,6 +37,18 @@ aes-gcm = "0.10"                                   # AES-256-GCM AEAD, unique 96
 hkdf = "0.12"                                      # TEK = HKDF-SHA256(platform key, swap_session_id)
 sha2 = "0.10"                                      # HKDF hash
 
+# --- feature "bitcoind" (real-node chain backend; NOT part of the core) ------
+# Gated so the default build (and the windows-gnu test suite) carries no HTTP
+# client. These are transport/serialization only — no curve math (Req 1 holds).
+serde_json = { version = "1", optional = true }                      # JSON-RPC bodies
+ureq = { version = "2", default-features = false, optional = true }  # plain-HTTP RPC to a LOCAL node (no TLS on localhost)
+base64 = { version = "0.22", optional = true }                       # HTTP basic-auth header
+
+[features]
+# Real Bitcoin Core JSON-RPC chain backend (src/chain/bitcoind.rs) for
+# regtest/testnet. Off by default; the runner binary (Task 08) turns it on.
+bitcoind = ["dep:serde_json", "dep:ureq", "dep:base64"]
+
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"

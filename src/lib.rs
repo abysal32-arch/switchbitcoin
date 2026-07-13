@@ -54,6 +54,15 @@ pub enum Error {
     Abort(&'static str),
     #[error("not yet implemented in scaffold: {0}")]
     Unimplemented(&'static str),
+    /// Chain-RPC failure surfaced by the real-node backend (feature
+    /// `bitcoind`). Dynamic because the node's reject reason matters to the
+    /// operator; rejections with SETTLEMENT semantics (fee floor, timelock
+    /// immaturity, conflicting spend) are classified into `Deadline`/`Abort`
+    /// at the backend so drivers keep their SimChain-aligned error classes —
+    /// this variant is only the residual "node said something else" bucket.
+    #[cfg(feature = "bitcoind")]
+    #[error("chain rpc: {0}")]
+    Rpc(String),
 }
 
 pub type Result<T> = core::result::Result<T, Error>;

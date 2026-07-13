@@ -17,6 +17,13 @@
 
 pub mod policy;
 
+/// Real Bitcoin Core JSON-RPC backend (regtest/testnet) — feature `bitcoind`,
+/// so the default build stays dependency-light (no HTTP client).
+#[cfg(feature = "bitcoind")]
+pub mod bitcoind;
+#[cfg(feature = "bitcoind")]
+pub use bitcoind::{BitcoinCoreChainView, HttpTransport, RpcClientError, RpcTransport};
+
 use crate::{Error, Result};
 use bitcoin::relative::LockTime;
 use bitcoin::{OutPoint, ScriptBuf, Transaction, Txid};
