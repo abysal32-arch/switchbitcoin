@@ -1372,7 +1372,7 @@ fn backstop_execute_bumps_a_stalled_refund_autonomously() {
         .unwrap();
 
     // Pre-maturity: nothing to do — the decision passes through untouched.
-    match app.backstop_execute(&mut engine, &chain, 50, None, None).unwrap() {
+    match app.backstop_execute(&mut engine, &chain, 50, false, None, None).unwrap() {
         BackstopRun::Decided(BackstopTick::Idle) => {}
         other => panic!("immature refund must pass through as Decided(Idle), got {other:?}"),
     }
@@ -1384,7 +1384,7 @@ fn backstop_execute_bumps_a_stalled_refund_autonomously() {
         chain.mine();
     }
     let (change_op, child_fee) =
-        match app.backstop_execute(&mut engine, &chain, 50, None, None).unwrap() {
+        match app.backstop_execute(&mut engine, &chain, 50, false, None, None).unwrap() {
             BackstopRun::Executed {
                 decision: BackstopTick::Bump { target: BumpTarget::Refund },
                 outcome:
@@ -1414,7 +1414,7 @@ fn backstop_execute_bumps_a_stalled_refund_autonomously() {
     // Confirm: the refund lands; the loop quiesces (StandDown → Idle).
     chain.mine();
     assert!(matches!(chain.spend_status(our_op), SpendStatus::Confirmed(_)));
-    match app.backstop_execute(&mut engine, &chain, 50, None, None).unwrap() {
+    match app.backstop_execute(&mut engine, &chain, 50, false, None, None).unwrap() {
         BackstopRun::Decided(BackstopTick::Idle) => {}
         other => panic!("a confirmed refund must quiesce, got {other:?}"),
     }
@@ -1537,7 +1537,7 @@ fn backstop_execute_refund_bump_not_starved_by_a_huge_completion_parent() {
         fee_sats: 1,
         vsize_vb: 10_000_000,
     };
-    match f.app.backstop_execute(&mut f.engine, &f.chain, 50, Some(&huge), None).unwrap() {
+    match f.app.backstop_execute(&mut f.engine, &f.chain, 50, false, Some(&huge), None).unwrap() {
         BackstopRun::Executed {
             decision: BackstopTick::Bump { target: BumpTarget::Refund },
             outcome: BumpOutcome::Submitted { reserve_outpoint, .. },
@@ -1560,7 +1560,7 @@ fn backstop_execute_short_circuits_a_futile_zero_fee_bump() {
     let idx_before = f.engine.issue_reserve_key().unwrap().0;
 
     // target_feerate 0 → required_child_fee == 0 → short-circuit.
-    match f.app.backstop_execute(&mut f.engine, &f.chain, 0, None, None).unwrap() {
+    match f.app.backstop_execute(&mut f.engine, &f.chain, 0, false, None, None).unwrap() {
         BackstopRun::Decided(BackstopTick::KeepWaiting) => {}
         other => panic!("a futile bump must be Decided(KeepWaiting), got {other:?}"),
     }
@@ -1648,7 +1648,7 @@ fn backstop_execute_replenishes_the_reserve_pool_mid_session() {
     f.chain.set_congestion(f.refund_fee + 5_000);
 
     // Bump #1 consumes the ONLY provisioned reserve; its change parks pending.
-    let change_op = match f.app.backstop_execute(&mut f.engine, &f.chain, 50, None, None).unwrap() {
+    let change_op = match f.app.backstop_execute(&mut f.engine, &f.chain, 50, false, None, None).unwrap() {
         BackstopRun::Executed {
             decision: BackstopTick::Bump { target: BumpTarget::Refund },
             outcome: BumpOutcome::Submitted { reserve_outpoint, change_outpoint, .. },
@@ -1671,7 +1671,7 @@ fn backstop_execute_replenishes_the_reserve_pool_mid_session() {
     // ITSELF and bump from it.
     let (app2, refund_fee2, _dirs2) = second_record_less_funded_app(&f.engine, &f.chain, 0xF8);
     f.chain.set_congestion(refund_fee2 + 5_000);
-    match app2.backstop_execute(&mut f.engine, &f.chain, 50, None, None).unwrap() {
+    match app2.backstop_execute(&mut f.engine, &f.chain, 50, false, None, None).unwrap() {
         BackstopRun::Executed {
             decision: BackstopTick::Bump { target: BumpTarget::Refund },
             outcome: BumpOutcome::Submitted { reserve_outpoint, .. },

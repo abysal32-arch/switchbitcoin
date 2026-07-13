@@ -522,15 +522,23 @@ impl SwapApp {
     /// `Executed { outcome: NoBump }` with the lease released — the safe
     /// fallback stands and nothing is stranded. A reserve key index issued for
     /// a bump that falls through is skipped, never reused.
+    ///
+    /// `refund_congested` is the caller's observation that an ALREADY-RELAYED
+    /// pre-armed refund pays below the current confirmation floor — the one
+    /// stall the tower cannot detect internally (its own broadcast-time relay
+    /// stall and the unspent-arm fire are internal; see
+    /// [`WatchtowerDriver::tick`]). Without it a mempool-stuck refund reads
+    /// `Idle` forever and the silent refund CPFP never fires.
     pub fn backstop_execute(
         &self,
         engine: &mut SwapEngine,
         chain: &impl AuthoritativeChainView,
         target_feerate_sat_vb: u64,
+        refund_congested: bool,
         stalled_parent: Option<&StalledParent<'_>>,
         consent: Option<LinkageAck>,
     ) -> Result<BackstopRun> {
-        let congested = stalled_parent.is_some();
+        let congested = refund_congested || stalled_parent.is_some();
 
         // Pass 1 — identify the ACTIVE side with the reserve assumed
         // UNAVAILABLE, so the tick's own refund-first priority picks the side

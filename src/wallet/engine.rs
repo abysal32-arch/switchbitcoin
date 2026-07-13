@@ -207,6 +207,55 @@ impl SwapEngine {
         self.ledger.next_reserve_key(self.keys.as_ref())
     }
 
+    /// Issue a fresh deposit address (index + spk) through the ledger —
+    /// borrow-splitting wrapper for callers outside the engine (the runner's
+    /// `address` command), same pattern as [`issue_reserve_key`](Self::issue_reserve_key).
+    pub fn issue_deposit_address(&mut self) -> Result<(u32, bitcoin::ScriptBuf)> {
+        self.ledger.next_deposit_address(self.keys.as_ref())
+    }
+
+    /// Issue a fresh per-swap destination key (index + spk) through the
+    /// ledger (v3.13: fresh, never reused) — borrow-splitting wrapper for the
+    /// runner's pre-swap negotiation.
+    pub fn issue_swap_destination(&mut self) -> Result<(u32, bitcoin::ScriptBuf)> {
+        self.ledger.next_swap_destination(self.keys.as_ref())
+    }
+
+    /// Register a confirmed deposit through the ledger — borrow-splitting
+    /// wrapper over [`Ledger::register_deposit`](crate::wallet::ledger::Ledger::register_deposit)
+    /// (the ledger call also needs this engine's key source).
+    pub fn register_deposit(
+        &mut self,
+        outpoint: OutPoint,
+        amount_sats: u64,
+        confirmed_height: u32,
+        key_index: u32,
+        deposit_spk: &bitcoin::ScriptBuf,
+        first_deposit_ack: Option<crate::wallet::ledger::Phase0Ack>,
+    ) -> Result<()> {
+        self.ledger.register_deposit(
+            outpoint,
+            amount_sats,
+            confirmed_height,
+            key_index,
+            deposit_spk,
+            self.keys.as_ref(),
+            first_deposit_ack,
+        )
+    }
+
+    /// Build + persist the onboarding split of a registered deposit —
+    /// borrow-splitting wrapper over
+    /// [`Ledger::split_deposit`](crate::wallet::ledger::Ledger::split_deposit).
+    pub fn split_deposit(
+        &mut self,
+        deposit: OutPoint,
+        params: &crate::settlement::params::Params,
+        fee_sats: u64,
+    ) -> Result<crate::wallet::ledger::SplitPlan> {
+        self.ledger.split_deposit(deposit, params, fee_sats, self.keys.as_ref())
+    }
+
     /// Chain-aware reserve reconciliation — run at startup (after `open`) with
     /// the authoritative chain to sweep any phantom Reserve coin already spent
     /// on chain but still counted spendable (a crash in a prior bump's

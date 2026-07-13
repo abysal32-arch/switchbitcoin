@@ -49,11 +49,24 @@ pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 serde_json = { version = "1", optional = true }                      # JSON-RPC bodies
 ureq = { version = "2", default-features = false, optional = true }  # plain-HTTP RPC to a LOCAL node (no TLS on localhost)
 base64 = { version = "0.22", optional = true }                       # HTTP basic-auth header
+# NFC normalization of user-TYPED wallet passphrases at the binary's input
+# boundary (Task 07 contract: `Wallet::open` receives the normalized form so
+# the same visual passphrase always unseals the keystore across OSes/IMEs).
+# Pure Rust tables, no crypto — Req 1 untouched. Binary-only (Task 08).
+unicode-normalization = { version = "0.1", optional = true }
 
 [features]
 # Real Bitcoin Core JSON-RPC chain backend (src/chain/bitcoind.rs) for
 # regtest/testnet. Off by default; the runner binary (Task 08) turns it on.
-bitcoind = ["dep:serde_json", "dep:ureq", "dep:base64"]
+bitcoind = ["dep:serde_json", "dep:ureq", "dep:base64", "dep:unicode-normalization"]
+
+# The runnable wallet (Task 08). required-features keeps the default
+# windows-gnu suite HTTP-client-free: `cargo test` never builds the binary;
+# build/run it with `--features bitcoind`.
+[[bin]]
+name = "swapkey-cli"
+path = "src/bin/swapkey-cli.rs"
+required-features = ["bitcoind"]
 
 [dev-dependencies]
 proptest = "1"

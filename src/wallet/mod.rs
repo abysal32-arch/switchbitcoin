@@ -96,6 +96,7 @@ pub mod ledger;
 pub mod manifest;
 pub mod orchestrator;
 pub mod recovery_driver;
+pub mod runner;
 pub mod store;
 pub mod transport;
 
@@ -114,6 +115,10 @@ pub use config::{
     ConfigError, Network, NodeRpcConfig, PeerConfig, RpcAuth, Secret, WalletConfig, CONFIG_FILE,
 };
 pub use keystore::SoftwareKeyStore;
+pub use runner::{
+    negotiate_swap, NegotiatedSwap, RunOptions, SwapArtifacts, SwapOutcome, SwapRunState,
+    SwapStepOutcome,
+};
 pub use runtime::{FirstRun, FirstRunError, OpenedWallet, Wallet};
 pub use store::{EnclaveKeyProvider, ModeledEnclave, RecoveryAction, SwapPhase, SwapRecord, SwapStore};
 pub use transport::{TcpTransport, DEFAULT_IO_TIMEOUT, MAX_FRAME};
