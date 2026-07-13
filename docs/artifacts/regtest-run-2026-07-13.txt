@@ -1,0 +1,45 @@
+Swap Key pre-alpha — Task 11 LIVE REGTEST VALIDATION evidence
+Date: 2026-07-13
+Node: Bitcoin Core daemon version v29.4.0 (win64, bitcoin-29.4-win64.zip)
+Zip SHA256: 31e03b841bf2bbe711cf0179d3466678989fcbd46e5ef9bef957a20fa32e0e42 (matches bitcoincore.org SHA256SUMS)
+Binary: tools/bitcoin-29.4/bin/bitcoind.exe (BITCOIND_EXE)
+Crate HEAD at run time: 6f6552d (Task 10)
+
+Command:
+  cargo test --features bitcoind --test regtest_e2e -- --ignored --nocapture --test-threads 1
+
+=== HARNESS OUTPUT (first live execution — unedited) ===
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.34s
+     Running tests\regtest_e2e.rs (target\debug\deps\regtest_e2e-3dae9b6d956f9558.exe)
+
+running 3 tests
+test e2e_crash_recovery_reenters_from_the_store ... ok
+test e2e_dead_peer_routes_to_refund ... ok
+test e2e_happy_path_swap_completes ... attempt 0: convention mismatch, closed via refunds; retrying
+ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 625.10s
+
+
+=== bitcoin-cli getblockchaininfo (from the manual §2 walkthrough node, same binary) ===
+=== evidence: node info ===
+Bitcoin Core daemon version v29.4.0
+{
+  "chain": "regtest",
+  "blocks": 1249,
+  "headers": 1249,
+  "bestblockhash": "01d88395b04e7aeba561b204cace824e2bceecde8f4bff32efb28ec5a31f8b4c",
+  "bits": "207fffff",
+  "target": "7fffff0000000000000000000000000000000000000000000000000000000000",
+  "difficulty": 4.656542373906925e-10,
+  "time": 1783968864,
+  "mediantime": 1783968859,
+  "verificationprogress": 1,
+  "initialblockdownload": false,
+  "chainwork": "00000000000000000000000000000000000000000000000000000000000009c4",
+  "size_on_disk": 377467,
+  "pruned": false,
+  "warnings": [
+  ]
+}
+MANUAL-RUN SUCCESS

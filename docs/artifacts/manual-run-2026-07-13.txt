@@ -1,0 +1,87 @@
+=== runbook §2.1: node ===
+node up; miner=bcrt1q0pxh9ha26marxs3hvh79vj22v95nxtayhcz0fw
+=== runbook §2.2: walletA init ===
+[swapkey] wrote config template C:/Users/Joe/AppData/Local/Temp/claude/C--Users-Joe-Desktop-swap-key/5de1184e-46b4-48ad-9d51-3941cd48661a/scratchpad/manual-run/walletA/swapkey.toml
+
+=== RECOVERY MNEMONIC (write it down now) ===
+waste uphold evoke dawn quantum track cable gauge sweet clump stock rice fetch wonder unable agent mask fold extend dose universe potato expose twice
+=============================================
+[swapkey] WARNING: --skip-backup-verification waives the retype check; if you did
+[swapkey]          not back up the words above, this wallet is unrecoverable.
+
+=== PHASE-0 WARNING ===
+Warning: Before you send Bitcoin to Swap Key, move it to a fresh address first. If it came from a KYC'd exchange or any service that knows your identity, send it to a brand-new self-custodied address you control before depositing here. Swap Key protects your history from the moment your Bitcoin arrives; it cannot erase provenance that already exists on-chain before you arrive. One clean transaction to a wallet you control, wait for confirmation, then deposit.
+=======================
+[swapkey] phase-0 warning acknowledged via --accept-phase0
+[swapkey] wallet created
+network:  regtest
+data dir: C:/Users/Joe/AppData/Local/Temp/claude/C--Users-Joe-Desktop-swap-key/5de1184e-46b4-48ad-9d51-3941cd48661a/scratchpad/manual-run/walletA/data
+params:   tier D 1000000 sats | escrow 1003560 sats | pre-encumbrance unit 1005000 sats
+coins:    none — get an address (`address`) and onboard a deposit
+reserve:  NONE (backstop inert)
+swaps:    none
+[walletA] deposit address (key index 0): bcrt1pshutx7ufhcylvyxqguapcf0v8mvquu7shmtk9gtynvmnms4mpdmsrfvnp9
+[walletA] funded: 3a99c9abc3e0a961732a35a498f333d119f395fddb7159cc1528600aada30fa5:1
+=== runbook §2.2: walletA onboard (mining while it waits) ===
+[swapkey] split broadcast: 9c4b1148156b2dd927a0d7a3be3701599620111ae83275b04a4024a5cd739972
+[swapkey] split confirmed at height 109; onboarding delays anchored
+[swapkey] coins become leasable after their decorrelation delay (24-72h wall clock) — check `status`
+[walletA] onboarded: pre-encumbrance minted, reserve leasable
+=== runbook §2.2: walletB init ===
+[swapkey] wrote config template C:/Users/Joe/AppData/Local/Temp/claude/C--Users-Joe-Desktop-swap-key/5de1184e-46b4-48ad-9d51-3941cd48661a/scratchpad/manual-run/walletB/swapkey.toml
+
+=== RECOVERY MNEMONIC (write it down now) ===
+include keep genuine theory smooth finish shaft solid kick hole until diary memory museum silver tongue leopard snow check stick mixture plug build tragic
+=============================================
+[swapkey] WARNING: --skip-backup-verification waives the retype check; if you did
+[swapkey]          not back up the words above, this wallet is unrecoverable.
+
+=== PHASE-0 WARNING ===
+Warning: Before you send Bitcoin to Swap Key, move it to a fresh address first. If it came from a KYC'd exchange or any service that knows your identity, send it to a brand-new self-custodied address you control before depositing here. Swap Key protects your history from the moment your Bitcoin arrives; it cannot erase provenance that already exists on-chain before you arrive. One clean transaction to a wallet you control, wait for confirmation, then deposit.
+=======================
+[swapkey] phase-0 warning acknowledged via --accept-phase0
+[swapkey] wallet created
+network:  regtest
+data dir: C:/Users/Joe/AppData/Local/Temp/claude/C--Users-Joe-Desktop-swap-key/5de1184e-46b4-48ad-9d51-3941cd48661a/scratchpad/manual-run/walletB/data
+params:   tier D 1000000 sats | escrow 1003560 sats | pre-encumbrance unit 1005000 sats
+coins:    none — get an address (`address`) and onboard a deposit
+reserve:  NONE (backstop inert)
+swaps:    none
+[walletB] deposit address (key index 0): bcrt1pp527460n92x35h40lx44vxsdlepxnpyz5ecql4wnuyaaxed3uhvs0adna5
+[walletB] funded: 2d0f1d16e33048621e41bfee3e81575929d1d8ba4557f63c11e363dc2f980102:1
+=== runbook §2.2: walletB onboard (mining while it waits) ===
+[swapkey] split broadcast: 7d8750073c08c7dcb452599a73a50cd96e9f59c2b193b9864c08f448ebf7c5d1
+[swapkey] split confirmed at height 558; onboarding delays anchored
+[swapkey] coins become leasable after their decorrelation delay (24-72h wall clock) — check `status`
+[walletB] onboarded: pre-encumbrance minted, reserve leasable
+=== runbook §2.3: happy path (two terminals + miner loop) ===
+attempt 0: role<->CSV convention mismatch, closed via refunds on both sides; retrying (runbook: 'run it again')
+attempt 1: SWAP COMPLETED on both sides
+/c/Users/Joe/AppData/Local/Temp/claude/C--Users-Joe-Desktop-swap-key/5de1184e-46b4-48ad-9d51-3941cd48661a/scratchpad/manual-run/walletA/swap-1.log:[swapkey] a1c38644b93cdf413a72121be15b17ddf5794afb17968fc7b6eee1e57ded6f96: settlement output f066f73c71639e66b6942d42f8470cefa97395be8d90e82a4dc50d0c223ca183:0 registered (1000000 sats)
+/c/Users/Joe/AppData/Local/Temp/claude/C--Users-Joe-Desktop-swap-key/5de1184e-46b4-48ad-9d51-3941cd48661a/scratchpad/manual-run/walletA/swap-1.log:[swapkey] SWAP COMPLETED — our completion is confirmed on chain
+/c/Users/Joe/AppData/Local/Temp/claude/C--Users-Joe-Desktop-swap-key/5de1184e-46b4-48ad-9d51-3941cd48661a/scratchpad/manual-run/walletB/swap-1.log:[swapkey] a1c38644b93cdf413a72121be15b17ddf5794afb17968fc7b6eee1e57ded6f96: settlement output 07684d60da34724ae761ec245718686603580543788f8f8d2e40b7e84ce1407c:0 registered (1000000 sats)
+/c/Users/Joe/AppData/Local/Temp/claude/C--Users-Joe-Desktop-swap-key/5de1184e-46b4-48ad-9d51-3941cd48661a/scratchpad/manual-run/walletB/swap-1.log:[swapkey] SWAP COMPLETED — our completion is confirmed on chain
+=== final wallet status ===
+[walletA] OK: Swapped/Unspent tracked, record Completed
+[walletB] OK: Swapped/Unspent tracked, record Completed
+=== evidence: node info ===
+Bitcoin Core daemon version v29.4.0
+{
+  "chain": "regtest",
+  "blocks": 1249,
+  "headers": 1249,
+  "bestblockhash": "01d88395b04e7aeba561b204cace824e2bceecde8f4bff32efb28ec5a31f8b4c",
+  "bits": "207fffff",
+  "target": "7fffff0000000000000000000000000000000000000000000000000000000000",
+  "difficulty": 4.656542373906925e-10,
+  "time": 1783968864,
+  "mediantime": 1783968859,
+  "verificationprogress": 1,
+  "initialblockdownload": false,
+  "chainwork": "00000000000000000000000000000000000000000000000000000000000009c4",
+  "size_on_disk": 377467,
+  "pruned": false,
+  "warnings": [
+  ]
+}
+MANUAL-RUN SUCCESS
