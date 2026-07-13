@@ -1,0 +1,47 @@
+Role↔CSV interim-convention refund-rate measurement — evidence (Task 12, 2026-07-13)
+Companion to docs/role-csv-precommitment.md §11. Bitcoin Core v29.4.0 regtest,
+two real swapkey-cli processes per attempt (the Task-10/11 harness machinery).
+
+== SimChain, large-N (tests/runner.rs::measure_role_csv_refund_rate) ==
+cargo test --test runner measure_role_csv_refund_rate -- --ignored --nocapture
+N = 32 (default; env SWAPKEY_RATE_ATTEMPTS)
+
+ROLE-CSV RATE (SimChain): completed 18/32 (56.2%), refunded 14/32, prediction-mismatches 0
+ROLE-CSV BOUND (SimChain): |completed - N/2| = 2.00, allowed <= 1.5*sqrt(N) = 8.49
+test result: ok (38.34s)
+
+Per-attempt STRONG property held 32/32: the outcome equaled the seed-bit
+prediction every time (every refund was exactly a convention mismatch; the
+convention is a fair coin, not worse), and every attempt closed
+forward-or-refund on both sides with the settlement output ledger-registered.
+
+== Live regtest (tests/regtest_e2e.rs::e2e_measure_refund_rate) ==
+BITCOIND_EXE=<...>/tools/bitcoin-29.4/bin/bitcoind.exe \
+cargo test --features bitcoind --test regtest_e2e e2e_measure_refund_rate -- \
+  --ignored --nocapture --test-threads 1
+
+Run 1, N = 4 (SWAPKEY_RATE_ATTEMPTS=4):
+ROLE-CSV attempt 1/4 (regtest): completed
+ROLE-CSV attempt 2/4 (regtest): completed
+ROLE-CSV attempt 3/4 (regtest): completed
+ROLE-CSV attempt 4/4 (regtest): completed
+ROLE-CSV RATE (regtest): completed 4/4 (100.0%), refunded 0/4
+test result: ok. 1 passed; 0 failed (195.25s)
+
+Run 2, N = 8 (SWAPKEY_RATE_ATTEMPTS=8):
+ROLE-CSV attempt 1/8 (regtest): completed
+ROLE-CSV attempt 2/8 (regtest): refunded
+ROLE-CSV attempt 3/8 (regtest): completed
+ROLE-CSV attempt 4/8 (regtest): refunded
+ROLE-CSV attempt 5/8 (regtest): refunded
+ROLE-CSV attempt 6/8 (regtest): refunded
+ROLE-CSV attempt 7/8 (regtest): completed
+ROLE-CSV attempt 8/8 (regtest): refunded
+ROLE-CSV RATE (regtest): completed 3/8 (37.5%), refunded 5/8
+test result: ok. 1 passed; 0 failed (784.71s)
+
+Dedicated live totals: 7/12 completed (58.3%), 5/12 refunded; every attempt
+(including all 5 refunds) closed forward-or-refund per the test's assertions.
+With Task-11's prior live evidence (2/4, docs/artifacts/regtest-run-2026-07-13.txt
+and manual-run-2026-07-13.txt): 9/16 live attempts completed (56.3%).
+All observations consistent with the seed-bit's predicted p = 1/2.

@@ -394,6 +394,23 @@ fn run_attempt(node: &Node, a: &Wallet, b: &Wallet, peer_port: u16) -> (String, 
     (read_log(&log_a), read_log(&log_b))
 }
 
+/// Classify one attempt's terminal from the two swap logs: `Some(true)` = both
+/// sides COMPLETED, `Some(false)` = both REFUNDED (the role↔CSV convention
+/// mismatch, by design), `None` = neither — a forward-or-refund VIOLATION the
+/// caller must reject. Mirrors the happy-path proof's log predicates.
+fn attempt_terminal(la: &str, lb: &str) -> Option<bool> {
+    let both_completed = la.contains("SWAP COMPLETED") && lb.contains("SWAP COMPLETED");
+    let both_refunded =
+        la.contains("refund path resolved") && lb.contains("refund path resolved");
+    if both_completed {
+        Some(true)
+    } else if both_refunded {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 // ---------------------------------------------------------------------------
 // the three E2E proofs
 // ---------------------------------------------------------------------------
@@ -555,4 +572,61 @@ fn e2e_crash_recovery_reenters_from_the_store() {
         );
         std::thread::sleep(Duration::from_secs(2));
     }
+}
+
+// ---------------------------------------------------------------------------
+// role↔CSV refund-rate measurement (Deliverable B)
+// ---------------------------------------------------------------------------
+
+/// Live analogue of `runner::measure_role_csv_refund_rate`: run EXACTLY N
+/// attempts of the A-listen/B-connect flow (env `SWAPKEY_RATE_ATTEMPTS`,
+/// default 4 — live attempts are minutes each) WITHOUT stopping at the first
+/// completion, record each terminal, and print a machine-greppable summary.
+///
+/// No statistical bound (N is small); the test passes iff EVERY attempt closes
+/// forward-or-refund — the same per-attempt assertion the happy-path proof
+/// makes for its non-completing attempts.
+#[test]
+#[ignore = "needs bitcoind; N-attempt role↔CSV refund-rate measurement (SWAPKEY_RATE_ATTEMPTS, default 4)"]
+fn e2e_measure_refund_rate() {
+    let n: u16 = std::env::var("SWAPKEY_RATE_ATTEMPTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(4);
+
+    let node = Node::start(28873, 28874);
+    let a = Wallet::create("A", 28873);
+    let b = Wallet::create("B", 28873);
+    // One pre-encumbrance unit per attempt (unit = D + Δfee = 0.01005 BTC) plus
+    // the one-time CPFP reserve + split headroom; the convention refunds ~half,
+    // so every attempt consumes a fresh unit and none are reused.
+    let units_btc = 0.0115 * f64::from(n) + 0.02;
+    provision(&node, &a, units_btc);
+    provision(&node, &b, units_btc);
+
+    let mut completed = 0u16;
+    for attempt in 0..n {
+        let (la, lb) = run_attempt(&node, &a, &b, 29300 + attempt);
+        let terminal = attempt_terminal(&la, &lb);
+        assert!(
+            terminal.is_some(),
+            "attempt {attempt} must close forward-or-refund on BOTH sides\nA:\n{la}\nB:\n{lb}"
+        );
+        let done = terminal == Some(true);
+        if done {
+            completed += 1;
+        }
+        eprintln!(
+            "ROLE-CSV attempt {}/{n} (regtest): {}",
+            attempt + 1,
+            if done { "completed" } else { "refunded" }
+        );
+    }
+
+    let refunded = n - completed;
+    let pct = 100.0 * f64::from(completed) / f64::from(n);
+    println!(
+        "ROLE-CSV RATE (regtest): completed {completed}/{n} ({pct:.1}%), refunded {refunded}/{n}"
+    );
 }

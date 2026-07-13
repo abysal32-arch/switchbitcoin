@@ -650,8 +650,32 @@ fn run_party(
     })
 }
 
-#[test]
-fn negotiate_swap_two_parties_agree_and_close_forward_or_refund() {
+/// The per-attempt outcome of the two-party negotiate→swap flow: the branch
+/// predictor and the terminal it produced, plus the forward-or-refund closure
+/// facts the flow asserts on chain. Returned by [`run_role_csv_attempt`].
+struct AttemptFacts {
+    /// The interim convention (A = smaller session pubkey = presumed
+    /// SecretLearner) matched the POST-CONFIRMATION derived role — the branch
+    /// predictor for which terminal is CORRECT.
+    predicted_match: bool,
+    /// Both parties reached `SwapOutcome::Completed` (else both `Refunding`).
+    completed: bool,
+    /// Both escrows were swept/reclaimed on chain (completions or refunds).
+    escrows_closed: bool,
+    /// Both ledgers registered the received `Swapped` coin.
+    swapped_registered: bool,
+}
+
+/// ONE attempt of the shared two-party flow: two independent wallets, each with
+/// one REAL onboarded coin, negotiate over a duplex transport and run the swap
+/// end to end against a fresh shared `SimChain`. Asserts cross-side agreement,
+/// the strong outcome==prediction property (the deferred role↔CSV stop-gate
+/// decides which terminal is CORRECT), and forward-or-refund closure — then
+/// returns the facts.
+///
+/// Fresh tempdirs, fresh onboarded coins, and fresh random session keys make
+/// each call independent, so `measure_role_csv_refund_rate` can run N of them.
+fn run_role_csv_attempt() -> AttemptFacts {
     let params = Params::testnet_provisional();
     let base = 500_000u32;
     let chain = SimChain::new(base);
@@ -717,6 +741,8 @@ fn negotiate_swap_two_parties_agree_and_close_forward_or_refund() {
         derived_role(&chain, &params, ra.our_escrow_op, ra.their_escrow_op, &ra.our_pk, &rb.our_pk);
     let a_is_smaller = vp(&ra.our_pk).to_bytes() < vp(&rb.our_pk).to_bytes();
     let convention_matched = (role_a == Role::SecretLearner) == a_is_smaller;
+    let completed = matches!(ra.outcome, SwapOutcome::Completed { .. })
+        && matches!(rb.outcome, SwapOutcome::Completed { .. });
 
     if convention_matched {
         assert!(
@@ -748,6 +774,95 @@ fn negotiate_swap_two_parties_agree_and_close_forward_or_refund() {
     // terminal must have REGISTERED the received coin in each ledger.
     assert!(ra.has_swapped_coin, "A's settlement output must be ledger-tracked");
     assert!(rb.has_swapped_coin, "B's settlement output must be ledger-tracked");
+
+    let escrows_closed = matches!(chain.spend_status(ra.our_escrow_op), SpendStatus::Confirmed(_))
+        && matches!(chain.spend_status(rb.our_escrow_op), SpendStatus::Confirmed(_));
+    let swapped_registered = ra.has_swapped_coin && rb.has_swapped_coin;
+    AttemptFacts {
+        predicted_match: convention_matched,
+        completed,
+        escrows_closed,
+        swapped_registered,
+    }
+}
+
+#[test]
+fn negotiate_swap_two_parties_agree_and_close_forward_or_refund() {
+    // One attempt of the shared flow; the helper makes every assertion this
+    // test always made (cross-side agreement, outcome==prediction, and forward-
+    // or-refund closure). `measure_role_csv_refund_rate` runs N of these.
+    run_role_csv_attempt();
+}
+
+/// N-attempt empirical measurement of the role↔CSV refund rate: run the SAME
+/// two-wallet flow N times (env `SWAPKEY_RATE_ATTEMPTS`, default 32), tally the
+/// completed/refunded split, and print a machine-greppable summary. Ignored by
+/// default (minutes of wall clock — each refund attempt mines 216+ SimChain
+/// blocks at the 10 ms miner tick). Run with:
+///   cargo test --test runner measure_role_csv_refund_rate -- --ignored --nocapture
+#[test]
+#[ignore = "N-attempt role↔CSV refund-rate measurement; run with --ignored --nocapture"]
+fn measure_role_csv_refund_rate() {
+    let n: usize = std::env::var("SWAPKEY_RATE_ATTEMPTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(32);
+
+    let mut completed = 0usize;
+    let mut mismatches = 0usize;
+    for attempt in 0..n {
+        let facts = run_role_csv_attempt();
+        // The strong property: the terminal MUST equal the convention predictor
+        // (predicted_match ⇒ both Completed; !predicted_match ⇒ both Refunding).
+        // run_role_csv_attempt already asserts this; count here too so the tally
+        // printed below is a real number, not a tautology.
+        if facts.completed != facts.predicted_match {
+            mismatches += 1;
+        }
+        assert_eq!(
+            facts.completed, facts.predicted_match,
+            "attempt {attempt}: terminal (completed={}) disagreed with the convention \
+             prediction (match={})",
+            facts.completed, facts.predicted_match
+        );
+        // Forward-or-refund closure — the same facts the existing test asserts.
+        assert!(facts.escrows_closed, "attempt {attempt}: both escrows must close on chain");
+        assert!(
+            facts.swapped_registered,
+            "attempt {attempt}: both ledgers must register the Swapped coin"
+        );
+        if facts.completed {
+            completed += 1;
+        }
+        eprintln!(
+            "ROLE-CSV attempt {}/{n}: {} (predicted {})",
+            attempt + 1,
+            if facts.completed { "completed" } else { "refunded" },
+            if facts.predicted_match { "completed" } else { "refunded" },
+        );
+    }
+
+    let refunded = n - completed;
+    let pct = 100.0 * completed as f64 / n as f64;
+    // 3σ sanity bound around the p=0.5 expectation — catches a broken-coin
+    // regression that would skew the split, NOT a substitute for the per-attempt
+    // prediction assertion above (that is the strong check).
+    let bound = 1.5 * (n as f64).sqrt();
+    let deviation = (completed as f64 - n as f64 / 2.0).abs();
+    println!(
+        "ROLE-CSV RATE (SimChain): completed {completed}/{n} ({pct:.1}%), refunded {refunded}/{n}, \
+         prediction-mismatches {mismatches}"
+    );
+    println!(
+        "ROLE-CSV BOUND (SimChain): |completed - N/2| = {deviation:.2}, allowed <= 1.5*sqrt(N) = {bound:.2}"
+    );
+    assert_eq!(mismatches, 0, "every attempt's terminal must equal its convention prediction");
+    assert!(
+        deviation <= bound,
+        "completed {completed}/{n} deviates {deviation:.2} from N/2, exceeding the ~3σ bound \
+         {bound:.2} (suspect a broken-coin regression, not the p=0.5 role split)"
+    );
 }
 
 // ============================================================================
