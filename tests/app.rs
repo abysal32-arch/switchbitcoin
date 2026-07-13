@@ -353,7 +353,7 @@ fn swap_app_runs_a_full_swap_to_completed() {
                         // fall through to re-poll
                     }
                 }
-                AppTick::Completed { our_final_sig } => {
+                AppTick::Completed { our_final_sig, .. } => {
                     settled = Some(our_final_sig);
                     break;
                 }
@@ -369,7 +369,7 @@ fn swap_app_runs_a_full_swap_to_completed() {
         if settled.is_none() {
             for _ in 0..6 {
                 match app.poll(&mut engine, &chain).unwrap() {
-                    AppTick::Completed { our_final_sig } => {
+                    AppTick::Completed { our_final_sig, .. } => {
                         settled = Some(our_final_sig);
                         break;
                     }

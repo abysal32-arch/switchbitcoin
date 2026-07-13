@@ -48,6 +48,7 @@ use crate::tx::escrow::Escrow;
 use crate::tx::setup::{build_setup, pre_encumbrance_spk};
 use crate::tx::txbuild::{build_completion, finalize_key_spend, SpendTx};
 use crate::wallet::app::{AppTick, BackstopRun, SwapApp};
+use crate::wallet::claim_scheduler::{ClaimBroadcast, ClaimScheduler};
 use crate::wallet::config::Network;
 use crate::wallet::engine::{SwapContext, SwapEngine};
 use crate::wallet::keys::{KeyPurpose, KeySource};
@@ -227,6 +228,9 @@ pub struct SwapArtifacts {
 pub struct SwapRunState {
     pub setup_on_wire: bool,
     record_confirm_pending: bool,
+    /// Once-only latch for the "posture hold begun" log line, so a multi-block
+    /// hold logs its reveal/delay/target ONCE, not on every held poll.
+    hold_announced: bool,
 }
 
 impl SwapRunState {
@@ -567,6 +571,43 @@ pub enum SwapOutcome {
 pub enum SwapStepOutcome {
     /// Non-terminal; the tick is surfaced for logging/cadence decisions.
     Continue(AppTick),
+    /// Non-terminal: OUR SL claim is finalized and PERSISTED (the record is
+    /// already `Completed`), but the broadcast is being HELD for the privacy
+    /// posture until the chain tip reaches `broadcast_at_height`. Keep polling
+    /// — and keep [`backstop_step`] running throughout the hold: it
+    /// independently guards every refund deadline the whole time.
+    ///
+    /// SAFETY-PROOF (Task 13 — why holding the SL claim broadcast is safe):
+    ///
+    /// (a) BOUNDED DELAY. `broadcast_at_height = reveal + delay` with
+    ///     `delay ≤ Possessing::claim_delay_ceiling(reveal) =
+    ///     Params::max_claim_delay(sweep_escrow_height, reveal)`, whose budget
+    ///     ends at `sweep_escrow_height + delta_late − claim_confirm_allowance
+    ///     − 1` — STRICTLY before the swept escrow's late refund matures
+    ///     (`sweep_escrow_height + delta_late`), minus the confirm allowance.
+    ///     So even the maximum posture leaves the claim confirmable before the
+    ///     race opens. The clamp anchors to the SWEPT escrow's OWN funding
+    ///     height (not the co-funding baseline S), which is the adversary-proof
+    ///     bound; the manifest validator's window is looser (in-code
+    ///     CRYPTOGRAPHER REVIEW ITEM #5), so it is the RUNTIME clamp in
+    ///     `schedule_claim` that binds — and it already did, before this hold
+    ///     ever sees the schedule.
+    ///
+    /// (b) REFUNDS ARE GUARDED INDEPENDENTLY. The hold delays only OUR sweep of
+    ///     the counterparty escrow. Every refund deadline — ours and the
+    ///     dead-device tower's — is guarded by `backstop_step`, which callers
+    ///     keep running during the hold; the hold never delays a refund.
+    ///
+    /// (c) CRASH DEGRADES TO IMMEDIATE, NEVER UNSAFE. A crash mid-hold is
+    ///     re-entered by recovery as an immediate rebroadcast (the record is
+    ///     already `Completed`, so `RecoveryDriver` rebuilds+broadcasts at
+    ///     once). Privacy decorrelation degrades; forward-or-refund does not.
+    ///
+    /// (d) A RACE ABANDONS THE HOLD. A foreign spend racing the swept escrow
+    ///     during the hold abandons the hold and fights immediately (by fee); a
+    ///     foreign CONFIRMED spend surfaces as a loud LOSS (`Err`), never a
+    ///     success.
+    Holding { broadcast_at_height: u32 },
     Done(SwapOutcome),
 }
 
@@ -575,9 +616,15 @@ pub enum SwapStepOutcome {
 ///
 /// * `BroadcastSetup` → broadcast our signed Setup (idempotent), then confirm
 ///   via [`SwapApp::setup_broadcast`] so the early `Funding` record persists.
-/// * `Completed` → finalize OUR completion (the record's `completion_tx` when
-///   persisted, else the role-matching template + returned signature) and
-///   broadcast it.
+/// * `Completed` → finalize OUR completion (the role-matching template + the
+///   returned signature) and broadcast it — UNLESS the tick carries a
+///   `claim_hold` (a fresh SL claim) and the tip has not yet reached its
+///   `broadcast_at_height`: then the broadcast is HELD (returns
+///   [`SwapStepOutcome::Holding`]) for the privacy posture, and a foreign spend
+///   racing the swept escrow abandons the hold to fight immediately.
+/// * `Holding` → the SL claim is finalized+persisted but its broadcast is being
+///   held for the posture delay; keep polling (and keep `backstop_step`
+///   running — it guards every refund deadline throughout the hold).
 /// * `Refunding` / `Aborted` → surfaced as terminals; the refund babysit loop
 ///   owns everything after `Refunding`.
 /// * `Wait` / `AwaitingVerification` / `AwaitingReveal` → `Continue`.
@@ -653,7 +700,7 @@ pub fn swap_step(
             }
             Ok(SwapStepOutcome::Continue(tick))
         }
-        AppTick::Completed { our_final_sig } => {
+        AppTick::Completed { our_final_sig, claim_hold } => {
             // The record's `completion_tx` holds the 64-byte FINAL SIGNATURE
             // (the spender-attribution artifact), not broadcastable bytes —
             // the full tx is template + signature (the engine boundary keeps
@@ -666,6 +713,84 @@ pub fn swap_step(
                 Role::SecretHolder => artifacts.comp_sh.clone(),
                 Role::SecretLearner => artifacts.comp_sl.clone(),
             };
+            // Capture the swept escrow's outpoint BEFORE `finalize_key_spend`
+            // consumes the template — the hold poll below watches it for a
+            // foreign spend racing us. A template with no input is malformed.
+            let swept_op = template
+                .tx
+                .input
+                .first()
+                .map(|i| i.previous_output)
+                .ok_or(Error::Validation("completion template has no input to sweep"))?;
+
+            // SL claim-delay privacy posture: a fresh SL settle asks us to HOLD
+            // the broadcast until `broadcast_at_height` (already ceiling-clamped
+            // by the engine — see `SwapStepOutcome::Holding`'s SAFETY-PROOF).
+            if let Some(hold) = claim_hold {
+                if opts.dry_run {
+                    log(format!(
+                        "dry-run: would hold the claim until height {}",
+                        hold.broadcast_at_height
+                    ));
+                } else {
+                    // Rebuild the schedule (the 64-byte sig rode the tick) and
+                    // poll the scheduler against the swept escrow.
+                    let schedule = hold.into_schedule(our_final_sig);
+                    match ClaimScheduler::next_broadcast(chain, swept_op, &schedule, None) {
+                        ClaimBroadcast::Wait => {
+                            if !state.hold_announced {
+                                state.hold_announced = true;
+                                log(format!(
+                                    "claim-delay posture hold: reveal at height {}, sampled delay \
+                                     {} blocks, broadcasting at height {} (the runtime ceiling \
+                                     clamp already bounded this delay)",
+                                    hold.reveal_height, hold.delay_blocks, hold.broadcast_at_height
+                                ));
+                            }
+                            return Ok(SwapStepOutcome::Holding {
+                                broadcast_at_height: hold.broadcast_at_height,
+                            });
+                        }
+                        ClaimBroadcast::Broadcast => {
+                            if chain.tip_height() < hold.broadcast_at_height {
+                                // A foreign spend (SH's late refund) is racing
+                                // the swept escrow before our hold elapsed: the
+                                // hold is a privacy knob only, so abandon it and
+                                // fight the refund immediately by fee.
+                                log(format!(
+                                    "a foreign spend is racing the swept escrow before the posture \
+                                     hold's target height {}; abandoning the hold to fight by fee",
+                                    hold.broadcast_at_height
+                                ));
+                            }
+                            // else: the hold elapsed cleanly — broadcast now.
+                            // Fall through to the broadcast below.
+                        }
+                        ClaimBroadcast::Lost => {
+                            // A foreign spend CONFIRMED the escrow we sweep while
+                            // we held: the claim race is lost. Per the scheduler
+                            // contract this is NEVER reported as success — surface
+                            // it loudly. The CLI's fund-exposure discipline turns
+                            // this into the guard loop (the honest degradation).
+                            log(
+                                "ALARM: a foreign spend CONFIRMED the escrow we sweep while holding \
+                                 the SL claim — the claim race is LOST (never a success)"
+                                    .into(),
+                            );
+                            return Err(Error::Abort(
+                                "claim race lost: a foreign spend confirmed the escrow we sweep",
+                            ));
+                        }
+                        ClaimBroadcast::Won => {
+                            // Unreachable with `our_claim_txid = None`: `Won`
+                            // needs a confirmed spend attributable to OUR
+                            // broadcast, but we have not broadcast yet — that is
+                            // exactly what this hold gates. Fall through to the
+                            // idempotent broadcast rather than special-casing it.
+                        }
+                    }
+                }
+            }
             let bytes = finalize_key_spend(template, our_final_sig);
             let txid = txid_of(&bytes)?;
             if opts.dry_run {

@@ -36,7 +36,7 @@
 use crate::chain::{AuthoritativeChainView, SpendStatus};
 use crate::crypto::ValidatedFinalSig;
 use crate::settlement::state_machine::{CompletionSig, Possessing};
-use crate::wallet::manifest::SignedManifest;
+use crate::wallet::manifest::{ClaimDelayPosture, SignedManifest};
 use crate::Result;
 use bitcoin::{OutPoint, Txid};
 use rand::TryRngCore;
@@ -56,6 +56,42 @@ pub struct ScheduledClaim {
     pub reveal_height: u32,
     pub delay_blocks: u32,
     pub broadcast_at_height: u32,
+}
+
+/// The engine-surfaced facts of a scheduled SL claim hold: everything the
+/// broadcasting caller needs to rebuild the [`ScheduledClaim`] it polls
+/// [`ClaimScheduler::next_broadcast`] with. The 64-byte final signature is NOT
+/// carried here — it rides the `Completed` outcome separately (the engine
+/// boundary keeps the finalized signature on the terminal), and
+/// [`into_schedule`](ClaimHold::into_schedule) re-marries the two.
+///
+/// `Copy`, so it threads cleanly through the `Copy` `DriveStatus`/`AppTick`
+/// terminals without heap or borrow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClaimHold {
+    /// Height at which the reveal was observed (the delay's anchor).
+    pub reveal_height: u32,
+    /// The sampled, ceiling-CLAMPED posture delay (blocks).
+    pub delay_blocks: u32,
+    /// `reveal_height + delay_blocks` — the tip height at which the held claim
+    /// is released. Already clamped to the settlement ceiling by
+    /// `schedule_claim`, so honoring it can never race the swept escrow's late
+    /// refund.
+    pub broadcast_at_height: u32,
+}
+
+impl ClaimHold {
+    /// Re-marry the hold's heights with the finalized Comp→SL signature (which
+    /// travelled separately on the `Completed` outcome) into the
+    /// [`ScheduledClaim`] the broadcasting loop polls `next_broadcast` with.
+    pub fn into_schedule(self, comp_sl_final_sig: [u8; 64]) -> ScheduledClaim {
+        ScheduledClaim {
+            comp_sl_final: CompletionSig(comp_sl_final_sig),
+            reveal_height: self.reveal_height,
+            delay_blocks: self.delay_blocks,
+            broadcast_at_height: self.broadcast_at_height,
+        }
+    }
 }
 
 /// The scheduler's decision while waiting to broadcast a prepared claim.
@@ -79,7 +115,18 @@ pub enum ClaimBroadcast {
 
 impl ClaimScheduler {
     pub fn from_manifest(manifest: &SignedManifest) -> Self {
-        let (posture_min, posture_max) = manifest.delay_bounds(manifest.active_posture());
+        Self::for_posture(manifest, manifest.active_posture())
+    }
+
+    /// Build a scheduler for an EXPLICIT posture, still drawn from the signed
+    /// manifest. The posture only SELECTS among the manifest's three signed,
+    /// validator-bounded bands (minimal/moderate/aggressive) — a caller can
+    /// never invent bounds outside the manifest, and the runtime ceiling clamp
+    /// in [`schedule_claim`](Self::schedule_claim) still binds regardless. This
+    /// is how an operator override (`--claim-posture`) picks a band without
+    /// touching the trust path.
+    pub fn for_posture(manifest: &SignedManifest, posture: ClaimDelayPosture) -> Self {
+        let (posture_min, posture_max) = manifest.delay_bounds(posture);
         ClaimScheduler { posture_min, posture_max }
     }
 

@@ -88,7 +88,8 @@ fn status_snapshot_reflects_the_seeded_engine() {
         "\"alarms\":[\"disk almost full\"]",
         "\"records\":[]",
         "\"unreadable_records\":0",
-        "\"claim_posture_applied\":false",
+        "\"claim_posture_applied\":true",
+        "\"claim_posture\":\"moderate\"",
     ] {
         assert!(json.contains(needle), "missing {needle} in {json}");
     }

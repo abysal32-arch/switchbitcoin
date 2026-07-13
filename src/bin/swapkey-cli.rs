@@ -39,6 +39,7 @@ use swapkey::chain::{AuthoritativeChainView, ChainView};
 use swapkey::settlement::state_machine::PeerSession;
 use swapkey::wallet::config::{Network, WalletConfig, CONFIG_FILE};
 use swapkey::wallet::keys::KeyPurpose;
+use swapkey::wallet::manifest::ClaimDelayPosture;
 use swapkey::wallet::ledger::{acknowledge_phase0, SystemClock, PHASE0_WARNING};
 use swapkey::wallet::runner::{
     self, apply_recovery_tick, backstop_step, hex32, negotiate_swap, refund_babysit_step,
@@ -167,6 +168,10 @@ COMMANDS
             --accept-timeout-secs <n>  --listen wait budget (default 600)
             --assume-congested  treat a relayed refund as below the fee floor
                                 (fires the silent refund CPFP)
+            --claim-posture <fast|balanced|private>  SL claim-delay privacy
+                                (default: the signed manifest's active posture;
+                                 maps to the manifest minimal/moderate/aggressive
+                                 bands — a randomized, ceiling-clamped hold)
   recover   Startup reconcile + crash-recovery scan; drive each tick.
             --dry-run           decide but never broadcast
             --assume-congested  as for swap
@@ -174,6 +179,8 @@ COMMANDS
             auth — any local process can drive the wallet; pre-alpha).
             --port <n>          bind 127.0.0.1:<n> (default 3316)
             --poll-secs / --feerate / --assume-congested as for swap
+            --claim-posture <fast|balanced|private>  as for swap (default: the
+                                signed manifest's active posture)
             Endpoints: GET /status /events?since=N /swap/<sid>;
             POST /onboard {deposit, ack_phase0, split_fee?},
             POST /swap/begin {connect|listen}
@@ -213,6 +220,7 @@ const VALUE_FLAGS: &[&str] = &[
     "--poll-secs",
     "--accept-timeout-secs",
     "--port",
+    "--claim-posture",
 ];
 
 /// Every boolean switch any subcommand accepts.
@@ -264,6 +272,21 @@ impl Flags {
     }
     fn config_path(&self) -> PathBuf {
         PathBuf::from(self.value("config").unwrap_or(CONFIG_FILE))
+    }
+}
+
+/// Map a `--claim-posture` value to a signed-manifest band. The friendly names
+/// (fast/balanced/private) and the manifest's own names (minimal/moderate/
+/// aggressive) both work; anything else names the accepted values.
+fn parse_claim_posture(v: &str) -> Result<ClaimDelayPosture, UsageError> {
+    match v {
+        "fast" | "minimal" => Ok(ClaimDelayPosture::Minimal),
+        "balanced" | "moderate" => Ok(ClaimDelayPosture::Moderate),
+        "private" | "aggressive" => Ok(ClaimDelayPosture::Aggressive),
+        other => Err(format!(
+            "--claim-posture: unknown posture `{other}` (accepted: fast|balanced|private)"
+        )
+        .into()),
     }
 }
 
@@ -744,6 +767,12 @@ fn cmd_swap(flags: &Flags) -> CliResult {
     let accept_timeout = Duration::from_secs(flags.num("accept-timeout-secs", 600)?);
 
     let mut wallet = open_ready(flags)?;
+    // Operator claim-delay posture override (else the signed manifest's active
+    // posture). It only selects among the manifest's signed bands; the runtime
+    // ceiling clamp binds regardless.
+    if let Some(v) = flags.value("claim-posture") {
+        wallet.engine_mut().set_claim_posture(Some(parse_claim_posture(v)?));
+    }
     let chain = chain_view(wallet.config())?;
     let network = wallet.config().network;
     let data_dir = wallet.config().data_dir.clone();
@@ -815,11 +844,17 @@ fn cmd_swap(flags: &Flags) -> CliResult {
     if let Some(order) = app.funding_order() {
         log(&format!("funding order: {order:?} (Block X at height {block_x})"));
     }
-    // Documented pre-alpha limitation (Fable review): the SL claim privacy
-    // posture (randomized claim delay, wallet::claim_scheduler) is NOT
-    // applied by this runner — completions broadcast as soon as the engine
-    // hands back the signature. Wiring the schedule is a Task-09/10 item.
-    log("NOTE: claim-delay privacy posture is not applied pre-alpha (immediate broadcast)");
+    // The SL claim privacy posture (randomized, ceiling-clamped claim delay,
+    // wallet::claim_scheduler) IS applied now: the run loop holds the SL claim
+    // broadcast until the sampled target height (Task 13).
+    {
+        let posture = wallet.engine().effective_claim_posture();
+        let source = if flags.value("claim-posture").is_some() { "flag" } else { "manifest" };
+        log(&format!(
+            "claim-delay privacy posture active: {posture:?} ({source}) — the SL claim broadcast \
+             is held for a randomized, ceiling-clamped delay"
+        ));
+    }
 
     let artifacts = negotiated.artifacts;
     let mut state = swapkey::wallet::SwapRunState::new();
@@ -839,6 +874,17 @@ fn cmd_swap(flags: &Flags) -> CliResult {
                 // Every poll acts; log the wait states on a slow cadence.
                 if iter.is_multiple_of(6) {
                     log(&format!("tick: {tick:?}"));
+                }
+            }
+            // Holding the SL claim for the privacy posture: fall through to the
+            // backstop/recovery/sleep tail EXACTLY like Continue — the backstop
+            // guarding every refund deadline through the hold is load-bearing.
+            Ok(SwapStepOutcome::Holding { broadcast_at_height }) => {
+                if iter.is_multiple_of(6) {
+                    log(&format!(
+                        "holding the SL claim until height {broadcast_at_height} (tip {})",
+                        chain.tip_height()
+                    ));
                 }
             }
             Err(e) if state.setup_on_wire => {
@@ -1045,6 +1091,11 @@ fn cmd_serve(flags: &Flags) -> CliResult {
     let jitter: u32 = flags.num("jitter", 0)?;
 
     let mut wallet = open_ready(flags)?;
+    // Operator claim-delay posture override (else the signed manifest's active
+    // posture); it only selects among the manifest's signed bands.
+    if let Some(v) = flags.value("claim-posture") {
+        wallet.engine_mut().set_claim_posture(Some(parse_claim_posture(v)?));
+    }
     // The node is OPTIONAL for serve: without [node] the API is status-only
     // (onboard/swap need the chain and report it).
     let chain: Option<NodeChain> = match wallet.config().node.as_ref() {
@@ -1245,10 +1296,20 @@ fn serve_worker(
         );
 
         // 4. Whole-wallet recovery pass on a slow cadence (other swaps'
-        //    deadlines stay driven while this one runs).
+        //    deadlines stay driven while this one runs). EXCLUDE the live
+        //    swap's own record: its ticks belong to `step_live` above, and a
+        //    recovery pass would re-enter a mid-HOLD `Completed` record and
+        //    REBROADCAST the completion immediately — defeating the posture
+        //    hold. Copy the sid out of `live` FIRST so the reference borrow ends
+        //    before `recovery_pass` takes `&mut wallet`.
+        let exclude_sid: Option<[u8; 32]> = match &live {
+            Live::Running { artifacts, .. } => Some(artifacts.session_id),
+            Live::BabysitCompletion { sid, .. } | Live::BabysitRefund { sid, .. } => Some(*sid),
+            _ => None,
+        };
         if let Some(chain) = chain {
             if iter.is_multiple_of(10) && iter > 0 {
-                recovery_pass(wallet, chain, data_dir, opts, None);
+                recovery_pass(wallet, chain, data_dir, opts, exclude_sid.as_ref());
             }
         }
 
@@ -1354,7 +1415,11 @@ fn begin_swap(
     let sid = negotiated.artifacts.session_id;
     let sid_hex = hex32(&sid);
     sink(format!("negotiated swap session {sid_hex}"));
-    sink("NOTE: claim-delay privacy posture is not applied pre-alpha (immediate broadcast)".into());
+    sink(format!(
+        "claim-delay privacy posture active: {:?} — the SL claim broadcast is held for a \
+         randomized, ceiling-clamped delay",
+        wallet.engine().effective_claim_posture()
+    ));
     let peer = PeerSession::new(sid, Box::new(transport));
     let block_x = chain.tip_height() + block_x_delta;
     match SwapApp::begin(wallet.engine(), negotiated.ctx, peer, block_x, jitter) {
@@ -1426,6 +1491,16 @@ fn step_live(
             {
                 Ok(SwapStepOutcome::Continue(tick)) => {
                     set_swap_view(state, active, &sid_hex, &format!("{tick:?}"), None);
+                    Live::Running { app, artifacts, run }
+                }
+                Ok(SwapStepOutcome::Holding { broadcast_at_height }) => {
+                    set_swap_view(
+                        state,
+                        active,
+                        &sid_hex,
+                        &format!("holding-claim(until {broadcast_at_height})"),
+                        None,
+                    );
                     Live::Running { app, artifacts, run }
                 }
                 Ok(SwapStepOutcome::Done(SwapOutcome::Completed { .. })) => {

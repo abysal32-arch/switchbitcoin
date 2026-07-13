@@ -30,10 +30,10 @@ use crate::crypto::adaptor::AdaptorSecret;
 use crate::crypto::{ValidatedFinalSig, ValidatedPoint};
 use crate::settlement::refund::{PreArmedRefund, WatchtowerReceipt};
 use crate::settlement::state_machine::{ExchangeInputs, Funded, Possessing, Role};
-use crate::wallet::claim_scheduler::{ClaimScheduler, ScheduledClaim};
+use crate::wallet::claim_scheduler::{ClaimHold, ClaimScheduler, ScheduledClaim};
 use crate::wallet::keys::KeySource;
 use crate::wallet::ledger::Ledger;
-use crate::wallet::manifest::{ManifestStore, ManifestTrustRoot};
+use crate::wallet::manifest::{ClaimDelayPosture, ManifestStore, ManifestTrustRoot};
 use crate::wallet::store::{EnclaveKeyProvider, RecoveryAction, SwapPhase, SwapRecord, SwapStore};
 use crate::{Error, Result};
 use bitcoin::OutPoint;
@@ -82,9 +82,15 @@ pub struct SwapContext {
 #[derive(Debug)]
 pub enum SwapOutcome {
     /// The swap completed. `our_final_sig` is the completed signature for OUR
-    /// leg, ready for the (chain-layer) broadcast; `reveal` (SL only) is the
-    /// secret-carrying counterparty signature we extracted from.
-    Completed { our_final_sig: [u8; 64] },
+    /// leg, ready for the (chain-layer) broadcast.
+    ///
+    /// `claim_hold` is `Some` when a FRESH SL settle scheduled the claim THIS
+    /// call: the caller must HOLD the broadcast until `broadcast_at_height`
+    /// (already ceiling-clamped by `schedule_claim`). It is `None` for SH (no
+    /// claim delay), and for a re-driven / crash-recovered short-circuit (the
+    /// record was already `Completing`/`Completed`), where the immediate
+    /// broadcast is the safe fallback — decorrelation degrades, safety does not.
+    Completed { our_final_sig: [u8; 64], claim_hold: Option<ClaimHold> },
     /// A failure path was taken; the pre-armed refund is the exit. Idempotent
     /// to re-drive via `recover`.
     Aborted(&'static str),
@@ -101,7 +107,9 @@ pub enum DriveStatus {
     /// OUR leg is settled and the record is persisted `Completed`.
     /// `our_final_sig` is the 64-byte signature the caller finalizes+broadcasts
     /// onto its own completion tx (the engine boundary — see the module docs).
-    Completed { our_final_sig: [u8; 64] },
+    /// `claim_hold` carries the SL claim-delay schedule when a fresh SL settle
+    /// produced it this call (else `None`); see [`SwapOutcome::Completed`].
+    Completed { our_final_sig: [u8; 64], claim_hold: Option<ClaimHold> },
     /// SL only: the counterparty's reveal is not on chain yet. Advance the
     /// `ChainView` and step again — the swap has NOT failed, and the in-flight
     /// `Possessing` is retained so no work is lost.
@@ -147,6 +155,12 @@ pub struct SwapEngine {
     ledger: Ledger,
     manifest: ManifestStore,
     keys: Box<dyn KeySource>,
+    /// Operator override for the SL claim-delay posture. `None` = use the
+    /// manifest's active posture. An override only SELECTS among the manifest's
+    /// three signed, validator-bounded bands (see `ClaimScheduler::for_posture`)
+    /// — it can never widen the delay past what the signed manifest published,
+    /// and the runtime ceiling clamp in `schedule_claim` binds regardless.
+    claim_posture: Option<ClaimDelayPosture>,
 }
 
 impl SwapEngine {
@@ -178,11 +192,27 @@ impl SwapEngine {
         // swap already spent on chain must become Spent, not re-exposed Unspent).
         ledger.reconcile_leases(&live_lessees(&store)?)?;
 
-        Ok((SwapEngine { store, ledger, manifest, keys }, actions))
+        Ok((SwapEngine { store, ledger, manifest, keys, claim_posture: None }, actions))
     }
 
     pub fn manifest(&self) -> &ManifestStore {
         &self.manifest
+    }
+
+    /// Set (or clear, with `None`) the operator's SL claim-delay posture
+    /// override. An override only SELECTS among the manifest's three signed,
+    /// validator-bounded bands — it can never invent bounds outside the signed
+    /// manifest, and `schedule_claim`'s runtime ceiling clamp still binds.
+    pub fn set_claim_posture(&mut self, posture: Option<ClaimDelayPosture>) {
+        self.claim_posture = posture;
+    }
+
+    /// The posture that will actually shape SL claim delays: the operator
+    /// override if set, else the signed manifest's active posture. Either way
+    /// the band comes from the signed manifest and the ceiling clamp binds.
+    pub fn effective_claim_posture(&self) -> ClaimDelayPosture {
+        self.claim_posture
+            .unwrap_or_else(|| self.manifest.current().active_posture())
     }
     pub fn ledger(&self) -> &Ledger {
         &self.ledger
@@ -476,8 +506,8 @@ impl SwapEngine {
         }
 
         match self.settle(possessing, ctx, chain)? {
-            SwapOutcome::Completed { our_final_sig } => {
-                Ok(DriveStatus::Completed { our_final_sig })
+            SwapOutcome::Completed { our_final_sig, claim_hold } => {
+                Ok(DriveStatus::Completed { our_final_sig, claim_hold })
             }
             SwapOutcome::Aborted(reason) => {
                 // Discriminate a genuine terminal refund (SH broadcast-gate-closed
@@ -683,19 +713,23 @@ impl SwapEngine {
         // a terminal record. Short-circuit from the persisted completion tx.
         let rec0 = self.store.get(&sid)?.ok_or(Error::Abort("record vanished"))?;
         match rec0.phase {
+            // A re-driven/crash-recovered short-circuit: the schedule (if any)
+            // was already surfaced on the ORIGINAL settle. Re-driving hands back
+            // `None` — the immediate rebroadcast is the safe fallback (privacy
+            // decorrelation degrades on a re-drive, forward-or-refund does not).
             SwapPhase::Completed => {
                 let sig = completion_sig_from(&rec0)?;
-                return Ok(SwapOutcome::Completed { our_final_sig: sig });
+                return Ok(SwapOutcome::Completed { our_final_sig: sig, claim_hold: None });
             }
             SwapPhase::Completing => {
-                // Already broadcast/scheduled: just finalize.
+                // Already broadcast/scheduled: just finalize (no fresh hold).
                 let sig = completion_sig_from(&rec0)?;
-                return self.finalize_completed(sid, sig);
+                return self.finalize_completed(sid, sig, None);
             }
             _ => {}
         }
 
-        let final_sig = match possessing.role() {
+        let (final_sig, claim_hold) = match possessing.role() {
             Role::SecretLearner => {
                 let reveal = match ClaimScheduler::observe_reveal(chain, ctx.reveal_escrow_op) {
                     Some(sig) => sig,
@@ -705,7 +739,11 @@ impl SwapEngine {
                         return Ok(SwapOutcome::Aborted("no reveal observed yet"));
                     }
                 };
-                let scheduler = ClaimScheduler::from_manifest(self.manifest.current());
+                // The posture only SELECTS the signed manifest band (operator
+                // override else the manifest's active posture); the ceiling
+                // clamp inside `schedule_claim` still binds regardless.
+                let posture = self.effective_claim_posture();
+                let scheduler = ClaimScheduler::for_posture(self.manifest.current(), posture);
                 let schedule: ScheduledClaim =
                     match scheduler.schedule_claim(possessing, &reveal, chain.tip_height()) {
                         Ok(s) => s,
@@ -724,11 +762,18 @@ impl SwapEngine {
                             ));
                         }
                     };
+                // Surface the schedule so the broadcasting caller HOLDS the
+                // claim until `broadcast_at_height` (already ceiling-clamped).
+                let hold = ClaimHold {
+                    reveal_height: schedule.reveal_height,
+                    delay_blocks: schedule.delay_blocks,
+                    broadcast_at_height: schedule.broadcast_at_height,
+                };
                 let mut rec = self.store.get(&sid)?.ok_or(Error::Abort("record vanished"))?;
                 rec.phase = SwapPhase::Completing;
                 rec.completion_tx = Some(schedule.comp_sl_final.0.to_vec());
                 self.store.put(&rec)?;
-                schedule.comp_sl_final.0
+                (schedule.comp_sl_final.0, Some(hold))
             }
             Role::SecretHolder => {
                 let sig = match possessing
@@ -744,22 +789,28 @@ impl SwapEngine {
                 rec.phase = SwapPhase::Completing;
                 rec.completion_tx = Some(sig.0.to_vec());
                 self.store.put(&rec)?;
-                sig.0
+                // SH has no claim delay: the completion IS the reveal.
+                (sig.0, None)
             }
         };
         // (The funding coin was already marked spent in run_exchange, once
         // funding confirmed — so both this path and the refund path leave the
         // ledger correct.)
-        self.finalize_completed(sid, final_sig)
+        self.finalize_completed(sid, final_sig, claim_hold)
     }
 
-    fn finalize_completed(&self, sid: [u8; 32], sig: [u8; 64]) -> Result<SwapOutcome> {
+    fn finalize_completed(
+        &self,
+        sid: [u8; 32],
+        sig: [u8; 64],
+        claim_hold: Option<ClaimHold>,
+    ) -> Result<SwapOutcome> {
         let mut rec = self.store.get(&sid)?.ok_or(Error::Abort("record vanished"))?;
         if rec.phase != SwapPhase::Completed {
             rec.phase = SwapPhase::Completed;
             self.store.put(&rec)?;
         }
-        Ok(SwapOutcome::Completed { our_final_sig: sig })
+        Ok(SwapOutcome::Completed { our_final_sig: sig, claim_hold })
     }
 
     /// Record the refund terminal: the swap unwound to its pre-armed refund.

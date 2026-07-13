@@ -40,7 +40,7 @@ use swapkey::wallet::config::Network;
 use swapkey::wallet::engine::{SwapContext, SwapEngine};
 use swapkey::wallet::keys::ModeledKeySource;
 use swapkey::wallet::ledger::{acknowledge_phase0, CoinClass, CoinState, Ledger, WalletClock, PHASE0_WARNING};
-use swapkey::wallet::manifest::ModeledTrustRoot;
+use swapkey::wallet::manifest::{ClaimDelayPosture, ModeledTrustRoot};
 use swapkey::wallet::runner::{
     completion_babysit_step, negotiate_swap, refund_babysit_step, swap_step, RunOptions,
     SwapArtifacts, SwapOutcome, SwapRunState, SwapStepOutcome,
@@ -370,6 +370,14 @@ fn swap_step_drives_a_full_swap_to_completed() {
                 );
             }
             SwapStepOutcome::Continue(_) => {}
+            // The default (Moderate) posture holds the SL claim; this loop
+            // never mines otherwise, so mine the hold out here so the next
+            // poll broadcasts.
+            SwapStepOutcome::Holding { broadcast_at_height } => {
+                while chain.tip_height() < broadcast_at_height {
+                    chain.mine();
+                }
+            }
             SwapStepOutcome::Done(o) => {
                 outcome = Some(o);
                 break;
@@ -382,12 +390,19 @@ fn swap_step_drives_a_full_swap_to_completed() {
     let _sh_sig = sh_handle.join().unwrap().expect("SH side");
     if outcome.is_none() {
         for _ in 0..8 {
-            if let SwapStepOutcome::Done(o) =
-                swap_step(&mut app, &mut engine, &chain, &artifacts, &mut state, &opts, &mut log)
-                    .unwrap()
+            match swap_step(&mut app, &mut engine, &chain, &artifacts, &mut state, &opts, &mut log)
+                .unwrap()
             {
-                outcome = Some(o);
-                break;
+                SwapStepOutcome::Done(o) => {
+                    outcome = Some(o);
+                    break;
+                }
+                SwapStepOutcome::Holding { broadcast_at_height } => {
+                    while chain.tip_height() < broadcast_at_height {
+                        chain.mine();
+                    }
+                }
+                SwapStepOutcome::Continue(_) => {}
             }
         }
     }
@@ -501,6 +516,9 @@ fn swap_step_funded_abort_babysits_to_refunded() {
             .unwrap()
         {
             SwapStepOutcome::Continue(_) => {}
+            // This swap aborts to refund (never settles as SL), so a hold is
+            // not expected here; mine anyway so it would elapse (no miner runs).
+            SwapStepOutcome::Holding { .. } => chain.mine(),
             SwapStepOutcome::Done(o) => break o,
         }
     };
@@ -548,6 +566,28 @@ struct SideResult {
     /// registered settlement output (completion OR refund pays our fresh
     /// SwapDestination key).
     has_swapped_coin: bool,
+    /// Task-13 hold telemetry: the FIRST observed SL claim hold (`None` for a
+    /// side that never held — SH always, and any refunding SL).
+    hold: Option<HoldObs>,
+    /// Tip height at which a `Done(Completed)` returned (`None` otherwise) —
+    /// used to assert the claim was broadcast AT/AFTER the hold target.
+    completed_tip: Option<u32>,
+    /// Count of `Holding` steps observed by this side.
+    held_steps: usize,
+}
+
+/// One SL claim-hold observation captured by [`run_party`] at the FIRST
+/// `Holding` step (Task 13 telemetry).
+#[derive(Clone, Copy)]
+struct HoldObs {
+    /// The posture target height the SL held for.
+    broadcast_at_height: u32,
+    /// Chain tip at the first `Holding` observation (must be strictly below
+    /// `broadcast_at_height` — the claim is NOT broadcast before its target).
+    tip_at_first_obs: u32,
+    /// Whether the swept escrow (the counterparty escrow the SL sweeps) still
+    /// read `Unspent` at the first `Holding` observation.
+    swept_unspent_at_first_obs: bool,
 }
 
 /// One party's whole life: negotiate over `io`, begin, drive `swap_step` to a
@@ -561,9 +601,13 @@ fn run_party(
     session_sk: Scalar,
     block_x: u32,
     done: Arc<AtomicUsize>,
+    posture: Option<ClaimDelayPosture>,
 ) -> Result<SideResult> {
     let mut io = io;
     let mut engine = open_engine(&dir);
+    // Task 13: apply the operator posture override right after the engine
+    // opens (mirrors the CLI); `None` leaves the manifest's active posture.
+    engine.set_claim_posture(posture);
     let clock = FixedClock(u64::MAX);
     let negotiated = negotiate_swap(
         &mut io,
@@ -590,6 +634,9 @@ fn run_party(
     let mut state = SwapRunState::new();
 
     let mut outcome = None;
+    let mut hold: Option<HoldObs> = None;
+    let mut held_steps = 0usize;
+    let mut completed_tip: Option<u32> = None;
     for step in 0..4_000 {
         match swap_step(&mut app, &mut engine, &chain, &artifacts, &mut state, &opts, &mut log)
             .map_err(|e| {
@@ -597,7 +644,28 @@ fn run_party(
                 e
             })? {
             SwapStepOutcome::Continue(_) => std::thread::sleep(Duration::from_millis(5)),
+            // Under run_role_csv_attempt's background miner, treat Holding like
+            // Continue (sleep) but RECORD the first observation (Task 13); the
+            // miner advances the chain past broadcast_at_height so the hold
+            // elapses on its own.
+            SwapStepOutcome::Holding { broadcast_at_height } => {
+                held_steps += 1;
+                if hold.is_none() {
+                    hold = Some(HoldObs {
+                        broadcast_at_height,
+                        tip_at_first_obs: chain.tip_height(),
+                        swept_unspent_at_first_obs: matches!(
+                            chain.spend_status(their_escrow_op),
+                            SpendStatus::Unspent
+                        ),
+                    });
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
             SwapStepOutcome::Done(o) => {
+                if matches!(o, SwapOutcome::Completed { .. }) {
+                    completed_tip = Some(chain.tip_height());
+                }
                 outcome = Some(o);
                 break;
             }
@@ -647,6 +715,9 @@ fn run_party(
         msg_comp_sl,
         outcome,
         has_swapped_coin,
+        hold,
+        completed_tip,
+        held_steps,
     })
 }
 
@@ -666,16 +737,35 @@ struct AttemptFacts {
     swapped_registered: bool,
 }
 
+/// The full result of one attempt: the summary facts PLUS the two per-side
+/// results and the shared chain, so a caller (Task-13's hold test) can inspect
+/// the SL claim-hold telemetry and reach `funding_height` for the ceiling
+/// assertion.
+struct AttemptResult {
+    facts: AttemptFacts,
+    ra: SideResult,
+    rb: SideResult,
+    chain: SimChain,
+}
+
+/// The no-posture attempt (manifest active posture on both sides) — the shape
+/// the existing tests use. Delegates to [`run_role_csv_attempt_with`].
+fn run_role_csv_attempt() -> AttemptFacts {
+    run_role_csv_attempt_with(None).facts
+}
+
 /// ONE attempt of the shared two-party flow: two independent wallets, each with
 /// one REAL onboarded coin, negotiate over a duplex transport and run the swap
 /// end to end against a fresh shared `SimChain`. Asserts cross-side agreement,
 /// the strong outcome==prediction property (the deferred role↔CSV stop-gate
 /// decides which terminal is CORRECT), and forward-or-refund closure — then
-/// returns the facts.
+/// returns the facts, both side results, and the chain.
 ///
-/// Fresh tempdirs, fresh onboarded coins, and fresh random session keys make
-/// each call independent, so `measure_role_csv_refund_rate` can run N of them.
-fn run_role_csv_attempt() -> AttemptFacts {
+/// `posture` is applied to BOTH parties' engines (Task 13); `None` leaves the
+/// manifest's active posture. Fresh tempdirs, fresh onboarded coins, and fresh
+/// random session keys make each call independent, so `measure_role_csv_refund_rate`
+/// can run N of them.
+fn run_role_csv_attempt_with(posture: Option<ClaimDelayPosture>) -> AttemptResult {
     let params = Params::testnet_provisional();
     let base = 500_000u32;
     let chain = SimChain::new(base);
@@ -698,11 +788,11 @@ fn run_role_csv_attempt() -> AttemptFacts {
 
     let ha = {
         let (dir, chain, done) = (dir_a.path().to_path_buf(), chain.clone(), done.clone());
-        std::thread::spawn(move || run_party("A", dir, chain, io_a, sk_a, block_x, done))
+        std::thread::spawn(move || run_party("A", dir, chain, io_a, sk_a, block_x, done, posture))
     };
     let hb = {
         let (dir, chain, done) = (dir_b.path().to_path_buf(), chain.clone(), done.clone());
-        std::thread::spawn(move || run_party("B", dir, chain, io_b, sk_b, block_x, done))
+        std::thread::spawn(move || run_party("B", dir, chain, io_b, sk_b, block_x, done, posture))
     };
 
     // Miner: keep the chain advancing (setup confirmations, CSV maturity for
@@ -778,11 +868,16 @@ fn run_role_csv_attempt() -> AttemptFacts {
     let escrows_closed = matches!(chain.spend_status(ra.our_escrow_op), SpendStatus::Confirmed(_))
         && matches!(chain.spend_status(rb.our_escrow_op), SpendStatus::Confirmed(_));
     let swapped_registered = ra.has_swapped_coin && rb.has_swapped_coin;
-    AttemptFacts {
-        predicted_match: convention_matched,
-        completed,
-        escrows_closed,
-        swapped_registered,
+    AttemptResult {
+        facts: AttemptFacts {
+            predicted_match: convention_matched,
+            completed,
+            escrows_closed,
+            swapped_registered,
+        },
+        ra,
+        rb,
+        chain,
     }
 }
 
@@ -792,6 +887,401 @@ fn negotiate_swap_two_parties_agree_and_close_forward_or_refund() {
     // test always made (cross-side agreement, outcome==prediction, and forward-
     // or-refund closure). `measure_role_csv_refund_rate` runs N of these.
     run_role_csv_attempt();
+}
+
+/// Task 13 — the SL claim-delay privacy posture wired end-to-end through the
+/// two-party run loop. With `Aggressive` (min band 12) the SL ALWAYS holds, so
+/// a hold is observable; the SH is unaffected. The role↔CSV convention refunds
+/// ~half of attempts by design, so retry until one COMPLETES (the negotiate flow
+/// can't pre-grind the derived role the way
+/// `swap_step_drives_a_full_swap_to_completed` does, so a bounded retry stands
+/// in for that deterministic-completion discipline).
+#[test]
+fn sl_claim_hold_delays_broadcast_and_respects_ceiling() {
+    let params = Params::testnet_provisional();
+    let delta_late = params.delta_late();
+    let allowance = params.claim_confirm_allowance as u64;
+
+    // ~half of attempts refund by design; retry (cap 12 ⇒ all-refund flake
+    // ≈ 0.5^12 ≈ 0.02%) until one completes and a hold is observable. A
+    // completed attempt can also — very rarely — consume its whole hold window
+    // against the 10 ms miner before the SL's first `Holding` poll (an OS
+    // stall between the engine's schedule and the runner's first poll; Fable
+    // review, LOW), or read the telemetry tip late for the same reason. Both
+    // are timing degeneracies of THIS harness, not hold regressions, so they
+    // retry like a refunded attempt; an implementation that never holds fails
+    // EVERY attempt and dies at the expect below.
+    let mut result = None;
+    for attempt in 0..12 {
+        let r = run_role_csv_attempt_with(Some(ClaimDelayPosture::Aggressive));
+        if !r.facts.completed {
+            eprintln!("attempt {attempt}: refunded (role↔CSV mismatch by design); retrying");
+            continue;
+        }
+        // BOTH sides holding is a hard bug (the SH must never hold) — never a
+        // timing artifact, so it fails immediately rather than retrying.
+        assert!(
+            !(r.ra.held_steps > 0 && r.rb.held_steps > 0),
+            "both sides held a claim — the SecretHolder must never hold"
+        );
+        let first_hold = if r.ra.held_steps > 0 { r.ra.hold } else { r.rb.hold };
+        match first_hold {
+            Some(h) if h.tip_at_first_obs < h.broadcast_at_height => {
+                result = Some(r);
+                break;
+            }
+            _ => eprintln!(
+                "attempt {attempt}: completed but the hold window raced the miner \
+                 (timing degeneracy); retrying"
+            ),
+        }
+    }
+    let AttemptResult { ra, rb, chain, .. } = result.expect(
+        "at least one of 12 attempts must complete WITH an observable hold \
+         (p≈0.5 completion each; a raced hold window is ~1e-5)",
+    );
+
+    // Exactly ONE side — the SL — observed a hold; the SH never did (a
+    // SecretHolder swap is unaffected by the claim posture).
+    assert!(
+        (ra.held_steps > 0) ^ (rb.held_steps > 0),
+        "exactly one side must hold, got A.held={} B.held={}",
+        ra.held_steps,
+        rb.held_steps
+    );
+    let (sl, sh) = if ra.held_steps > 0 { (&ra, &rb) } else { (&rb, &ra) };
+    assert_eq!(sh.held_steps, 0, "the SecretHolder side must never hold");
+    assert!(sh.hold.is_none(), "the SecretHolder side records no hold");
+
+    let hold = sl.hold.expect("the SL recorded a hold");
+    // Not broadcast BEFORE the target: the first hold is observed at a tip
+    // strictly below broadcast_at_height.
+    assert!(
+        hold.tip_at_first_obs < hold.broadcast_at_height,
+        "first hold tip {} must be strictly below the target {}",
+        hold.tip_at_first_obs,
+        hold.broadcast_at_height
+    );
+    // The swept escrow was still Unspent while the SL held its claim.
+    assert!(
+        hold.swept_unspent_at_first_obs,
+        "the swept escrow must read Unspent while the SL holds its claim"
+    );
+    // Broadcast AT/AFTER the target: the completion tip is >= broadcast_at.
+    let completed_tip = sl.completed_tip.expect("the SL reached a completion");
+    assert!(
+        completed_tip >= hold.broadcast_at_height,
+        "SL completed at tip {} but must not broadcast before the hold target {}",
+        completed_tip,
+        hold.broadcast_at_height
+    );
+
+    // Ceiling respected END-TO-END: the held broadcast still confirms (within
+    // the allowance) strictly before the swept escrow's late refund matures.
+    // swept_op = the escrow the SL sweeps (its completion template's input).
+    let swept_op = sl.their_escrow_op;
+    let swept_funding_h = chain
+        .funding_height(swept_op)
+        .expect("the swept escrow is funded on chain") as u64;
+    // broadcast_at + allowance + 1 <= swept_funding + delta_late; the strict `<`
+    // form is the clippy-clean equivalent of that (confirm STRICTLY before the
+    // swept escrow's late refund matures).
+    assert!(
+        hold.broadcast_at_height as u64 + allowance < swept_funding_h + delta_late,
+        "broadcast_at {} + allowance {} + 1 exceeds swept funding {} + delta_late {}",
+        hold.broadcast_at_height,
+        allowance,
+        swept_funding_h,
+        delta_late
+    );
+    // Both records reached confirmed terminals + escrows closed — already
+    // asserted inside run_role_csv_attempt_with for a completed attempt.
+}
+
+// ============================================================================
+// swap_step: the hold's RACE arms (Fable review, MEDIUM — previously untested).
+// A foreign mempool spend of the swept escrow abandons the hold and FIGHTS
+// (Done(Completed) before the target height); a foreign CONFIRMED spend is a
+// loud LOSS (`Err`), never reported as success.
+// ============================================================================
+
+/// A well-formed foreign spend of `outpoint` paying a standard P2TR output —
+/// the shape of SH's late refund racing our held claim. (SimChain does not
+/// enforce CSV maturity on relay, which is exactly the hostile shape the hold
+/// must react to.)
+fn foreign_spend_of(outpoint: OutPoint, out_sats: u64) -> Vec<u8> {
+    use bitcoin::{
+        absolute, transaction::Version, Amount, ScriptBuf, Sequence, Transaction, TxIn, TxOut,
+        Witness,
+    };
+    let mut spk = vec![0x51u8, 0x20];
+    spk.extend_from_slice(&[0x77u8; 32]);
+    let tx = Transaction {
+        version: Version::TWO,
+        lock_time: absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: outpoint,
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(out_sats),
+            script_pubkey: ScriptBuf::from_bytes(spk),
+        }],
+    };
+    bitcoin::consensus::encode::serialize(&tx)
+}
+
+/// The driven SL swap parked at its FIRST `Holding` step, ready for a race to
+/// be injected against the swept escrow. Tempdirs ride along so the stores
+/// under the engine/ctx stay alive.
+struct HeldSwap {
+    app: swapkey::wallet::SwapApp,
+    engine: SwapEngine,
+    chain: SimChain,
+    artifacts: SwapArtifacts,
+    state: SwapRunState,
+    /// The escrow the SL's held claim sweeps (the completion's input).
+    swept_op: OutPoint,
+    broadcast_at_height: u32,
+    _wallet_dir: tempfile::TempDir,
+    _lease_sl: tempfile::TempDir,
+    _possession_store: tempfile::TempDir,
+}
+
+/// Drive the deterministic SL fixture (the same role-grind as
+/// `swap_step_drives_a_full_swap_to_completed`) to its FIRST `Holding` step.
+/// The posture is forced `Aggressive` (min delay 12) and NO miner thread runs,
+/// so the hold cannot elapse on its own — the runner is parked mid-hold,
+/// polling `next_broadcast` against the swept escrow, deterministically.
+fn drive_sl_swap_to_first_hold() -> HeldSwap {
+    let params = Params::testnet_provisional();
+    let escrow_amt = params.escrow_amount_sats();
+    let d = params.tier_d_sats;
+    let base = 910_000u32;
+    let s_height = base + 1;
+    let delta_late = u32::try_from(params.delta_late()).unwrap();
+
+    let wallet_dir = tempfile::tempdir().unwrap();
+    let sl_pre = onboard_leased(wallet_dir.path(), &params, [0xAAu8; 32]);
+    let sh_pre = OutPoint::new(txid_from(0xB0), 0);
+
+    // Grind keypairs until the runner-driven side derives SecretLearner (the
+    // fixture-self-consistency trick shared with the full-swap test).
+    let (sh, sl, escrow_e_sl, escrow_e_sh, sl_setup, sh_setup, sl_escrow_op, sh_escrow_op) = loop {
+        let sh = keypair();
+        let sl = keypair();
+        let internal = canonical_internal_key(sh.pk, sl.pk).unwrap();
+        let e_sl = Escrow::new(&internal, &sl.pk, params.delta_early).unwrap();
+        let e_sh = Escrow::new(&internal, &sh.pk, delta_late).unwrap();
+
+        let probe = SimChain::new(base);
+        let (sl_setup, sl_op) = build_real_setup(&probe, &params, sl_pre, base, &e_sl, &sl.sk);
+        let (sh_setup, sh_op) = build_real_setup(&probe, &params, sh_pre, base, &e_sh, &sh.sk);
+        probe.broadcast(&sl_setup).unwrap();
+        probe.broadcast(&sh_setup).unwrap();
+        probe.mine();
+
+        if derived_role(&probe, &params, sl_op, sh_op, &sl.pk, &sh.pk) == Role::SecretLearner {
+            break (sh, sl, e_sl, e_sh, sl_setup, sh_setup, sl_op, sh_op);
+        }
+    };
+
+    let chain = SimChain::new(base);
+    chain.fund_with_amount(sl_pre, base, params.pre_encumbrance_sats());
+    chain.fund_with_amount(sh_pre, base, params.pre_encumbrance_sats());
+    chain.broadcast(&sl_setup).unwrap();
+    chain.broadcast(&sh_setup).unwrap();
+    chain.mine();
+
+    let dest = escrow_e_sl.funding_script_pubkey().clone();
+    let comp_sh =
+        build_completion(&escrow_e_sl, sl_escrow_op, escrow_amt, dest.clone(), d, params.anchor_sats)
+            .unwrap();
+    let comp_sl =
+        build_completion(&escrow_e_sh, sh_escrow_op, escrow_amt, dest.clone(), d, params.anchor_sats)
+            .unwrap();
+    let (msg_sh, msg_sl) = (comp_sh.sighash, comp_sl.sighash);
+    let (root_sh, root_sl) = (escrow_e_sl.merkle_root(), escrow_e_sh.merkle_root());
+    let (ok_sh, ok_sl) = (escrow_e_sl.output_key_xonly(), escrow_e_sh.output_key_xonly());
+
+    let sid = swap_session_id(sl.pk, sh.pk).unwrap();
+    let lease_sl = tempfile::tempdir().unwrap();
+    let lease_sh = tempfile::tempdir().unwrap();
+    let possession_store = tempfile::tempdir().unwrap();
+    let (io_sh, io_sl) = duplex();
+
+    let sl_refund = PreArmedRefund::arm(
+        &escrow_e_sl, sl_escrow_op, escrow_amt, &sl.sk, dest.clone(), d, params.anchor_sats,
+        s_height,
+    )
+    .unwrap();
+    let sl_refund_bytes = sl_refund.tx_bytes().to_vec();
+    let sl_receipt = confirm_watchtower_handoff(&sl_refund, sl_refund.fingerprint()).unwrap();
+
+    // Live SH counterparty (raw settlement thread), as in the full-swap test.
+    let sh_params = params.clone();
+    let sh_chain = chain.clone();
+    let comp_sh_for_sh = comp_sh.clone();
+    let lease_sh_path = lease_sh.path().to_path_buf();
+    let sh_handle = std::thread::spawn(move || -> Result<[u8; 64]> {
+        let refund = PreArmedRefund::from_signed_tx(vec![0xaa; 64], s_height + delta_late)?;
+        let receipt = confirm_watchtower_handoff(&refund, refund.fingerprint())?;
+        let (t, _) = AdaptorSecret::generate()?;
+        let peer = PeerSession::new([0xE9u8; 32], Box::new(io_sh));
+        let funded = Funding::new(sh_params, peer).funded_manual(Role::SecretHolder, s_height)?;
+        let possessing = funded.run_adaptor_exchange(ExchangeInputs {
+            our_seckey: sh.sk,
+            their_pubkey: vp(&sl.pk),
+            msg_comp_sh: msg_sh,
+            msg_comp_sl: msg_sl,
+            pre_armed_refund: refund,
+            adaptor_secret: Some(t),
+            lease_dir: Some(lease_sh_path),
+            possession_store: None,
+            taproot_root_comp_sh: Some(root_sh),
+            taproot_root_comp_sl: Some(root_sl),
+            taproot_output_comp_sh: Some(ok_sh),
+            taproot_output_comp_sl: Some(ok_sl),
+        })?;
+        let sig = possessing.broadcast_completion(s_height + 10, &receipt)?;
+        sh_chain
+            .broadcast(&finalize_key_spend(comp_sh_for_sh, sig.0))
+            .expect("Comp->SH to mempool");
+        Ok(sig.0)
+    });
+
+    let mut engine = open_engine(wallet_dir.path());
+    // Aggressive ⇒ the sampled delay is >= 12 (the ceiling is ample this close
+    // to funding), so with no miner the first Completed tick MUST hold.
+    engine.set_claim_posture(Some(ClaimDelayPosture::Aggressive));
+    let ctx = make_ctx(
+        sl.sk, sh.pk, sl_escrow_op, sh_escrow_op, escrow_amt, msg_sh, msg_sl, sl_refund, None,
+        root_sh, root_sl, ok_sh, ok_sl, lease_sl.path().to_path_buf(),
+        possession_store.path().to_path_buf(), sl_receipt, sl_pre,
+    );
+    let peer = PeerSession::new([0xE9u8; 32], Box::new(io_sl));
+    let mut app = swapkey::wallet::SwapApp::begin(&engine, ctx, peer, base + 500, 0).unwrap();
+
+    let artifacts = SwapArtifacts {
+        session_id: sid,
+        setup_tx: sl_setup,
+        comp_sh,
+        comp_sl,
+        refund_tx: sl_refund_bytes,
+        dest_key_index: 0,
+        dest_spk: dest,
+    };
+    let opts = RunOptions::default();
+    let mut log = no_log();
+    let mut state = SwapRunState::new();
+
+    // Drive to the first Holding. The Phase-A exchange blocks inside one poll;
+    // after joining the SH thread the reveal is guaranteed in the mempool, so
+    // the very next step schedules and holds.
+    let mut held_at = None;
+    for _ in 0..24 {
+        match swap_step(&mut app, &mut engine, &chain, &artifacts, &mut state, &opts, &mut log)
+            .unwrap()
+        {
+            SwapStepOutcome::Holding { broadcast_at_height } => {
+                held_at = Some(broadcast_at_height);
+                break;
+            }
+            SwapStepOutcome::Continue(_) => {}
+            SwapStepOutcome::Done(o) => panic!("swap terminated before the hold: {o:?}"),
+        }
+    }
+    sh_handle.join().unwrap().expect("SH side");
+    if held_at.is_none() {
+        for _ in 0..8 {
+            match swap_step(&mut app, &mut engine, &chain, &artifacts, &mut state, &opts, &mut log)
+                .unwrap()
+            {
+                SwapStepOutcome::Holding { broadcast_at_height } => {
+                    held_at = Some(broadcast_at_height);
+                    break;
+                }
+                SwapStepOutcome::Continue(_) => {}
+                SwapStepOutcome::Done(o) => panic!("swap terminated before the hold: {o:?}"),
+            }
+        }
+    }
+    let broadcast_at_height =
+        held_at.expect("the Aggressive posture must hold (no miner runs in this fixture)");
+    assert!(
+        chain.tip_height() < broadcast_at_height,
+        "the fixture must park strictly inside the hold window"
+    );
+
+    HeldSwap {
+        app,
+        engine,
+        chain,
+        artifacts,
+        state,
+        swept_op: sh_escrow_op,
+        broadcast_at_height,
+        _wallet_dir: wallet_dir,
+        _lease_sl: lease_sl,
+        _possession_store: possession_store,
+    }
+}
+
+/// Task 13 (Fable review, MEDIUM): a foreign spend racing the swept escrow in
+/// the MEMPOOL during the hold must ABANDON the hold and fight immediately —
+/// `Done(Completed)` strictly before the posture target height, never a
+/// stand-down `Holding`.
+#[test]
+fn sl_hold_abandons_to_fight_a_racing_foreign_mempool_spend() {
+    let mut hs = drive_sl_swap_to_first_hold();
+    let escrow_amt = Params::testnet_provisional().escrow_amount_sats();
+    hs.chain
+        .broadcast(&foreign_spend_of(hs.swept_op, escrow_amt.saturating_sub(20_000)))
+        .expect("the foreign racing spend relays");
+    assert!(hs.chain.tip_height() < hs.broadcast_at_height);
+
+    let mut log = no_log();
+    let out = swap_step(
+        &mut hs.app, &mut hs.engine, &hs.chain, &hs.artifacts, &mut hs.state,
+        &RunOptions::default(), &mut log,
+    )
+    .unwrap();
+    match out {
+        SwapStepOutcome::Done(SwapOutcome::Completed { .. }) => {}
+        other => panic!("a racing foreign spend must abandon the hold and fight, got {other:?}"),
+    }
+    assert!(
+        hs.chain.tip_height() < hs.broadcast_at_height,
+        "the fight must have happened BEFORE the posture target height"
+    );
+}
+
+/// Task 13 (Fable review, MEDIUM): a foreign spend that CONFIRMS on the swept
+/// escrow while we hold is a lost claim race — `swap_step` must surface a loud
+/// `Err`, NEVER `Done(Completed)` (the scheduler contract: a loss is never
+/// reported as a success).
+#[test]
+fn sl_hold_reports_a_confirmed_foreign_spend_as_lost_never_success() {
+    let mut hs = drive_sl_swap_to_first_hold();
+    let escrow_amt = Params::testnet_provisional().escrow_amount_sats();
+    hs.chain
+        .broadcast(&foreign_spend_of(hs.swept_op, escrow_amt.saturating_sub(20_000)))
+        .expect("the foreign racing spend relays");
+    hs.chain.mine(); // ...and CONFIRMS while we hold (still inside the window).
+    assert!(hs.chain.tip_height() < hs.broadcast_at_height);
+
+    let mut log = no_log();
+    let err = swap_step(
+        &mut hs.app, &mut hs.engine, &hs.chain, &hs.artifacts, &mut hs.state,
+        &RunOptions::default(), &mut log,
+    )
+    .expect_err("a confirmed foreign spend of the swept escrow must be a loud loss");
+    assert!(
+        matches!(err, Error::Abort(m) if m.contains("claim race lost")),
+        "the loss must surface as Abort(claim race lost ...), got {err:?}"
+    );
 }
 
 /// N-attempt empirical measurement of the role↔CSV refund rate: run the SAME

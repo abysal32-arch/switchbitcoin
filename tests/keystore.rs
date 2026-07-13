@@ -242,7 +242,7 @@ fn full_swap_driven_with_the_software_keystore() {
     assert!(matches!(chain.spend_status(op_comp_sh), SpendStatus::InMempool));
 
     match engine.settle(&possessing, &ctx, &chain).unwrap() {
-        SwapOutcome::Completed { our_final_sig } => {
+        SwapOutcome::Completed { our_final_sig, .. } => {
             let comp_sl_final = finalize_key_spend(comp_sl_spend, our_final_sig);
             chain.broadcast(&comp_sl_final).expect("Comp->SL accepted");
             chain.mine();

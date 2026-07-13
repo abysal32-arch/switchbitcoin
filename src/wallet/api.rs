@@ -40,6 +40,7 @@ use std::sync::{Arc, Mutex};
 use crate::settlement::params::Params;
 use crate::wallet::config::Network;
 use crate::wallet::engine::SwapEngine;
+use crate::wallet::manifest::ClaimDelayPosture;
 use crate::wallet::runner::hex32;
 
 /// Conventional local port (0x0CF4 = 3316, the spec version tag).
@@ -330,13 +331,22 @@ pub fn status_snapshot(
     }
     alarms_json.push(']');
 
+    // The SL claim-delay posture is now wired into the run loop (Task 13), so
+    // this is `true` and the ACTIVE posture (override else the manifest's) is
+    // reported lowercase for the UI.
+    let claim_posture = match engine.effective_claim_posture() {
+        ClaimDelayPosture::Minimal => "minimal",
+        ClaimDelayPosture::Moderate => "moderate",
+        ClaimDelayPosture::Aggressive => "aggressive",
+    };
+
     format!(
         "{{\"ready\":true,\"network\":{},\"tip\":{},\"node_online\":{},\
          \"spendable_sats\":{spendable_sats},\"reserve_leasable\":{},\
          \"tier_d_sats\":{},\"escrow_sats\":{},\"pre_encumbrance_sats\":{},\
          \"coins\":{coins},\"records\":{swaps},\"unreadable_records\":{unreadable},\
          \"swap\":{},\"busy\":{},\"alarms\":{alarms_json},\
-         \"phase0_warning\":{},\"claim_posture_applied\":false}}",
+         \"phase0_warning\":{},\"claim_posture_applied\":true,\"claim_posture\":{}}}",
         json_string(network.as_str()),
         tip_height.map(|h| h.to_string()).unwrap_or_else(|| "null".into()),
         node_online,
@@ -347,6 +357,7 @@ pub fn status_snapshot(
         active_swap.map(swap_view_json).unwrap_or_else(|| "null".into()),
         busy.map(json_string).unwrap_or_else(|| "null".into()),
         json_string(crate::wallet::ledger::PHASE0_WARNING),
+        json_string(claim_posture),
     )
 }
 

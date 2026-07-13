@@ -81,6 +81,7 @@ use crate::crypto::ValidatedPoint;
 use crate::settlement::state_machine::{Funded, PeerSession, Possessing, Role};
 use crate::tx::backstop::{required_child_fee, ANCHOR_VOUT, MAX_BUMP_FEE_SATS};
 use crate::wallet::backstop_driver::{BackstopDriver, BackstopTick, BumpOutcome, CpfpBumpRequest};
+use crate::wallet::claim_scheduler::ClaimHold;
 use crate::wallet::ledger::{BumpTarget, LinkageAck};
 use crate::wallet::engine::{ChainReconcile, DriveStatus, SettleEntry, SwapContext, SwapEngine};
 use crate::wallet::funding_driver::{FundingDriver, FundingTick, HandoffError};
@@ -148,7 +149,13 @@ pub enum AppTick {
     /// Terminal (success): OUR leg is settled and the record is persisted
     /// `Completed`. `our_final_sig` is the 64-byte signature the caller
     /// finalizes+broadcasts onto its own completion tx (the engine boundary).
-    Completed { our_final_sig: [u8; 64] },
+    ///
+    /// `claim_hold` is `Some` ⇒ the caller must HOLD that broadcast until the
+    /// given `broadcast_at_height` (the runner's `swap_step` does this — the SL
+    /// claim-delay privacy posture); `None` ⇒ broadcast now (SH, or a re-driven/
+    /// crash-recovered short-circuit where immediate broadcast is the safe
+    /// fallback).
+    Completed { our_final_sig: [u8; 64], claim_hold: Option<ClaimHold> },
     /// Terminal (automatic refund): the swap routed to its pre-armed refund
     /// exit and OUR escrow was locked, so the refund is the sink. `AbortRefund`
     /// is persisted on both routes — a settlement-phase failure via the engine,
@@ -928,7 +935,9 @@ impl SwapApp {
 /// Map a settlement [`DriveStatus`] to the caller-facing [`AppTick`].
 fn app_from_drive(status: DriveStatus) -> AppTick {
     match status {
-        DriveStatus::Completed { our_final_sig } => AppTick::Completed { our_final_sig },
+        DriveStatus::Completed { our_final_sig, claim_hold } => {
+            AppTick::Completed { our_final_sig, claim_hold }
+        }
         DriveStatus::AwaitingReveal => AppTick::AwaitingReveal,
         DriveStatus::Refunding(reason) => AppTick::Refunding(reason),
     }
