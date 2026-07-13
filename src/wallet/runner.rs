@@ -858,19 +858,17 @@ fn register_settlement_output(
     };
     let outpoint = OutPoint::new(txid, vout as u32);
     let height = chain.funding_height(outpoint).unwrap_or_else(|| chain.tip_height());
-    match engine.ledger_mut().record_swapped_output(
-        outpoint,
-        out.value.to_sat(),
-        artifacts.dest_key_index,
-        height,
-        false,
-    ) {
-        Ok(()) => log(format!(
+    // An Err here is the already-tracked case (an earlier pass registered
+    // it) — benign, so only the success is reported.
+    if engine
+        .ledger_mut()
+        .record_swapped_output(outpoint, out.value.to_sat(), artifacts.dest_key_index, height, false)
+        .is_ok()
+    {
+        log(format!(
             "{sid_hex}: settlement output {txid}:{vout} registered ({} sats)",
             out.value.to_sat()
-        )),
-        // Already tracked (an earlier babysit pass registered it): benign.
-        Err(_) => {}
+        ));
     }
 }
 

@@ -107,6 +107,69 @@ fn help_prints_usage() {
 }
 
 #[test]
+fn serve_answers_status_over_a_real_socket() {
+    use std::io::{Read as _, Write as _};
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("swapkey.toml");
+    let data_dir = dir.path().join("data");
+    let out = run_cli(
+        &config,
+        &[
+            "init",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "--passphrase-stdin",
+            "--accept-phase0",
+            "--skip-backup-verification",
+        ],
+        PASSPHRASE,
+    );
+    assert!(out.status.success(), "{}", text(&out));
+
+    // A likely-free ephemeral-range port (collision risk is tiny; the test
+    // fails loudly if bind loses the race).
+    let port = 39316;
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_swapkey-cli"));
+    for (name, _) in std::env::vars() {
+        if name.starts_with("SWAPKEY_") {
+            cmd.env_remove(&name);
+        }
+    }
+    let mut child = cmd
+        .args(["serve", "--port", &port.to_string(), "--passphrase-stdin", "--poll-secs", "1"])
+        .arg("--config")
+        .arg(&config)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn serve");
+    child.stdin.as_mut().unwrap().write_all(PASSPHRASE.as_bytes()).unwrap();
+
+    // Wait for the socket (wallet open pays the KDF first), then GET /status.
+    let mut body = String::new();
+    for _ in 0..120 {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", port)) else { continue };
+        s.write_all(b"GET /status HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        let mut raw = String::new();
+        s.read_to_string(&mut raw).ok();
+        if let Some((_, b)) = raw.split_once("\r\n\r\n") {
+            if b.contains("\"ready\":true") {
+                body = b.to_string();
+                break;
+            }
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(body.contains("\"ready\":true"), "no ready status from serve: {body:?}");
+    assert!(body.contains("\"node_online\":false"), "no [node] → status-only: {body}");
+    assert!(body.contains("status-only mode"), "the alarm must say so: {body}");
+}
+
+#[test]
 fn commands_needing_a_node_refuse_without_a_node_section() {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("swapkey.toml");

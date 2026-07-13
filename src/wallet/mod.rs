@@ -81,6 +81,7 @@
 //!     single-instance locks. The Task-08 runner drives the handle.
 
 pub mod abort_hygiene;
+pub mod api;
 pub mod app;
 pub mod config;
 pub mod runtime;

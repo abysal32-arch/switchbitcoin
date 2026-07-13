@@ -111,6 +111,7 @@ fn run(args: &[String]) -> CliResult {
         "onboard" => cmd_onboard(&flags),
         "swap" => cmd_swap(&flags),
         "recover" => cmd_recover(&flags),
+        "serve" => cmd_serve(&flags),
         "help" | "--help" | "-h" => {
             print!("{HELP}");
             Ok(())
@@ -151,6 +152,13 @@ COMMANDS
   recover   Startup reconcile + crash-recovery scan; drive each tick.
             --dry-run           decide but never broadcast
             --assume-congested  as for swap
+  serve     Localhost JSON API for SwapKey-Wallet.html (LOOPBACK ONLY, no
+            auth — any local process can drive the wallet; pre-alpha).
+            --port <n>          bind 127.0.0.1:<n> (default 3316)
+            --poll-secs / --feerate / --assume-congested as for swap
+            Endpoints: GET /status /events?since=N /swap/<sid>;
+            POST /onboard {deposit, ack_phase0, split_fee?},
+            POST /swap/begin {connect|listen}
 
 COMMON FLAGS
   --config <path>        config file (default ./swapkey.toml)
@@ -186,6 +194,7 @@ const VALUE_FLAGS: &[&str] = &[
     "--jitter",
     "--poll-secs",
     "--accept-timeout-secs",
+    "--port",
 ];
 
 /// Every boolean switch any subcommand accepts.
@@ -957,4 +966,583 @@ fn cmd_recover(flags: &Flags) -> CliResult {
     startup_with_alarms(&mut wallet, &chain, &opts)?;
     log("recovery scan driven; re-run as the chain advances until every swap is terminal");
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// serve — the localhost JSON API for SwapKey-Wallet.html (Task 09)
+// ---------------------------------------------------------------------------
+
+use swapkey::wallet::api::{
+    self, route, status_snapshot, ApiCmd, ApiState, SharedState, SwapView, DEFAULT_API_PORT,
+};
+use swapkey::wallet::runner::{completion_babysit_step, SwapArtifacts};
+use swapkey::wallet::SwapRunState;
+use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::{Arc, Mutex};
+
+type NodeChain = swapkey::chain::BitcoinCoreChainView<swapkey::chain::HttpTransport>;
+
+/// The worker's live activity — one command at a time (`busy` gates the API).
+enum Live {
+    Idle,
+    /// `swap/begin {listen}`: waiting for the peer to dial in.
+    Accepting { listener: std::net::TcpListener, deadline: std::time::Instant },
+    /// A swap driving through `swap_step`.
+    Running { app: Box<SwapApp>, artifacts: Box<SwapArtifacts>, run: SwapRunState },
+    /// Post-`Completed`: babysit our completion to CONFIRMED.
+    BabysitCompletion { app: Box<SwapApp>, sid: [u8; 32] },
+    /// Post-`Refunding`: babysit the refund to its terminal.
+    BabysitRefund { app: Box<SwapApp>, sid: [u8; 32] },
+    /// Hard error with funds exposed: backstop-only guard (fund-exposure
+    /// discipline — never drop a funded escrow).
+    Guard { app: Box<SwapApp> },
+}
+
+fn cmd_serve(flags: &Flags) -> CliResult {
+    // Same rule as `swap` (Fable review): a dry-run intent must never run a
+    // live wallet; serve broadcasts for real, so the flag is refused, not
+    // silently ignored.
+    if flags.switch("dry-run") {
+        return Err("serve does not support --dry-run; use `recover --dry-run`".into());
+    }
+    let port: u16 = flags.num("port", DEFAULT_API_PORT)?;
+    let poll = Duration::from_secs(flags.num("poll-secs", 3)?);
+    let opts = RunOptions {
+        target_feerate_sat_vb: flags.num("feerate", 2)?,
+        dry_run: false,
+        refund_congested: flags.switch("assume-congested"),
+    };
+    let block_x_delta: u32 = flags.num("block-x-delta", 144)?;
+    let jitter: u32 = flags.num("jitter", 0)?;
+
+    let mut wallet = open_ready(flags)?;
+    // The node is OPTIONAL for serve: without [node] the API is status-only
+    // (onboard/swap need the chain and report it).
+    let chain: Option<NodeChain> = match wallet.config().node.as_ref() {
+        Some(_) => Some(chain_view(wallet.config())?),
+        None => None,
+    };
+    let network = wallet.config().network;
+    let data_dir = wallet.config().data_dir.clone();
+    let mut alarms: Vec<String> =
+        wallet.open_actions().iter().map(|a| format!("store open: {a:?}")).collect();
+    let mut reconcile_ok = false;
+    if let Some(chain) = &chain {
+        reconcile_ok = startup_with_alarms(&mut wallet, chain, &opts)?;
+        if !reconcile_ok {
+            alarms.push("chain reconcile failed: lease/bump actions gated off".into());
+        }
+    } else {
+        alarms.push("no [node] configured: status-only mode".into());
+    }
+
+    let state: SharedState = Arc::new(Mutex::new(ApiState::new()));
+    let (tx, rx) = std::sync::mpsc::channel::<ApiCmd>();
+
+    // HTTP accept loop (spawned); the worker below owns the wallet.
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port))
+        .map_err(|e| format!("bind 127.0.0.1:{port}: {e}"))?;
+    log(&format!(
+        "serving http://127.0.0.1:{port} — LOOPBACK ONLY, NO AUTH (pre-alpha): any local \
+         process can drive this wallet"
+    ));
+    {
+        let state = state.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                let state = state.clone();
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    let _ = handle_conn(stream, &state, &tx);
+                });
+            }
+        });
+    }
+
+    serve_worker(
+        &mut wallet, chain.as_ref(), network, &data_dir, &state, rx, &opts, poll,
+        block_x_delta, jitter, reconcile_ok, alarms,
+    )
+}
+
+fn handle_conn(
+    stream: std::net::TcpStream,
+    state: &SharedState,
+    cmds: &std::sync::mpsc::Sender<ApiCmd>,
+) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    let mut reader = std::io::BufReader::new(stream.try_clone()?);
+    let mut writer = stream;
+    match api::read_request(&mut reader) {
+        Ok((method, path, body)) => {
+            let (code, response) = route(state, cmds, &method, &path, &body);
+            api::write_response(&mut writer, code, &response)
+        }
+        Err(_) => api::write_response(&mut writer, 400, "{\"error\":\"bad request\"}"),
+    }
+}
+
+/// The worker loop: owns the wallet + chain, drains commands, drives the
+/// live activity one step per tick, refreshes the status snapshot, and
+/// mirrors the `swap`/`onboard` command semantics (including the
+/// fund-exposure guard discipline).
+#[allow(clippy::too_many_arguments)]
+fn serve_worker(
+    wallet: &mut Wallet,
+    chain: Option<&NodeChain>,
+    network: Network,
+    data_dir: &Path,
+    state: &SharedState,
+    rx: Receiver<ApiCmd>,
+    opts: &RunOptions,
+    poll: Duration,
+    block_x_delta: u32,
+    jitter: u32,
+    reconcile_ok: bool,
+    alarms: Vec<String>,
+) -> CliResult {
+    let mut live = Live::Idle;
+    // A split whose confirmation we poll: (txid, signed bytes, start iter).
+    let mut pending_split: Option<(bitcoin::Txid, Vec<u8>, u64)> = None;
+    let mut active_sid_hex: Option<String> = None;
+    let mut iter: u64 = 0;
+
+    loop {
+        let sink_state = state.clone();
+        let mut sink = move |line: String| {
+            log(&line);
+            sink_state.lock().unwrap().push_trace(line);
+        };
+
+        // 1. Commands (one at a time; `busy` was set by the route).
+        if matches!(live, Live::Idle) && pending_split.is_none() {
+            match rx.try_recv() {
+                Ok(ApiCmd::Onboard { deposit, split_fee }) => match chain {
+                    Some(chain) => {
+                        match serve_onboard(wallet, chain, &deposit, split_fee, &mut sink) {
+                            Ok((txid, tx_bytes)) => {
+                                pending_split = Some((txid, tx_bytes, iter));
+                            }
+                            Err(e) => {
+                                sink(format!("onboard failed: {}", e.0));
+                                state.lock().unwrap().busy = None;
+                            }
+                        }
+                    }
+                    None => {
+                        sink("onboard refused: no [node] configured".into());
+                        state.lock().unwrap().busy = None;
+                    }
+                },
+                Ok(ApiCmd::SwapBegin { listen, connect }) => match (chain, reconcile_ok) {
+                    (Some(node), true) => {
+                        if let Some(addr) = connect {
+                            match TcpTransport::connect(addr.as_str()) {
+                                Ok(t) => {
+                                    live = begin_swap(
+                                        wallet, node, network, data_dir, t, poll, block_x_delta,
+                                        jitter, state, &mut active_sid_hex, &mut sink,
+                                    );
+                                }
+                                Err(e) => {
+                                    sink(format!("connect {addr} failed: {e}"));
+                                    state.lock().unwrap().busy = None;
+                                }
+                            }
+                        } else if let Some(addr) = listen {
+                            match std::net::TcpListener::bind(addr.as_str()) {
+                                Ok(l) => {
+                                    sink(format!("listening on {addr} for a swap peer (10 min)"));
+                                    set_swap_view(
+                                        state, &mut active_sid_hex, "pending", "accepting", None,
+                                    );
+                                    live = Live::Accepting {
+                                        listener: l,
+                                        deadline: std::time::Instant::now()
+                                            + Duration::from_secs(600),
+                                    };
+                                }
+                                Err(e) => {
+                                    sink(format!("bind {addr} failed: {e}"));
+                                    state.lock().unwrap().busy = None;
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        sink("swap refused: node offline or reconcile failed".into());
+                        state.lock().unwrap().busy = None;
+                    }
+                },
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    return Err("api accept loop died".into());
+                }
+            }
+        }
+
+        // 2. Onboard tail: poll the split confirmation, REBROADCASTING on a
+        //    slow cadence (an evicted split otherwise never confirms) and
+        //    timing out instead of holding `busy` forever (Fable review;
+        //    re-POSTing /onboard resumes via the mid-split arm).
+        if let (Some((txid, tx_bytes, started)), Some(chain)) = (&pending_split, chain) {
+            if let Some(h) = chain.funding_height(bitcoin::OutPoint::new(*txid, 0)) {
+                match wallet.engine_mut().ledger_mut().confirm_split(*txid, h, &SystemClock) {
+                    Ok(()) => sink(format!("split {txid} confirmed at {h}; delays anchored")),
+                    Err(e) => sink(format!("confirm_split failed: {e}")),
+                }
+                pending_split = None;
+                state.lock().unwrap().busy = None;
+            } else if iter.saturating_sub(*started) > 400 {
+                sink(format!(
+                    "onboard timed out waiting for split {txid} to confirm; POST /onboard \
+                     again with the same deposit to resume"
+                ));
+                pending_split = None;
+                state.lock().unwrap().busy = None;
+            } else if iter.saturating_sub(*started) % 10 == 9 {
+                if let Err(e) = chain.broadcast(tx_bytes) {
+                    sink(format!("split rebroadcast refused ({e}); still waiting"));
+                }
+            }
+        }
+
+        // 3. Advance the live swap one step.
+        live = step_live(
+            live, wallet, chain, data_dir, state, &mut active_sid_hex, opts, poll,
+            block_x_delta, jitter, &mut sink,
+        );
+
+        // 4. Whole-wallet recovery pass on a slow cadence (other swaps'
+        //    deadlines stay driven while this one runs).
+        if let Some(chain) = chain {
+            if iter.is_multiple_of(10) && iter > 0 {
+                recovery_pass(wallet, chain, data_dir, opts, None);
+            }
+        }
+
+        // 5. Snapshot refresh.
+        {
+            let params = wallet.params().clone();
+            let mut st = state.lock().unwrap();
+            let active = active_sid_hex.as_ref().and_then(|s| st.swaps.get(s)).cloned();
+            st.status_json = status_snapshot(
+                wallet.engine(),
+                &params,
+                network,
+                chain.map(|c| c.tip_height()),
+                chain.is_some(),
+                active.as_ref(),
+                st.busy,
+                &alarms,
+            );
+        }
+
+        iter += 1;
+        std::thread::sleep(poll);
+    }
+}
+
+/// Update (or create) the active swap's view.
+fn set_swap_view(
+    state: &SharedState,
+    active: &mut Option<String>,
+    sid: &str,
+    phase: &str,
+    outcome: Option<String>,
+) {
+    let mut st = state.lock().unwrap();
+    // A "pending" placeholder is replaced once the real sid derives.
+    if let Some(old) = active.as_ref() {
+        if old != sid {
+            st.swaps.remove(old);
+        }
+    }
+    *active = Some(sid.to_string());
+    st.swaps.insert(
+        sid.to_string(),
+        SwapView { sid: sid.to_string(), phase: phase.to_string(), outcome },
+    );
+}
+
+/// Release leases orphaned by a failed swap attempt. The negotiate/begin
+/// contract heals orphaned leases at the NEXT `SwapEngine::open` — right for
+/// the one-shot `swap` command, but a long-running serve process would leak
+/// one coin per failed attempt until restart (Fable review, HIGH). This runs
+/// the same chain-aware reconcile in-process.
+fn heal_orphan_leases(wallet: &mut Wallet, chain: &NodeChain, sink: &mut dyn FnMut(String)) {
+    if let Err(e) = wallet.engine_mut().reconcile_leases_with_chain(chain) {
+        sink(format!(
+            "ALARM: orphan-lease heal failed ({e}); a pre-encumbrance coin may stay leased \
+             until the next restart"
+        ));
+    }
+}
+
+/// Negotiate + begin over an established transport; returns the next state.
+#[allow(clippy::too_many_arguments)]
+fn begin_swap(
+    wallet: &mut Wallet,
+    chain: &NodeChain,
+    network: Network,
+    data_dir: &Path,
+    mut transport: TcpTransport,
+    poll: Duration,
+    block_x_delta: u32,
+    jitter: u32,
+    state: &SharedState,
+    active: &mut Option<String>,
+    sink: &mut dyn FnMut(String),
+) -> Live {
+    let io_timeout = Duration::from_secs(120.max(poll.as_secs().saturating_mul(3)));
+    if let Err(e) = transport.set_io_timeout(Some(io_timeout)) {
+        sink(format!("transport setup failed: {e}"));
+        state.lock().unwrap().busy = None;
+        return Live::Idle;
+    }
+    set_swap_view(state, active, "pending", "negotiating", None);
+    let session_seckey = secp::Scalar::random(&mut rand::rng());
+    let negotiated = match negotiate_swap(
+        &mut transport,
+        wallet.engine_mut(),
+        chain,
+        &SystemClock,
+        network,
+        data_dir,
+        session_seckey,
+    ) {
+        Ok(n) => n,
+        Err(e) => {
+            sink(format!("negotiation failed: {e}"));
+            heal_orphan_leases(wallet, chain, sink);
+            set_swap_view(state, active, "pending", "failed", Some(format!("negotiation: {e}")));
+            state.lock().unwrap().busy = None;
+            return Live::Idle;
+        }
+    };
+    let sid = negotiated.artifacts.session_id;
+    let sid_hex = hex32(&sid);
+    sink(format!("negotiated swap session {sid_hex}"));
+    sink("NOTE: claim-delay privacy posture is not applied pre-alpha (immediate broadcast)".into());
+    let peer = PeerSession::new(sid, Box::new(transport));
+    let block_x = chain.tip_height() + block_x_delta;
+    match SwapApp::begin(wallet.engine(), negotiated.ctx, peer, block_x, jitter) {
+        Ok(app) => {
+            set_swap_view(state, active, &sid_hex, "funding", None);
+            Live::Running {
+                app: Box::new(app),
+                artifacts: Box::new(negotiated.artifacts),
+                run: SwapRunState::new(),
+            }
+        }
+        Err(e) => {
+            sink(format!("SwapApp::begin failed: {e}"));
+            heal_orphan_leases(wallet, chain, sink);
+            set_swap_view(state, active, &sid_hex, "failed", Some(format!("begin: {e}")));
+            state.lock().unwrap().busy = None;
+            Live::Idle
+        }
+    }
+}
+
+/// One tick of the live-activity state machine (the serve twin of
+/// `cmd_swap`'s loops, incl. the fund-exposure guard discipline).
+#[allow(clippy::too_many_arguments)]
+fn step_live(
+    live: Live,
+    wallet: &mut Wallet,
+    chain: Option<&NodeChain>,
+    data_dir: &Path,
+    state: &SharedState,
+    active: &mut Option<String>,
+    opts: &RunOptions,
+    poll: Duration,
+    block_x_delta: u32,
+    jitter: u32,
+    sink: &mut dyn FnMut(String),
+) -> Live {
+    let Some(chain) = chain else { return live };
+    match live {
+        Live::Idle => Live::Idle,
+        Live::Accepting { listener, deadline } => {
+            match TcpTransport::accept_timeout(&listener, Duration::from_millis(900)) {
+                Ok(t) => {
+                    let network = wallet.config().network;
+                    let dir = wallet.config().data_dir.clone();
+                    begin_swap(
+                        wallet, chain, network, &dir, t, poll, block_x_delta, jitter, state,
+                        active, sink,
+                    )
+                }
+                Err(_) if std::time::Instant::now() < deadline => {
+                    Live::Accepting { listener, deadline }
+                }
+                Err(_) => {
+                    sink("no peer connected before the deadline".into());
+                    set_swap_view(state, active, "pending", "failed", Some("no peer".into()));
+                    state.lock().unwrap().busy = None;
+                    Live::Idle
+                }
+            }
+        }
+        Live::Running { mut app, artifacts, mut run } => {
+            let sid = artifacts.session_id;
+            let sid_hex = hex32(&sid);
+            if let Err(e) = backstop_step(&app, wallet.engine_mut(), chain, opts, sink) {
+                sink(format!("backstop pass failed (retrying): {e}"));
+            }
+            match swap_step(&mut app, wallet.engine_mut(), chain, &artifacts, &mut run, opts, sink)
+            {
+                Ok(SwapStepOutcome::Continue(tick)) => {
+                    set_swap_view(state, active, &sid_hex, &format!("{tick:?}"), None);
+                    Live::Running { app, artifacts, run }
+                }
+                Ok(SwapStepOutcome::Done(SwapOutcome::Completed { .. })) => {
+                    set_swap_view(state, active, &sid_hex, "babysit-completion", None);
+                    Live::BabysitCompletion { app, sid }
+                }
+                Ok(SwapStepOutcome::Done(SwapOutcome::Refunding { reason })) => {
+                    sink(format!("refund exit: {reason}"));
+                    set_swap_view(state, active, &sid_hex, "babysit-refund", None);
+                    Live::BabysitRefund { app, sid }
+                }
+                Ok(SwapStepOutcome::Done(SwapOutcome::Aborted { reason })) => {
+                    sink(format!("swap aborted cleanly: {reason}"));
+                    set_swap_view(state, active, &sid_hex, "aborted", Some(reason.to_string()));
+                    state.lock().unwrap().busy = None;
+                    Live::Idle
+                }
+                Err(e) if run.setup_on_wire => {
+                    sink(format!("ALARM: swap failed with the escrow exposed: {e}; guarding"));
+                    set_swap_view(state, active, &sid_hex, "guard", None);
+                    Live::Guard { app }
+                }
+                Err(e) => {
+                    sink(format!("swap failed before fund exposure: {e}"));
+                    heal_orphan_leases(wallet, chain, sink);
+                    set_swap_view(state, active, &sid_hex, "failed", Some(e.to_string()));
+                    state.lock().unwrap().busy = None;
+                    Live::Idle
+                }
+            }
+        }
+        Live::BabysitCompletion { app, sid } => {
+            let sid_hex = hex32(&sid);
+            if let Err(e) = backstop_step(&app, wallet.engine_mut(), chain, opts, sink) {
+                sink(format!("backstop pass failed (retrying): {e}"));
+            }
+            match completion_babysit_step(wallet.engine_mut(), chain, data_dir, &sid, opts, sink) {
+                Ok(Some(())) => {
+                    sink("SWAP COMPLETED — completion confirmed on chain".into());
+                    set_swap_view(state, active, &sid_hex, "completed", Some("completed".into()));
+                    state.lock().unwrap().busy = None;
+                    Live::Idle
+                }
+                Ok(None) => Live::BabysitCompletion { app, sid },
+                Err(e) => {
+                    sink(format!("completion babysit failed (retrying): {e}"));
+                    Live::BabysitCompletion { app, sid }
+                }
+            }
+        }
+        Live::BabysitRefund { app, sid } => {
+            let sid_hex = hex32(&sid);
+            if let Err(e) = backstop_step(&app, wallet.engine_mut(), chain, opts, sink) {
+                sink(format!("backstop pass failed (retrying): {e}"));
+            }
+            match refund_babysit_step(wallet.engine_mut(), chain, data_dir, &sid, opts, sink) {
+                Ok(Some(phase)) => {
+                    sink(format!("refund resolved — record terminal {phase:?}"));
+                    set_swap_view(state, active, &sid_hex, "refunded", Some(format!("{phase:?}")));
+                    state.lock().unwrap().busy = None;
+                    Live::Idle
+                }
+                Ok(None) => Live::BabysitRefund { app, sid },
+                Err(e) => {
+                    sink(format!("refund babysit failed (retrying): {e}"));
+                    Live::BabysitRefund { app, sid }
+                }
+            }
+        }
+        Live::Guard { app } => {
+            if let Err(e) = backstop_step(&app, wallet.engine_mut(), chain, opts, sink) {
+                sink(format!("guard backstop failed (retrying): {e}"));
+            }
+            recovery_pass(wallet, chain, data_dir, opts, None);
+            if matches!(
+                chain.spend_status(app.our_escrow()),
+                swapkey::chain::SpendStatus::Confirmed(_)
+            ) {
+                sink("escrow exit confirmed; run recover to reconcile records".into());
+                if let Some(sid_hex) = active.clone() {
+                    set_swap_view(state, active, &sid_hex, "guard-resolved", Some("refunded".into()));
+                }
+                state.lock().unwrap().busy = None;
+                Live::Idle
+            } else {
+                Live::Guard { app }
+            }
+        }
+    }
+}
+
+/// The API-side onboard front half: register (with the route-verified
+/// Phase-0 ack) + split + broadcast. Returns the split txid + signed bytes
+/// (the worker tail rebroadcasts them until confirmation).
+fn serve_onboard(
+    wallet: &mut Wallet,
+    chain: &NodeChain,
+    deposit: &str,
+    split_fee: u64,
+    sink: &mut dyn FnMut(String),
+) -> Result<(bitcoin::Txid, Vec<u8>), UsageError> {
+    let deposit = parse_outpoint(deposit)?;
+    let params = wallet.params().clone();
+    {
+        use swapkey::wallet::ledger::{CoinClass, CoinState};
+        if let Some(coin) = wallet.engine().ledger().find(&deposit) {
+            match (coin.class, coin.state, coin.split_attempts.last().cloned()) {
+                (_, CoinState::SplitPending, Some(attempt)) => {
+                    sink("deposit mid-split — resuming".into());
+                    chain.broadcast(&attempt.tx_bytes)?;
+                    return Ok((attempt.txid, attempt.tx_bytes));
+                }
+                (CoinClass::Deposit, CoinState::Unspent, _) => {
+                    sink("deposit registered but unsplit — resuming at the split".into());
+                }
+                _ => return Err("deposit already tracked".into()),
+            }
+        } else {
+            let height = chain
+                .funding_height(deposit)
+                .ok_or("deposit not found or not confirmed")?;
+            let amount = chain.funding_amount(deposit).ok_or("node did not report the amount")?;
+            let spk = chain.funding_spk(deposit).ok_or("node did not report the spk")?;
+            let keys = wallet.engine().keys();
+            let mut key_index = None;
+            for i in 0..KEY_SCAN_LIMIT {
+                if runner::derived_spk(keys, KeyPurpose::Deposit, i)? == spk {
+                    key_index = Some(i);
+                    break;
+                }
+            }
+            let key_index = key_index.ok_or("deposit does not pay any address of this wallet")?;
+            // The route enforced ack_phase0 AND /status carries the warning
+            // copy for the UI to display — that pair is the display contract.
+            let ack = acknowledge_phase0(PHASE0_WARNING)?;
+            wallet
+                .engine_mut()
+                .register_deposit(deposit, amount, height, key_index, &spk, Some(ack))?;
+            sink(format!("deposit registered: {amount} sats at height {height}"));
+        }
+    }
+    let plan = wallet.engine_mut().split_deposit(deposit, &params, split_fee)?;
+    let txid = chain.broadcast(&plan.tx_bytes)?;
+    sink(format!(
+        "split broadcast {txid}: {} unit(s), reserve {} sats",
+        plan.pre_encumbrance_count, plan.reserve_sats
+    ));
+    Ok((plan.txid, plan.tx_bytes))
 }
