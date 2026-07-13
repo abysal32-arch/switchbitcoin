@@ -13,7 +13,7 @@ use swapkey::crypto::{ValidatedFinalSig, ValidatedPoint};
 use swapkey::settlement::params::Params;
 use swapkey::settlement::refund::{confirm_watchtower_handoff, PreArmedRefund};
 use swapkey::settlement::state_machine::{
-    ExchangeInputs, Funding, PeerSession, Possessing, Role,
+    ExchangeInputs, Funding, PeerSession, Possessing, Role, Transport,
 };
 use swapkey::tx::escrow::Escrow;
 use swapkey::tx::txbuild::{build_completion, verify_taproot_key_spend};
@@ -154,4 +154,38 @@ fn adaptor_exchange_over_tcp_both_legs_spendable() {
         (s_height + 12) as u64 + plan.delay_blocks as u64 + params.claim_confirm_allowance as u64
             <= s_height as u64 + params.delta_late()
     );
+}
+
+/// Task 05 envelope gate over the REAL transport: a frame sealed for one
+/// session must not open for another (cross-session splice), and a frame
+/// carrying a foreign wire version must be rejected — both surviving actual
+/// TCP framing byte-identically.
+#[test]
+fn cross_session_and_wrong_version_envelopes_rejected_over_tcp() {
+    use swapkey::wire::{open_message, seal_message, Message, WIRE_VERSION};
+
+    let (mut a, mut b) = tcp_pair();
+    let sid = [0xAAu8; 32];
+    let other_sid = [0xBBu8; 32];
+    let m = Message::NonceCommitment([0x77u8; 32]);
+
+    // Sanity: the sealed frame crosses TCP intact and opens under its session.
+    a.send(&seal_message(&sid, &m)).expect("send sealed");
+    let frame = b.recv().expect("recv sealed");
+    assert_eq!(open_message(&sid, &frame).expect("own session must open"), m);
+
+    // Cross-session splice: the same valid bytes, expected by another session.
+    a.send(&seal_message(&sid, &m)).expect("send sealed");
+    let frame = b.recv().expect("recv sealed");
+    assert!(
+        open_message(&other_sid, &frame).is_err(),
+        "frame sealed for session A must not open for session B"
+    );
+
+    // Wrong wire version: rejected before any field parses.
+    let mut forged = seal_message(&sid, &m);
+    forged[0] = WIRE_VERSION.wrapping_add(1);
+    a.send(&forged).expect("send forged");
+    let frame = b.recv().expect("recv forged");
+    assert!(open_message(&sid, &frame).is_err(), "foreign wire version must be rejected");
 }

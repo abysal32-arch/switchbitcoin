@@ -59,7 +59,8 @@
 //!     u32-BE length framing behind the settlement core's `Transport` trait.
 //!     PLAINTEXT, LAN/regtest only; Tor/Noise is post-pre-alpha. Transport
 //!     failures map to `Error::Abort` → the refund path, and every received
-//!     frame still passes the `wire::parse_message` gate inside `PeerSession`.
+//!     frame still passes the `wire::open_message` gate inside `PeerSession`
+//!     (version + exact-length + session-id envelope, then field validation).
 
 //!   * `engine` — the swap engine (rank 7): the wallet's core loop that
 //!     composes every rank into one driven, crash-recoverable swap lifecycle

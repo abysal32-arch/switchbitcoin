@@ -158,8 +158,8 @@ impl ValidatedFinalSig {
 
 // --- Fuzz entry point (Requirement 4) -------------------------------------
 // The wire parser calls these. The fuzz target throws arbitrary bytes at
-// `wire::parse_message`, which must NEVER panic — only ever return Err. See
-// fuzz/fuzz_targets/wire_parse.rs.
+// `wire::parse_message` AND the envelope opener `wire::open_message`, which
+// must NEVER panic — only ever return Err. See fuzz/fuzz_targets/wire_parse.rs.
 
 #[cfg(test)]
 mod tests {

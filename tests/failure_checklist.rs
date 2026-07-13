@@ -16,8 +16,8 @@
 
 use bitcoin::{OutPoint, Txid};
 use swapkey::chain::{ChainView, DualSourceChainView, SimChain, Source, SpendStatus};
-use swapkey::crypto::adaptor::AdaptorSecret;
-use swapkey::crypto::{ValidatedFinalSig, ValidatedPoint};
+use swapkey::crypto::adaptor::{AdaptorPoint, AdaptorSecret};
+use swapkey::crypto::{ValidatedFinalSig, ValidatedPartial, ValidatedPoint, ValidatedPubNonce};
 use swapkey::settlement::params::Params;
 use swapkey::settlement::refund::{confirm_watchtower_handoff, PreArmedRefund, Watchtower};
 use swapkey::settlement::state_machine::{
@@ -27,7 +27,9 @@ use swapkey::signing::{commit_and_reveal, SigningSession, SingleSignerLease};
 use swapkey::tx::escrow::Escrow;
 use swapkey::tx::setup::build_setup;
 use swapkey::tx::txbuild::{build_completion, finalize_key_spend, SpendTx};
-use swapkey::wire::parse_message;
+use swapkey::wire::{
+    open_message, parse_message, seal_message, serialize_message, Message, WIRE_VERSION,
+};
 use swapkey::{Error, Result};
 use secp::{Point, Scalar};
 use std::sync::mpsc;
@@ -531,14 +533,72 @@ fn invalid_wire_input_is_rejected_not_panicked() {
         assert!(parse_message(sample).is_err(), "accepted malformed input: {sample:02x?}");
     }
 
-    // Pseudorandom blast (deterministic seed): total behavior on arbitrary bytes.
+    // Pseudorandom blast (deterministic seed): total behavior on arbitrary
+    // bytes, through BOTH entry points (bare parser + envelope opener).
     use rand::{Rng, SeedableRng};
+    let sid = [0xABu8; 32];
     let mut rng = rand::rngs::StdRng::seed_from_u64(0x6e65_776b_6579);
     for _ in 0..50_000 {
         let len = rng.random_range(0..512);
         let bytes: Vec<u8> = (0..len).map(|_| rng.random()).collect();
         let _ = parse_message(&bytes); // Ok or Err both fine; panic is the bug.
+        let _ = open_message(&sid, &bytes);
     }
+
+    // Every message type: EVERY single-byte truncation of the valid encoding
+    // must Err (never panic) — bare and sealed — and a sealed frame must be
+    // rejected under a different session id or wire version (Task 05).
+    let one_of_each = valid_message_menagerie();
+    assert_eq!(one_of_each.len(), 6, "menagerie must cover every Message variant");
+    let other_sid = [0xACu8; 32];
+    for m in &one_of_each {
+        let bare = serialize_message(m);
+        for i in 0..bare.len() {
+            assert!(parse_message(&bare[..i]).is_err(), "bare truncation to {i} must Err");
+        }
+        let sealed = seal_message(&sid, m);
+        assert_eq!(open_message(&sid, &sealed).expect("sealed frame must open"), *m);
+        for i in 0..sealed.len() {
+            assert!(open_message(&sid, &sealed[..i]).is_err(), "sealed truncation to {i} must Err");
+        }
+        // Cross-session splice: valid frame, wrong session id.
+        assert!(open_message(&other_sid, &sealed).is_err(), "cross-session frame must Err");
+        // Version mismatch: rejected before anything else parses.
+        let mut wrong_ver = sealed.clone();
+        wrong_ver[0] = WIRE_VERSION.wrapping_add(1);
+        assert!(open_message(&sid, &wrong_ver).is_err(), "wrong-version frame must Err");
+    }
+}
+
+/// One valid instance of every `Message` variant, for totality sweeps.
+fn valid_message_menagerie() -> Vec<Message> {
+    let scalar = |k: u32| {
+        let mut b = [0u8; 32];
+        b[28..].copy_from_slice(&k.to_be_bytes());
+        Scalar::from_slice(&b).expect("nonzero scalar")
+    };
+    let point = |k: u32| {
+        ValidatedPoint::from_bytes(&(scalar(k) * secp::G).serialize()).expect("valid point")
+    };
+    let nonce = |k: u32| {
+        let mut b = [0u8; 66];
+        b[..33].copy_from_slice(&(scalar(k) * secp::G).serialize());
+        b[33..].copy_from_slice(&(scalar(k + 1) * secp::G).serialize());
+        ValidatedPubNonce::from_bytes(&b).expect("valid nonce")
+    };
+    let partial = |k: u32| {
+        let mut b = [0u8; 32];
+        b[28..].copy_from_slice(&k.to_be_bytes());
+        ValidatedPartial::from_bytes(&b).expect("valid partial")
+    };
+    vec![
+        Message::NonceCommitment([0x5au8; 32]),
+        Message::Nonces { comp_sh: nonce(1), comp_sl: nonce(3) },
+        Message::AdaptorPointMsg(AdaptorPoint::new(point(7))),
+        Message::ShPartials { comp_sh: partial(1), comp_sl: partial(2) },
+        Message::SlEnablingPartial(partial(9)),
+        Message::Destination(point(11)),
+    ]
 }
 
 // ---- 7. Partial funding / fund-and-run ------------------------------------
@@ -848,9 +908,14 @@ fn equivocated_nonce_reveal_is_rejected() {
         }
         fn recv(&mut self) -> Result<Vec<u8>> {
             let b = self.rx.recv().map_err(|_| Error::Abort("hung up"))?;
-            if b.first() == Some(&0x01) {
+            // Envelope = [ver][tag][len:4][sid:32][fields]; Nonces tag 0x01.
+            if b.get(1) == Some(&0x01) && b.len() >= 38 {
                 // Replace the counterparty's real Nonces reveal with different
-                // valid nonces — the commitment check must then fail.
+                // valid nonces, RE-SEALED under the frame's own session id (a
+                // MITM can do this — the sid is not secret; it is the
+                // commit-reveal interlock that must catch the substitution).
+                let mut sid = [0u8; 32];
+                sid.copy_from_slice(&b[6..38]);
                 let vn = |k: u32| -> ValidatedPubNonce {
                     let s = |x: u32| {
                         let mut z = [0u8; 32];
@@ -862,7 +927,7 @@ fn equivocated_nonce_reveal_is_rejected() {
                     nb[33..].copy_from_slice(&(s(k + 1) * secp::G).serialize());
                     ValidatedPubNonce::from_bytes(&nb).unwrap()
                 };
-                return Ok(swapkey::wire::serialize_message(&swapkey::wire::Message::Nonces {
+                return Ok(seal_message(&sid, &Message::Nonces {
                     comp_sh: vn(101),
                     comp_sl: vn(103),
                 }));

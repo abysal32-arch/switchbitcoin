@@ -30,7 +30,7 @@ use crate::signing::{
     aggregate_nonces, assemble_complete_presig, commit_and_reveal, nonce_commitment,
     verify_partial, RevealedNonces, SigningSession, SingleSignerLease,
 };
-use crate::wire::{parse_message, serialize_message, Message};
+use crate::wire::{open_message, seal_message, Message};
 use crate::{Error, Result};
 use musig2::KeyAggContext;
 use secp::{Point, Scalar};
@@ -38,8 +38,10 @@ use std::rc::Rc;
 
 /// Byte-level duplex channel to the counterparty. The (stubbed) discovery layer
 /// provides the real authenticated Tor stream; tests provide an in-memory pair.
-/// RECEIVING goes through `wire::parse_message`, so everything that enters the
-/// state machine has passed the validation gate — a Transport cannot bypass it.
+/// RECEIVING goes through `wire::open_message` (Task 05 envelope: version +
+/// exact length + session binding, then per-field crypto validation), so
+/// everything that enters the state machine has passed the validation gate —
+/// a Transport cannot bypass it.
 pub trait Transport {
     fn send(&mut self, bytes: &[u8]) -> Result<()>;
     fn recv(&mut self) -> Result<Vec<u8>>;
@@ -49,10 +51,12 @@ pub trait Transport {
 /// discovery layer; here constructed manually (tests, hand-fed testnet drive).
 ///
 /// `swap_session_id` here is the Phase-2 routing/session tag. The AUTHORITATIVE
-/// cryptographic swap_session_id used to key the single-signer lease and bind
-/// the possession witness is DERIVED inside `run_adaptor_exchange` from the two
-/// session pubkeys via `swap_session_id(...)`, so both wallets always agree
-/// regardless of this tag.
+/// cryptographic swap_session_id used to key the single-signer lease, bind
+/// the possession witness, AND seal every wire envelope is DERIVED inside
+/// `run_adaptor_exchange` from the two session pubkeys via
+/// `swap_session_id(...)`, so both wallets always agree regardless of this
+/// tag — a frame spliced in from another session fails `open_message` no
+/// matter what tag the sessions were constructed with.
 pub struct PeerSession {
     swap_session_id: [u8; 32],
     transport: Box<dyn Transport>,
@@ -67,14 +71,16 @@ impl PeerSession {
         &self.swap_session_id
     }
 
-    fn send_msg(&mut self, m: &Message) -> Result<()> {
-        self.transport.send(&serialize_message(m))
+    /// Seal under the DERIVED swap_session_id (`sid`), not the routing tag.
+    fn send_msg(&mut self, sid: &[u8; 32], m: &Message) -> Result<()> {
+        self.transport.send(&seal_message(sid, m))
     }
 
-    /// Every received byte string passes the validation gate here.
-    fn recv_msg(&mut self) -> Result<Message> {
+    /// Every received byte string passes the envelope + validation gate here:
+    /// wrong version, wrong length, or a session id other than `sid` => Err.
+    fn recv_msg(&mut self, sid: &[u8; 32]) -> Result<Message> {
         let bytes = self.transport.recv()?;
-        parse_message(&bytes)
+        open_message(sid, &bytes)
     }
 }
 
@@ -308,7 +314,7 @@ fn release_enabling_partial(
     if witness.swap_session_id != swap_sid {
         return Err(Error::Ordering("possession witness is bound to a different swap"));
     }
-    peer.send_msg(&Message::SlEnablingPartial(enabling_partial))
+    peer.send_msg(&swap_sid, &Message::SlEnablingPartial(enabling_partial))
 }
 
 impl Funding {
@@ -487,15 +493,15 @@ impl Funded {
         // and only THEN are nonces revealed. A counterparty therefore cannot
         // choose its nonces adaptively after seeing ours (Wagner/Drijvers).
         let ours = commit_and_reveal(&mut sess_sh, &mut sess_sl)?;
-        self.peer.send_msg(&Message::NonceCommitment(nonce_commitment(&ours)))?;
-        let their_commitment = expect_nonce_commitment(self.peer.recv_msg()?)?;
+        self.peer.send_msg(&swap_sid, &Message::NonceCommitment(nonce_commitment(&ours)))?;
+        let their_commitment = expect_nonce_commitment(self.peer.recv_msg(&swap_sid)?)?;
 
         // Both sides have committed; reveal now.
-        self.peer.send_msg(&Message::Nonces {
+        self.peer.send_msg(&swap_sid, &Message::Nonces {
             comp_sh: ours.comp_sh.clone(),
             comp_sl: ours.comp_sl.clone(),
         })?;
-        let (their_nonce_sh, their_nonce_sl) = expect_nonces(self.peer.recv_msg()?)?;
+        let (their_nonce_sh, their_nonce_sl) = expect_nonces(self.peer.recv_msg(&swap_sid)?)?;
 
         // The revealed nonces MUST match the prior commitment.
         let their_revealed = RevealedNonces {
@@ -524,18 +530,18 @@ impl Funded {
                     .adaptor_secret
                     .ok_or(Error::Ordering("SH must supply its adaptor secret"))?;
                 let t_point = t_secret.point();
-                self.peer.send_msg(&Message::AdaptorPointMsg(t_point.clone()))?;
+                self.peer.send_msg(&swap_sid, &Message::AdaptorPointMsg(t_point.clone()))?;
 
                 // (3) SH signs BOTH completions, adaptor-bound, and sends them.
                 let p_sh = sess_sh.sign_partial(&agg_nonce_sh, &t_point)?;
                 let p_sl = sess_sl.sign_partial(&agg_nonce_sl, &t_point)?;
-                self.peer.send_msg(&Message::ShPartials {
+                self.peer.send_msg(&swap_sid, &Message::ShPartials {
                     comp_sh: p_sh.clone(),
                     comp_sl: p_sl.clone(),
                 })?;
 
                 // (5) Receive SL's enabling partial; verify BEFORE aggregation.
-                let enabling = expect_sl_enabling(self.peer.recv_msg()?)?;
+                let enabling = expect_sl_enabling(self.peer.recv_msg(&swap_sid)?)?;
                 verify_partial(
                     &ctx_sh, &enabling, &agg_nonce_sh, &t_point,
                     &inputs.their_pubkey, &their_nonce_sh, &inputs.msg_comp_sh,
@@ -561,11 +567,11 @@ impl Funded {
             }
             Role::SecretLearner => {
                 // (2) Receive T (validated by the wire gate).
-                let t_point = expect_adaptor_point(self.peer.recv_msg()?)?;
+                let t_point = expect_adaptor_point(self.peer.recv_msg(&swap_sid)?)?;
 
                 // (3) Receive SH's partials on BOTH completions; verify each
                 // under that leg's tweaked context.
-                let (sh_p_sh, sh_p_sl) = expect_sh_partials(self.peer.recv_msg()?)?;
+                let (sh_p_sh, sh_p_sl) = expect_sh_partials(self.peer.recv_msg(&swap_sid)?)?;
                 verify_partial(
                     &ctx_sh, &sh_p_sh, &agg_nonce_sh, &t_point,
                     &inputs.their_pubkey, &their_nonce_sh, &inputs.msg_comp_sh,
@@ -1174,18 +1180,20 @@ mod tests {
         }
         impl Transport for CorruptingTransport {
             fn send(&mut self, bytes: &[u8]) -> Result<()> {
-                if let Some(&tag) = bytes.first() {
+                // Envelope = [ver][tag][len:4][sid:32][fields]; tag at index 1.
+                if let Some(&tag) = bytes.get(1) {
                     self.sent_tags.lock().unwrap().push(tag);
                 }
                 self.inner.send(bytes)
             }
             fn recv(&mut self) -> Result<Vec<u8>> {
                 let mut b = self.inner.recv()?;
-                // ShPartials = [0x03][32 comp_sh][32 comp_sl]; flip the last
-                // byte of comp_sh — stays a valid scalar (< n w.h.p.), so it
-                // passes the WIRE gate and must fail verify_partial instead.
-                if b.first() == Some(&0x03) && b.len() >= 33 {
-                    b[32] ^= 0x01;
+                // Sealed ShPartials = [ver][0x03][len:4][sid:32][32 comp_sh]
+                // [32 comp_sl]; flip the last byte of comp_sh (index 69) —
+                // stays a valid scalar (< n w.h.p.), so it passes the WIRE
+                // gate and must fail verify_partial instead.
+                if b.get(1) == Some(&0x03) && b.len() >= 70 {
+                    b[69] ^= 0x01;
                 }
                 Ok(b)
             }
@@ -1258,6 +1266,99 @@ mod tests {
             std::fs::read_dir(store.path()).unwrap().next().is_none(),
             "possession record written before a verified pre-sig"
         );
+        let _ = sh.join();
+    }
+
+    /// CROSS-SESSION SPLICE (Task 05): frames arriving with a session id other
+    /// than THIS exchange's derived swap_session_id must be rejected by the
+    /// envelope gate and abort the exchange — a message captured from (or
+    /// forged for) another swap can never feed this state machine, no matter
+    /// how valid its fields are.
+    #[test]
+    fn spliced_frames_from_another_session_abort_the_exchange() {
+        /// Rewrites the envelope's session-id field on every inbound frame —
+        /// byte-identical to an attacker splicing traffic from another session.
+        struct SplicingTransport {
+            inner: ChannelTransport,
+        }
+        impl Transport for SplicingTransport {
+            fn send(&mut self, bytes: &[u8]) -> Result<()> {
+                self.inner.send(bytes)
+            }
+            fn recv(&mut self) -> Result<Vec<u8>> {
+                let mut b = self.inner.recv()?;
+                // Envelope = [ver][tag][len:4][sid: 6..38][fields].
+                if b.len() >= 38 {
+                    for x in &mut b[6..38] {
+                        *x = 0xDD;
+                    }
+                }
+                Ok(b)
+            }
+        }
+
+        let sh_keys = keypair();
+        let sl_keys = keypair();
+        let (io_sh, io_sl) = duplex();
+        let swap_id = [0xADu8; 32];
+        let (msg_a, msg_b) = ([0x81u8; 32], [0x82u8; 32]);
+        let params = Params::testnet_provisional();
+        let s_height = 9_000;
+        let lease_dir_sh = tempfile::tempdir().expect("tempdir");
+        let lease_dir_sl = tempfile::tempdir().expect("tempdir");
+
+        let sh_params = params.clone();
+        let (sh_sk, sl_pub) = (sh_keys.seckey, sl_keys.pubkey);
+        // SH plays honestly; it errors when SL aborts and drops the channel.
+        let sh = std::thread::spawn(move || -> Result<()> {
+            let refund = PreArmedRefund::from_signed_tx(vec![0x11; 32], s_height + 300)?;
+            let (t_secret, _) = AdaptorSecret::generate()?;
+            let peer = PeerSession::new(swap_id, Box::new(io_sh));
+            let funded = Funding::new(sh_params, peer).funded_manual(Role::SecretHolder, s_height)?;
+            let _ = funded.run_adaptor_exchange(ExchangeInputs {
+                our_seckey: sh_sk,
+                their_pubkey: ValidatedPoint::from_bytes(&sl_pub.serialize())?,
+                msg_comp_sh: msg_a,
+                msg_comp_sl: msg_b,
+                pre_armed_refund: refund,
+                adaptor_secret: Some(t_secret),
+                lease_dir: Some(lease_dir_sh.path().to_path_buf()),
+                possession_store: None,
+                taproot_root_comp_sh: None,
+                taproot_root_comp_sl: None,
+                taproot_output_comp_sh: None,
+                taproot_output_comp_sl: None,
+            })?;
+            Ok(())
+        });
+
+        let peer = PeerSession::new(swap_id, Box::new(SplicingTransport { inner: io_sl }));
+        let funded = Funding::new(params, peer)
+            .funded_manual(Role::SecretLearner, s_height)
+            .expect("funded");
+        let store = tempfile::tempdir().expect("store");
+        let result = funded.run_adaptor_exchange(ExchangeInputs {
+            our_seckey: sl_keys.seckey,
+            their_pubkey: ValidatedPoint::from_bytes(&sh_keys.pubkey.serialize()).unwrap(),
+            msg_comp_sh: msg_a,
+            msg_comp_sl: msg_b,
+            pre_armed_refund: PreArmedRefund::from_signed_tx(vec![0x33; 32], s_height + 200).unwrap(),
+            adaptor_secret: None,
+            lease_dir: Some(lease_dir_sl.path().to_path_buf()),
+            possession_store: Some(store.path().to_path_buf()),
+            taproot_root_comp_sh: None,
+            taproot_root_comp_sl: None,
+            taproot_output_comp_sh: None,
+            taproot_output_comp_sl: None,
+        });
+
+        match result {
+            Err(Error::Validation(m)) => {
+                assert_eq!(m, "wire message for a different session")
+            }
+            Err(other) => panic!("spliced session id must be a Validation error, got {other:?}"),
+            Ok(_) => panic!("spliced session id must abort the exchange"),
+        }
         let _ = sh.join();
     }
 

@@ -7,9 +7,10 @@
 //! work; this module exists so two wallets on one machine / LAN segment can
 //! run the adaptor exchange over an actual socket instead of an in-process
 //! channel. The protocol itself stays safe over a hostile transport — every
-//! received frame still passes `wire::parse_message` inside `PeerSession`,
-//! and any transport failure maps to `Error::Abort`, which the drivers route
-//! to the refund path (forward-or-refund holds).
+//! received frame still passes `wire::open_message` inside `PeerSession`
+//! (version + exact-length + session-id envelope gate, Task 05), and any
+//! transport failure maps to `Error::Abort`, which the drivers route to the
+//! refund path (forward-or-refund holds).
 //!
 //! Framing: each message is `u32 big-endian payload length ++ payload`.
 //! `recv` returns exactly one whole frame; partial reads are looped. Frames
