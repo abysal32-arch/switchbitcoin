@@ -73,8 +73,17 @@
 //!     (funded → exchange → settle), persisting the SwapRecord through every
 //!     phase and reconciling the ledger. The integration layer over the parts.
 
+//!   * `config` + `runtime` — the runnable-wallet shell (pre-alpha): ONE
+//!     validated `WalletConfig` (data dir, network, node RPC, peer addrs;
+//!     loaded from `swapkey.toml` + env) and `Wallet::open`, which routes
+//!     first-run/torn/existing keystore states and composes keystore →
+//!     engine → `SwapApp::startup` under a single data dir with the
+//!     single-instance locks. The Task-08 runner drives the handle.
+
 pub mod abort_hygiene;
 pub mod app;
+pub mod config;
+pub mod runtime;
 pub mod backstop_driver;
 pub mod claim_scheduler;
 pub mod driver;
@@ -101,6 +110,10 @@ pub use manifest::{
     ClaimDelayPosture, ManifestOpenReport, ManifestStore, ManifestTrustRoot, ModeledTrustRoot,
     SignedManifest,
 };
+pub use config::{
+    ConfigError, Network, NodeRpcConfig, PeerConfig, RpcAuth, Secret, WalletConfig, CONFIG_FILE,
+};
 pub use keystore::SoftwareKeyStore;
+pub use runtime::{FirstRun, FirstRunError, OpenedWallet, Wallet};
 pub use store::{EnclaveKeyProvider, ModeledEnclave, RecoveryAction, SwapPhase, SwapRecord, SwapStore};
 pub use transport::{TcpTransport, DEFAULT_IO_TIMEOUT, MAX_FRAME};

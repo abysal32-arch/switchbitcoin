@@ -142,12 +142,6 @@ impl SoftwareKeyStore {
         passphrase: &str,
         iters: u32,
     ) -> Result<(SoftwareKeyStore, Zeroizing<String>)> {
-        if iters == 0 || iters > MAX_PBKDF2_ITERS {
-            return Err(Error::Validation("keystore: pbkdf2 iteration count out of range"));
-        }
-        let path = dir.join(KEYSTORE_FILE);
-        std::fs::create_dir_all(dir).map_err(|_| Error::Abort("keystore dir create failed"))?;
-
         let mut entropy = Zeroizing::new([0u8; 32]);
         rand::rngs::OsRng
             .try_fill_bytes(entropy.as_mut())
@@ -157,6 +151,43 @@ impl SoftwareKeyStore {
         // Empty BIP39 passphrase by design (see module docs): the store
         // passphrase seals the file; it must not change derivation.
         let seed = Zeroizing::new(mnemonic.to_seed(""));
+        let store = Self::seal_new(dir, passphrase, iters, seed)?;
+        let words = Zeroizing::new(mnemonic.to_string());
+        Ok((store, words))
+    }
+
+    /// Dead-device recovery: rebuild the keystore in `dir` from the BIP39
+    /// backup words. Rebuilds the IDENTICAL seed (empty BIP39 passphrase,
+    /// matching [`SoftwareKeyStore::create`]) — same signing keys, same
+    /// `platform_key`, so sealed files from the lost device reopen — and
+    /// seals it under `passphrase` (which may differ from the original; the
+    /// store passphrase never alters derivation) at the production work
+    /// factor. Same atomic never-overwrite guard as `create`: an existing
+    /// `keystore.bin` refuses, it is never replaced.
+    pub fn restore(
+        dir: &Path,
+        mnemonic_words: &str,
+        passphrase: &str,
+    ) -> Result<SoftwareKeyStore> {
+        let mnemonic = bip39::Mnemonic::parse_normalized(mnemonic_words)
+            .map_err(|_| Error::Validation("keystore restore: not a valid BIP39 mnemonic"))?;
+        let seed = Zeroizing::new(mnemonic.to_seed(""));
+        Self::seal_new(dir, passphrase, DEFAULT_PBKDF2_ITERS, seed)
+    }
+
+    /// Shared create/restore tail: seal `seed` to a NEW `dir/keystore.bin`
+    /// under `passphrase` and return the live store.
+    fn seal_new(
+        dir: &Path,
+        passphrase: &str,
+        iters: u32,
+        seed: Zeroizing<[u8; SEED_LEN]>,
+    ) -> Result<SoftwareKeyStore> {
+        if iters == 0 || iters > MAX_PBKDF2_ITERS {
+            return Err(Error::Validation("keystore: pbkdf2 iteration count out of range"));
+        }
+        let path = dir.join(KEYSTORE_FILE);
+        std::fs::create_dir_all(dir).map_err(|_| Error::Abort("keystore dir create failed"))?;
 
         let mut salt = [0u8; SALT_LEN];
         rand::rngs::OsRng
@@ -203,8 +234,7 @@ impl SoftwareKeyStore {
             }
         }
 
-        let words = Zeroizing::new(mnemonic.to_string());
-        Ok((Self::from_seed(seed), words))
+        Ok(Self::from_seed(seed))
     }
 
     /// Open an existing keystore. A wrong passphrase (or any file tampering)
@@ -259,6 +289,44 @@ impl SoftwareKeyStore {
             .expect("HKDF expand of 32 bytes is always in range");
         SoftwareKeyStore { seed, platform_key }
     }
+}
+
+/// Coarse on-disk state of `dir/keystore.bin`, decided WITHOUT any KDF work —
+/// the first-run / torn-file router for `Wallet::open` (Task 07). Keeps the
+/// v1 format knowledge (magic, header lengths) inside this module.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeystoreFileState {
+    /// No file: a fresh dir; [`SoftwareKeyStore::create`] is the path.
+    Absent,
+    /// Passes every pre-KDF v1 header gate ([`SoftwareKeyStore::open`] may
+    /// still fail on the passphrase/GCM tag). Also returned on a transient
+    /// READ error: an I/O blip must never be misreported as torn — deletion
+    /// advice is reserved for [`KeystoreFileState::Torn`].
+    Plausible,
+    /// Definitively NOT a valid v1 keystore (bad magic / header / length): a
+    /// crash mid-`create`, or a foreign file. No mnemonic was ever returned
+    /// for such a file (`create` returns the words only after the synced
+    /// write), so manually deleting it loses nothing.
+    Torn,
+}
+
+/// Probe `dir/keystore.bin` against the same pre-KDF gates `open` applies.
+pub fn probe_keystore_file(dir: &Path) -> KeystoreFileState {
+    let raw = match std::fs::read(dir.join(KEYSTORE_FILE)) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return KeystoreFileState::Absent,
+        Err(_) => return KeystoreFileState::Plausible,
+    };
+    let header = MAGIC.len() + SALT_LEN + 4;
+    if raw.len() < header || &raw[..MAGIC.len()] != MAGIC {
+        return KeystoreFileState::Torn;
+    }
+    let iters =
+        u32::from_le_bytes(raw[MAGIC.len() + SALT_LEN..header].try_into().expect("4 bytes"));
+    if iters == 0 || iters > MAX_PBKDF2_ITERS || raw.len() - header != SEALED_SEED_LEN {
+        return KeystoreFileState::Torn;
+    }
+    KeystoreFileState::Plausible
 }
 
 /// KEK = PBKDF2-HMAC-SHA256(passphrase, salt, iters), 32 bytes.
@@ -501,6 +569,32 @@ mod tests {
             ks.derive_xonly(KeyPurpose::Deposit, 0).unwrap(),
             restored.derive_xonly(KeyPurpose::Deposit, 0).unwrap()
         );
+    }
+
+    #[test]
+    fn public_restore_rebuilds_the_identical_store_and_never_overwrites() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ks, words) =
+            SoftwareKeyStore::create_with_iters(dir.path(), "pw", TEST_ITERS).unwrap();
+
+        // Restore into a FRESH dir (the dead-device path): identical platform
+        // key + signing keys, even under a DIFFERENT store passphrase (the
+        // store passphrase never alters derivation).
+        let dir2 = tempfile::tempdir().unwrap();
+        let restored = SoftwareKeyStore::restore(dir2.path(), &words, "other pw").unwrap();
+        assert_eq!(
+            EnclaveKeyProvider::platform_key(&ks),
+            EnclaveKeyProvider::platform_key(&restored)
+        );
+        assert_eq!(
+            ks.derive_xonly(KeyPurpose::Deposit, 0).unwrap(),
+            restored.derive_xonly(KeyPurpose::Deposit, 0).unwrap()
+        );
+
+        // The never-overwrite guard holds for restore too, and garbage words
+        // are a clean validation error (checked BEFORE any file/KDF work).
+        assert!(SoftwareKeyStore::restore(dir.path(), &words, "pw").is_err());
+        assert!(SoftwareKeyStore::restore(dir2.path(), "not a mnemonic", "pw").is_err());
     }
 
     #[test]

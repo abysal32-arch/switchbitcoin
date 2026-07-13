@@ -368,6 +368,11 @@ fn ledger_salt() -> [u8; 32] {
     sha256::Hash::hash(b"newkey-ledger-v1").to_byte_array()
 }
 
+/// Ledger file name inside the wallet data dir (Task 07's first-run
+/// detection keys on its presence — the ledger is created exactly once, at
+/// onboarding).
+pub const LEDGER_FILE: &str = "ledger.bin";
+
 impl Ledger {
     /// Onboarding: create a fresh ledger. Demands the Phase-0 acknowledgement
     /// (shown once at onboarding). Refuses to clobber an existing ledger.
@@ -377,11 +382,18 @@ impl Ledger {
         _onboarding_ack: Phase0Ack,
     ) -> Result<Ledger> {
         std::fs::create_dir_all(dir).map_err(|_| Error::Abort("ledger dir unavailable"))?;
-        let path = dir.join("ledger.bin");
+        let path = dir.join(LEDGER_FILE);
+        // Lock FIRST, then check existence UNDER the lock: the reverse order
+        // is a TOCTOU — a process that passed a pre-lock exists() check could
+        // stall, wait out another instance's whole session, then acquire the
+        // freed lock and rename an EMPTY ledger over the established one
+        // (persist claims the path via tmp+rename, which replaces; Fable
+        // review finding). With the check under the lock, whoever persisted
+        // first is visible to whoever locks next.
+        let lock = Self::acquire_lock(dir)?;
         if path.exists() {
             return Err(Error::Abort("ledger already exists (refusing to clobber)"));
         }
-        let lock = Self::acquire_lock(dir)?;
         let ledger = Ledger {
             path,
             platform_key: enclave.platform_key(),
@@ -397,7 +409,7 @@ impl Ledger {
     /// Reopen an existing ledger. FAIL-CLOSED: a missing or corrupt ledger is
     /// an error (the coin memory must never silently reset).
     pub fn open(dir: &Path, enclave: &dyn EnclaveKeyProvider) -> Result<Ledger> {
-        let path = dir.join("ledger.bin");
+        let path = dir.join(LEDGER_FILE);
         let lock = Self::acquire_lock(dir)?;
         let sealed = std::fs::read(&path)
             .map_err(|_| Error::Abort("ledger missing/unreadable (restore from backup)"))?;
