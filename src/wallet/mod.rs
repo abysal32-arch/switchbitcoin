@@ -99,6 +99,7 @@ pub mod orchestrator;
 pub mod recovery_driver;
 pub mod runner;
 pub mod store;
+pub mod ticket;
 pub mod transport;
 
 pub use app::{AppTick, BackstopRun, StalledParent, SwapApp};

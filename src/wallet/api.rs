@@ -66,6 +66,13 @@ pub enum ApiCmd {
     Onboard { deposit: String, split_fee: u64 },
     /// Start ONE swap (exactly one of listen/connect, enforced at the route).
     SwapBegin { listen: Option<String>, connect: Option<String> },
+    /// Offer a swap by TICKET: bind `listen`, mint a ticket, expose it in
+    /// `/status` (`offer_ticket`), and wait for a taker to rendezvous.
+    SwapOffer { listen: String },
+    /// Take a swap by TICKET. The route pre-decodes the string (garbage → 400);
+    /// the worker re-decodes and validates network + params against THIS wallet
+    /// before dialing.
+    SwapTake { ticket: String },
 }
 
 /// One swap as the UI sees it.
@@ -93,6 +100,10 @@ pub struct ApiState {
     pub swaps: HashMap<String, SwapView>,
     /// The in-flight worker command, if any (409 gate for new commands).
     pub busy: Option<&'static str>,
+    /// The currently-offered swap ticket (a `skt1…` string) while a
+    /// `SwapOffer` waits for its taker; cleared once a taker rendezvouses or
+    /// the offer deadline passes. Surfaced in `/status` so the UI can show it.
+    pub offer_ticket: Option<String>,
 }
 
 impl Default for ApiState {
@@ -103,6 +114,7 @@ impl Default for ApiState {
             next_seq: 0,
             swaps: HashMap::new(),
             busy: None,
+            offer_ticket: None,
         }
     }
 }
@@ -232,6 +244,27 @@ pub fn route(
             }
             enqueue(state, cmds, "swap", ApiCmd::SwapBegin { listen, connect })
         }
+        ("POST", "/swap/offer") => {
+            let Some(listen) = json_str_field(body, "listen") else {
+                return (400, err_json("body needs {\"listen\":\"host:port\"}"));
+            };
+            if listen.is_empty() || !listen.contains(':') {
+                return (400, err_json("listen must be host:port"));
+            }
+            enqueue(state, cmds, "swap", ApiCmd::SwapOffer { listen })
+        }
+        ("POST", "/swap/take") => {
+            let Some(ticket) = json_str_field(body, "ticket") else {
+                return (400, err_json("body needs {\"ticket\":\"skt1...\"}"));
+            };
+            // Pre-decode at the route so garbage is a 400 that never enqueues.
+            // The route cannot check network/params (it has no engine) — the
+            // WORKER re-decodes and validates those before dialing.
+            if let Err(e) = crate::wallet::ticket::Ticket::decode(&ticket) {
+                return (400, err_json(&e.to_string()));
+            }
+            enqueue(state, cmds, "swap", ApiCmd::SwapTake { ticket })
+        }
         ("GET", _) | ("POST", _) => (404, err_json("unknown endpoint")),
         _ => (405, err_json("method not allowed")),
     }
@@ -283,6 +316,7 @@ pub fn status_snapshot(
     active_swap: Option<&SwapView>,
     busy: Option<&str>,
     alarms: &[String],
+    offer_ticket: Option<&str>,
 ) -> String {
     let ledger = engine.ledger();
     let mut coins = String::from("[");
@@ -346,7 +380,8 @@ pub fn status_snapshot(
          \"tier_d_sats\":{},\"escrow_sats\":{},\"pre_encumbrance_sats\":{},\
          \"coins\":{coins},\"records\":{swaps},\"unreadable_records\":{unreadable},\
          \"swap\":{},\"busy\":{},\"alarms\":{alarms_json},\
-         \"phase0_warning\":{},\"claim_posture_applied\":true,\"claim_posture\":{}}}",
+         \"phase0_warning\":{},\"claim_posture_applied\":true,\"claim_posture\":{},\
+         \"offer_ticket\":{}}}",
         json_string(network.as_str()),
         tip_height.map(|h| h.to_string()).unwrap_or_else(|| "null".into()),
         node_online,
@@ -358,6 +393,7 @@ pub fn status_snapshot(
         busy.map(json_string).unwrap_or_else(|| "null".into()),
         json_string(crate::wallet::ledger::PHASE0_WARNING),
         json_string(claim_posture),
+        offer_ticket.map(json_string).unwrap_or_else(|| "null".into()),
     )
 }
 

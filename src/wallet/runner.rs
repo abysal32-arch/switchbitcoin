@@ -89,7 +89,7 @@ fn network_byte(network: Network) -> u8 {
 /// tampered peer) must abort BEFORE anything funds: mismatched params mean
 /// mismatched sighashes, which Phase A would only discover after both Setups
 /// are on the wire.
-fn params_digest(network: Network, p: &Params) -> [u8; 32] {
+pub(crate) fn params_digest(network: Network, p: &Params) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(b"newkey-cli-handshake-params-v1");
     h.update([network_byte(network)]);

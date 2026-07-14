@@ -20,6 +20,7 @@
 //! * `negotiate_swap_rejects_a_network_mismatch` / `_requires_a_coin` —
 //!   handshake refusals happen before anything is at stake.
 
+use std::net::TcpListener;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
@@ -46,6 +47,8 @@ use swapkey::wallet::runner::{
     SwapArtifacts, SwapOutcome, SwapRunState, SwapStepOutcome,
 };
 use swapkey::wallet::store::{ModeledEnclave, SwapPhase};
+use swapkey::wallet::ticket::{maker_rendezvous, taker_rendezvous, Ticket};
+use swapkey::wallet::transport::TcpTransport;
 use swapkey::wallet::AppTick;
 use swapkey::{Error, Result};
 use secp::{Point, Scalar};
@@ -1513,4 +1516,81 @@ fn negotiate_swap_requires_an_onboarded_coin() {
     // clean transport abort, not a hang.
     drop(io_a);
     assert!(hb.join().unwrap().is_err());
+}
+
+// ============================================================================
+// Task 15: swap ticket end-to-end — maker mints a ticket carrying its REAL
+// ephemeral address, taker decodes+validates+dials it, both run the nonce
+// rendezvous, then the UNCHANGED negotiate_swap runs over a loopback
+// TcpTransport and BOTH derive the same session id (the ticket only got the
+// two parties to a connected transport; it is a convenience, not a trust
+// anchor — negotiate_swap re-checks network + params itself).
+// ============================================================================
+
+#[test]
+fn ticket_rendezvous_then_negotiate_over_tcp_loopback() {
+    let params = Params::testnet_provisional();
+    let base = 500_000u32;
+    let chain = SimChain::new(base);
+
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let pre_a = onboard_unleased(dir_a.path(), &params, 0xDA);
+    let pre_b = onboard_unleased(dir_b.path(), &params, 0xDB);
+    assert_ne!(pre_a, pre_b, "the two wallets must fund from distinct coins");
+    chain.fund_with_amount(pre_a, base, params.pre_encumbrance_sats());
+    chain.fund_with_amount(pre_b, base, params.pre_encumbrance_sats());
+
+    // Maker binds FIRST so the ticket carries the REAL bound port.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let ticket = Ticket::mint(Network::Regtest, &params, "127.0.0.1", port).unwrap();
+    let ticket_str = ticket.encode();
+    let maker_nonce = ticket.nonce;
+
+    // Maker: accept, maker-half rendezvous, then negotiate.
+    let maker = {
+        let (dir, chain) = (dir_a.path().to_path_buf(), chain.clone());
+        std::thread::spawn(move || -> Result<[u8; 32]> {
+            let mut t = TcpTransport::accept_timeout(&listener, Duration::from_secs(10))?;
+            maker_rendezvous(&mut t, &maker_nonce)?;
+            let mut engine = open_engine(&dir);
+            let negotiated = negotiate_swap(
+                &mut t,
+                &mut engine,
+                &chain,
+                &FixedClock(u64::MAX),
+                Network::Regtest,
+                &dir,
+                Scalar::random(&mut rand::rng()),
+            )?;
+            Ok(negotiated.artifacts.session_id)
+        })
+    };
+
+    // Taker: decode + validate BEFORE dialing (a mismatch is a clean refusal,
+    // not a hung socket), then dial, taker-half rendezvous, then negotiate.
+    let decoded = Ticket::decode(&ticket_str).expect("taker decodes the pasted ticket");
+    decoded
+        .validate(Network::Regtest, &params)
+        .expect("taker's local network + params match the ticket");
+    assert_eq!(decoded.addr(), format!("127.0.0.1:{port}"));
+    let mut t = TcpTransport::connect(decoded.addr()).expect("taker dials the ticket's address");
+    taker_rendezvous(&mut t, &decoded.nonce).expect("taker rendezvous");
+    let mut engine_b = open_engine(dir_b.path());
+    let taker_sid = negotiate_swap(
+        &mut t,
+        &mut engine_b,
+        &chain,
+        &FixedClock(u64::MAX),
+        Network::Regtest,
+        dir_b.path(),
+        Scalar::random(&mut rand::rng()),
+    )
+    .expect("taker negotiate over the socket")
+    .artifacts
+    .session_id;
+
+    let maker_sid = maker.join().unwrap().expect("maker side");
+    assert_eq!(maker_sid, taker_sid, "both sides must derive the same session id");
 }

@@ -18,6 +18,7 @@ use swapkey::wallet::keys::ModeledKeySource;
 use swapkey::wallet::ledger::{acknowledge_phase0, Ledger, PHASE0_WARNING};
 use swapkey::wallet::manifest::ModeledTrustRoot;
 use swapkey::wallet::store::ModeledEnclave;
+use swapkey::wallet::ticket::Ticket;
 
 fn seeded_engine(dir: &std::path::Path) -> SwapEngine {
     let ack = acknowledge_phase0(PHASE0_WARNING).unwrap();
@@ -72,6 +73,7 @@ fn status_snapshot_reflects_the_seeded_engine() {
         Some(&active),
         Some("swap"),
         &["disk almost full".into()],
+        Some("skt1exampleticket"),
     );
     for needle in [
         "\"ready\":true",
@@ -90,16 +92,18 @@ fn status_snapshot_reflects_the_seeded_engine() {
         "\"unreadable_records\":0",
         "\"claim_posture_applied\":true",
         "\"claim_posture\":\"moderate\"",
+        "\"offer_ticket\":\"skt1exampleticket\"",
     ] {
         assert!(json.contains(needle), "missing {needle} in {json}");
     }
     // The Phase-0 display contract: the warning copy rides in the snapshot.
     assert!(json.contains("\"phase0_warning\":"));
-    // No-node shape: tip null, offline.
+    // No-node shape: tip null, offline, no offer outstanding.
     let offline =
-        status_snapshot(&engine, &params, Network::Regtest, None, false, None, None, &[]);
+        status_snapshot(&engine, &params, Network::Regtest, None, false, None, None, &[], None);
     assert!(offline.contains("\"tip\":null") && offline.contains("\"node_online\":false"));
     assert!(offline.contains("\"swap\":null") && offline.contains("\"busy\":null"));
+    assert!(offline.contains("\"offer_ticket\":null"), "{offline}");
 }
 
 #[test]
@@ -196,6 +200,44 @@ fn swap_begin_route_validates_exclusive_addressing() {
         rx.try_recv().unwrap(),
         ApiCmd::SwapBegin { listen: Some("0.0.0.0:9735".into()), connect: None }
     );
+}
+
+#[test]
+fn swap_offer_and_take_routes_validate_and_enqueue() {
+    let (state, tx, rx) = fresh();
+
+    // /swap/offer: shape refusals never enqueue.
+    for bad in ["{}", "{\"listen\":\"\"}", "{\"listen\":\"noport\"}"] {
+        assert_eq!(route(&state, &tx, "POST", "/swap/offer", bad).0, 400, "must refuse {bad}");
+    }
+    assert!(rx.try_recv().is_err(), "offer shape refusals must not enqueue");
+
+    // Good offer enqueues once and flips busy (labelled "swap").
+    let (code, _) = route(&state, &tx, "POST", "/swap/offer", "{\"listen\":\"127.0.0.1:9735\"}");
+    assert_eq!(code, 202);
+    assert_eq!(rx.try_recv().unwrap(), ApiCmd::SwapOffer { listen: "127.0.0.1:9735".into() });
+    assert_eq!(state.lock().unwrap().busy, Some("swap"));
+
+    // The busy gate spans the ticket endpoints too: a take while busy is 409.
+    let good = Ticket::mint(Network::Regtest, &Params::testnet_provisional(), "127.0.0.1", 9735)
+        .unwrap()
+        .encode();
+    assert_eq!(
+        route(&state, &tx, "POST", "/swap/take", &format!("{{\"ticket\":\"{good}\"}}")).0,
+        409
+    );
+
+    // Fresh state: a garbage ticket is a 400 that NEVER enqueues (the route
+    // pre-decodes); a valid ticket string is 202 + enqueues (network/params
+    // are the worker's job, not the route's).
+    let (state, tx, rx) = fresh();
+    assert_eq!(route(&state, &tx, "POST", "/swap/take", "{}").0, 400);
+    assert_eq!(route(&state, &tx, "POST", "/swap/take", "{\"ticket\":\"not-a-ticket\"}").0, 400);
+    assert!(rx.try_recv().is_err(), "a garbage ticket must never enqueue");
+    let (code, _) =
+        route(&state, &tx, "POST", "/swap/take", &format!("{{\"ticket\":\"{good}\"}}"));
+    assert_eq!(code, 202);
+    assert_eq!(rx.try_recv().unwrap(), ApiCmd::SwapTake { ticket: good });
 }
 
 #[test]

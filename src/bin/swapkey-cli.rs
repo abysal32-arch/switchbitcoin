@@ -46,6 +46,7 @@ use swapkey::wallet::runner::{
     swap_step, RunOptions, SwapOutcome, SwapStepOutcome,
 };
 use swapkey::wallet::runtime::{FirstRunError, OpenedWallet, Wallet};
+use swapkey::wallet::ticket::{maker_rendezvous, taker_rendezvous, Ticket};
 use swapkey::wallet::transport::TcpTransport;
 use swapkey::wallet::SoftwareKeyStore;
 use swapkey::wallet::SwapApp;
@@ -159,7 +160,11 @@ COMMANDS
             --key-index <n>     skip the address scan (index from `address`)
             --wait-secs <n>     confirmation wait budget (default 600)
   swap      Run ONE swap against a peer (to a CONFIRMED terminal). Requires [node].
-            --listen <addr> | --connect <addr>   (flags outrank [peer] config)
+            Exactly one addressing mode (explicit flags outrank [peer] config):
+            --make <host:port>  bind + mint a paste-able swap TICKET (printed on
+                                stdout) and wait for a taker to dial it
+            --take <ticket>     decode+validate a partner's ticket, then dial it
+            --listen <addr> | --connect <addr>   raw address (no ticket)
             --feerate <sat/vB>  backstop CPFP feerate override (default: live
                                 node estimate, fallback 2)
             --block-x-delta <blocks>  funding no-show deadline (default 144)
@@ -185,7 +190,9 @@ COMMANDS
                                 signed manifest's active posture)
             Endpoints: GET /status /events?since=N /swap/<sid>;
             POST /onboard {deposit, ack_phase0, split_fee?},
-            POST /swap/begin {connect|listen}
+            POST /swap/begin {connect|listen},
+            POST /swap/offer {listen}  (mint a ticket; it appears in /status
+                                as offer_ticket), POST /swap/take {ticket}
 
 COMMON FLAGS
   --config <path>        config file (default ./swapkey.toml)
@@ -216,6 +223,8 @@ const VALUE_FLAGS: &[&str] = &[
     "--wait-secs",
     "--listen",
     "--connect",
+    "--make",
+    "--take",
     "--feerate",
     "--block-x-delta",
     "--jitter",
@@ -639,6 +648,16 @@ fn parse_outpoint(s: &str) -> Result<bitcoin::OutPoint, UsageError> {
     Ok(bitcoin::OutPoint::new(txid, vout))
 }
 
+/// Split a `host:port` address (the LAST colon separates the port, so IPv4 and
+/// hostnames work; an IPv6 literal would fail the ticket's host charset gate
+/// downstream — IPv6 is out of scope pre-alpha).
+fn split_host_port(addr: &str) -> Result<(String, u16), UsageError> {
+    // Serves both `swap --make <addr>` and `POST /swap/offer {listen}`.
+    let (host, port) = addr.rsplit_once(':').ok_or("listen address must be <host:port>")?;
+    let port: u16 = port.parse().map_err(|_| "listen port is not a valid u16")?;
+    Ok((host.to_string(), port))
+}
+
 fn cmd_onboard(flags: &Flags) -> CliResult {
     let deposit = parse_outpoint(
         flags.positional.first().ok_or("onboard needs a <txid:vout> argument")?,
@@ -795,41 +814,111 @@ fn cmd_swap(flags: &Flags) -> CliResult {
 
     // Peer transport. EXPLICIT FLAGS OUTRANK THE CONFIG ENTIRELY: an operator
     // typing --listen must never be silently dialed out by a leftover [peer]
-    // connect value (Fable review). Within one source, both set = ambiguous.
+    // connect value (Fable review). Exactly ONE addressing mode is allowed;
+    // --make/--take (the ticket flows) NEVER fall back to [peer] config.
     let peer_cfg = wallet.config().peer.clone();
-    let (listen, connect) = match (flags.value("listen"), flags.value("connect")) {
-        (Some(_), Some(_)) => return Err("--listen and --connect are mutually exclusive".into()),
-        (Some(l), None) => (Some(l.to_string()), None),
-        (None, Some(c)) => (None, Some(c.to_string())),
-        (None, None) => match (peer_cfg.listen, peer_cfg.connect) {
+    let make = flags.value("make").map(str::to_string);
+    let take = flags.value("take").map(str::to_string);
+    let listen_flag = flags.value("listen").map(str::to_string);
+    let connect_flag = flags.value("connect").map(str::to_string);
+    let modes_set = [&make, &take, &listen_flag, &connect_flag].iter().filter(|m| m.is_some()).count();
+    if modes_set > 1 {
+        return Err("choose exactly one of --make, --take, --listen, --connect".into());
+    }
+    let mut transport = if let Some(make_addr) = make {
+        // MAKER: bind the given host:port, mint + PRINT a ticket, wait for the
+        // taker, then run the maker-half rendezvous BEFORE any lease. A failed
+        // rendezvous (port scan / wrong ticket) is a clean error here.
+        let (host, port) = split_host_port(&make_addr)?;
+        if host == "0.0.0.0" || host == "::" || host.contains(':') {
+            log("WARNING: --make advertises a non-dialable host (0.0.0.0/::) — the ticket must");
+            log("         carry an address your peer can actually reach");
+        }
+        let ticket = Ticket::mint(network, wallet.params(), &host, port)?;
+        let encoded = ticket.encode();
+        let listener = std::net::TcpListener::bind(make_addr.as_str())
+            .map_err(|e| format!("bind {make_addr}: {e}"))?;
+        log(&format!("swap ticket (send this whole line to your taker): {encoded}"));
+        // Bare stdout line too, so a script can capture the ticket cleanly.
+        println!("{encoded}");
+        log(&format!("listening on {make_addr} (waiting up to {}s)", accept_timeout.as_secs()));
+        // Keep accepting until the deadline: a port scan or wrong-ticket dial
+        // is DROPPED without burning the offer (mirrors the serve path) — only
+        // a peer that passes the maker-half rendezvous gets the swap.
+        let deadline = std::time::Instant::now() + accept_timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err("no taker presented the ticket before the accept timeout".into());
+            }
+            let mut t = TcpTransport::accept_timeout(&listener, remaining)?;
+            // Short leash for the rendezvous so a silent dialer can't hang us.
+            match t
+                .set_io_timeout(Some(Duration::from_secs(10)))
+                .and_then(|()| maker_rendezvous(&mut t, &ticket.nonce))
+            {
+                Ok(()) => {
+                    log("ticket rendezvous ok — negotiating");
+                    break t;
+                }
+                Err(e) => {
+                    log(&format!("ticket rendezvous failed ({e}); connection dropped, still listening"));
+                }
+            }
+        }
+    } else if let Some(take_str) = take {
+        // TAKER: decode + validate against THIS wallet's network + params
+        // BEFORE dialing — a mismatch is a clean refusal, not a hung socket.
+        let ticket = Ticket::decode(take_str.trim())?;
+        ticket.validate(network, wallet.params())?;
+        log(&format!("dialing swap-ticket peer at {}", ticket.addr()));
+        let mut t = TcpTransport::connect(ticket.addr())?;
+        t.set_io_timeout(Some(Duration::from_secs(10)))?;
+        taker_rendezvous(&mut t, &ticket.nonce)?;
+        log("ticket rendezvous ok — negotiating");
+        t
+    } else {
+        // Legacy raw --listen/--connect (flags outrank [peer] config).
+        let (listen, connect) = match (listen_flag, connect_flag) {
             (Some(_), Some(_)) => {
+                return Err("--listen and --connect are mutually exclusive".into())
+            }
+            (Some(l), None) => (Some(l), None),
+            (None, Some(c)) => (None, Some(c)),
+            (None, None) => match (peer_cfg.listen, peer_cfg.connect) {
+                (Some(_), Some(_)) => {
+                    return Err(
+                        "config sets both [peer] listen and connect — pass --listen or --connect"
+                            .into(),
+                    )
+                }
+                other => other,
+            },
+        };
+        match (listen, connect) {
+            (_, Some(addr)) => {
+                log(&format!("connecting to peer {addr}"));
+                TcpTransport::connect(addr.as_str())?
+            }
+            (Some(addr), None) => {
+                let listener = std::net::TcpListener::bind(addr.as_str())
+                    .map_err(|e| format!("bind {addr}: {e}"))?;
+                log(&format!("listening on {addr} (waiting up to {}s)", accept_timeout.as_secs()));
+                TcpTransport::accept_timeout(&listener, accept_timeout)?
+            }
+            (None, None) => {
                 return Err(
-                    "config sets both [peer] listen and connect — pass --listen or --connect"
+                    "swap needs --make/--take/--listen/--connect (or a [peer] config section)"
                         .into(),
                 )
             }
-            other => other,
-        },
-    };
-    let mut transport = match (listen, connect) {
-        (_, Some(addr)) => {
-            log(&format!("connecting to peer {addr}"));
-            TcpTransport::connect(addr.as_str())?
-        }
-        (Some(addr), None) => {
-            let listener = std::net::TcpListener::bind(addr.as_str())
-                .map_err(|e| format!("bind {addr}: {e}"))?;
-            log(&format!("listening on {addr} (waiting up to {}s)", accept_timeout.as_secs()));
-            TcpTransport::accept_timeout(&listener, accept_timeout)?
-        }
-        (None, None) => {
-            return Err("swap needs --listen or --connect (or a [peer] config section)".into())
         }
     };
     // Whole-frame budget: the Phase-A rendezvous skew between the two sides
     // is bounded by the SLOWER side's poll cadence, so the deadline must
     // scale with it (a fixed budget under a large --poll-secs would abort
-    // healthy funded swaps to refund; Fable review).
+    // healthy funded swaps to refund; Fable review). This ALSO restores the
+    // normal budget after any short ticket-rendezvous leash above.
     let io_timeout = Duration::from_secs(120.max(poll_secs.saturating_mul(3)));
     transport.set_io_timeout(Some(io_timeout))?;
 
@@ -1070,8 +1159,16 @@ type NodeChain = swapkey::chain::BitcoinCoreChainView<swapkey::chain::HttpTransp
 /// The worker's live activity — one command at a time (`busy` gates the API).
 enum Live {
     Idle,
-    /// `swap/begin {listen}`: waiting for the peer to dial in.
-    Accepting { listener: std::net::TcpListener, deadline: std::time::Instant },
+    /// `swap/begin {listen}` or `swap/offer {listen}`: waiting for the peer to
+    /// dial in. `expected_nonce` is `Some` ONLY for the ticket-offer path — on
+    /// accept, the maker-half rendezvous must pass before `begin_swap`, and a
+    /// failed/scan dial is dropped WITHOUT burning the offer (keep accepting
+    /// until the deadline). `None` is the legacy raw-listen path (no ticket).
+    Accepting {
+        listener: std::net::TcpListener,
+        deadline: std::time::Instant,
+        expected_nonce: Option<[u8; 16]>,
+    },
     /// A swap driving through `swap_step`.
     Running { app: Box<SwapApp>, artifacts: Box<SwapArtifacts>, run: SwapRunState },
     /// Post-`Completed`: babysit our completion to CONFIRMED.
@@ -1252,6 +1349,7 @@ fn serve_worker(
                                         listener: l,
                                         deadline: std::time::Instant::now()
                                             + Duration::from_secs(600),
+                                        expected_nonce: None,
                                     };
                                 }
                                 Err(e) => {
@@ -1263,6 +1361,56 @@ fn serve_worker(
                     }
                     _ => {
                         sink("swap refused: node offline or reconcile failed".into());
+                        state.lock().unwrap().busy = None;
+                    }
+                },
+                Ok(ApiCmd::SwapOffer { listen }) => match (chain, reconcile_ok) {
+                    (Some(_), true) => {
+                        // Mint the ticket over THIS wallet's network + params
+                        // (the advertised address is the given listen addr),
+                        // then bind and wait — a taker must pass the maker-half
+                        // rendezvous before any lease.
+                        match offer_ticket(wallet, network, &listen) {
+                            Ok((ticket, encoded)) => match std::net::TcpListener::bind(listen.as_str())
+                            {
+                                Ok(l) => {
+                                    sink(format!("swap ticket offered on {listen}: {encoded}"));
+                                    state.lock().unwrap().offer_ticket = Some(encoded);
+                                    set_swap_view(
+                                        state, &mut active_sid_hex, "pending", "offering", None,
+                                    );
+                                    live = Live::Accepting {
+                                        listener: l,
+                                        deadline: std::time::Instant::now()
+                                            + Duration::from_secs(600),
+                                        expected_nonce: Some(ticket.nonce),
+                                    };
+                                }
+                                Err(e) => {
+                                    sink(format!("bind {listen} failed: {e}"));
+                                    state.lock().unwrap().busy = None;
+                                }
+                            },
+                            Err(e) => {
+                                sink(format!("swap offer refused: {}", e.0));
+                                state.lock().unwrap().busy = None;
+                            }
+                        }
+                    }
+                    _ => {
+                        sink("swap offer refused: node offline or reconcile failed".into());
+                        state.lock().unwrap().busy = None;
+                    }
+                },
+                Ok(ApiCmd::SwapTake { ticket }) => match (chain, reconcile_ok) {
+                    (Some(node), true) => {
+                        live = take_ticket(
+                            wallet, node, network, data_dir, &ticket, poll, block_x_delta, jitter,
+                            state, &mut active_sid_hex, &mut sink,
+                        );
+                    }
+                    _ => {
+                        sink("swap take refused: node offline or reconcile failed".into());
                         state.lock().unwrap().busy = None;
                     }
                 },
@@ -1328,6 +1476,7 @@ fn serve_worker(
             let params = wallet.params().clone();
             let mut st = state.lock().unwrap();
             let active = active_sid_hex.as_ref().and_then(|s| st.swaps.get(s)).cloned();
+            let offer_ticket = st.offer_ticket.clone();
             st.status_json = status_snapshot(
                 wallet.engine(),
                 &params,
@@ -1337,6 +1486,7 @@ fn serve_worker(
                 active.as_ref(),
                 st.busy,
                 &alarms,
+                offer_ticket.as_deref(),
             );
         }
 
@@ -1379,6 +1529,77 @@ fn heal_orphan_leases(wallet: &mut Wallet, chain: &NodeChain, sink: &mut dyn FnM
              until the next restart"
         ));
     }
+}
+
+/// Mint a swap ticket for a `/swap/offer {listen}` request: the advertised
+/// address is the given listen `host:port`, minted over THIS wallet's network
+/// and signed params. Returns the ticket (its nonce seeds the maker
+/// rendezvous) and its encoded string (surfaced in `/status` as `offer_ticket`).
+fn offer_ticket(
+    wallet: &Wallet,
+    network: Network,
+    listen: &str,
+) -> Result<(Ticket, String), UsageError> {
+    let (host, port) = split_host_port(listen)?;
+    let ticket = Ticket::mint(network, wallet.params(), &host, port)?;
+    let encoded = ticket.encode();
+    Ok((ticket, encoded))
+}
+
+/// Take a swap by ticket (`/swap/take {ticket}`): decode + validate against
+/// this wallet's network + params BEFORE dialing (a mismatch is a clean
+/// refusal, not a hung socket), dial, run the taker-half rendezvous under a
+/// short leash, then hand off to `begin_swap`. Every early refusal clears
+/// `busy` and returns to `Idle` (no lease was taken).
+#[allow(clippy::too_many_arguments)]
+fn take_ticket(
+    wallet: &mut Wallet,
+    chain: &NodeChain,
+    network: Network,
+    data_dir: &Path,
+    ticket_str: &str,
+    poll: Duration,
+    block_x_delta: u32,
+    jitter: u32,
+    state: &SharedState,
+    active: &mut Option<String>,
+    sink: &mut dyn FnMut(String),
+) -> Live {
+    let ticket = match Ticket::decode(ticket_str) {
+        Ok(t) => t,
+        Err(e) => {
+            sink(format!("swap take refused: {e}"));
+            state.lock().unwrap().busy = None;
+            return Live::Idle;
+        }
+    };
+    if let Err(e) = ticket.validate(network, wallet.params()) {
+        sink(format!("swap take refused: {e}"));
+        state.lock().unwrap().busy = None;
+        return Live::Idle;
+    }
+    let mut t = match TcpTransport::connect(ticket.addr()) {
+        Ok(t) => t,
+        Err(e) => {
+            sink(format!("dial {} failed: {e}", ticket.addr()));
+            state.lock().unwrap().busy = None;
+            return Live::Idle;
+        }
+    };
+    // Short leash for the rendezvous so a silent maker can't hang us; begin_swap
+    // restores the normal poll-scaled budget.
+    if let Err(e) = t.set_io_timeout(Some(Duration::from_secs(10))) {
+        sink(format!("transport setup failed: {e}"));
+        state.lock().unwrap().busy = None;
+        return Live::Idle;
+    }
+    if let Err(e) = taker_rendezvous(&mut t, &ticket.nonce) {
+        sink(format!("swap ticket rendezvous failed: {e}"));
+        state.lock().unwrap().busy = None;
+        return Live::Idle;
+    }
+    sink("ticket rendezvous ok — negotiating".into());
+    begin_swap(wallet, chain, network, data_dir, t, poll, block_x_delta, jitter, state, active, sink)
 }
 
 /// Negotiate + begin over an established transport; returns the next state.
@@ -1470,21 +1691,55 @@ fn step_live(
     let Some(chain) = chain else { return live };
     match live {
         Live::Idle => Live::Idle,
-        Live::Accepting { listener, deadline } => {
+        Live::Accepting { listener, deadline, expected_nonce } => {
             match TcpTransport::accept_timeout(&listener, Duration::from_millis(900)) {
-                Ok(t) => {
-                    let network = wallet.config().network;
-                    let dir = wallet.config().data_dir.clone();
-                    begin_swap(
-                        wallet, chain, network, &dir, t, poll, block_x_delta, jitter, state,
-                        active, sink,
-                    )
-                }
+                Ok(mut t) => match expected_nonce {
+                    // Ticket offer: the maker-half rendezvous MUST pass before
+                    // any lease. A wrong-nonce / port-scan dial is DROPPED and
+                    // we keep accepting until the deadline — a scan must never
+                    // burn the offer.
+                    Some(nonce) => {
+                        if let Err(e) = t.set_io_timeout(Some(Duration::from_secs(10))) {
+                            sink(format!("transport setup failed ({e}); still offering"));
+                            return Live::Accepting { listener, deadline, expected_nonce };
+                        }
+                        match maker_rendezvous(&mut t, &nonce) {
+                            Ok(()) => {
+                                sink("ticket rendezvous ok — negotiating".into());
+                                state.lock().unwrap().offer_ticket = None;
+                                let network = wallet.config().network;
+                                let dir = wallet.config().data_dir.clone();
+                                begin_swap(
+                                    wallet, chain, network, &dir, t, poll, block_x_delta, jitter,
+                                    state, active, sink,
+                                )
+                            }
+                            Err(e) => {
+                                sink(format!(
+                                    "ticket rendezvous failed ({e}); connection dropped, still offering"
+                                ));
+                                Live::Accepting { listener, deadline, expected_nonce }
+                            }
+                        }
+                    }
+                    // Legacy raw-listen path: no ticket, negotiate straight away.
+                    None => {
+                        let network = wallet.config().network;
+                        let dir = wallet.config().data_dir.clone();
+                        begin_swap(
+                            wallet, chain, network, &dir, t, poll, block_x_delta, jitter, state,
+                            active, sink,
+                        )
+                    }
+                },
                 Err(_) if std::time::Instant::now() < deadline => {
-                    Live::Accepting { listener, deadline }
+                    Live::Accepting { listener, deadline, expected_nonce }
                 }
                 Err(_) => {
                     sink("no peer connected before the deadline".into());
+                    if expected_nonce.is_some() {
+                        state.lock().unwrap().offer_ticket = None;
+                    }
                     set_swap_view(state, active, "pending", "failed", Some("no peer".into()));
                     state.lock().unwrap().busy = None;
                     Live::Idle
