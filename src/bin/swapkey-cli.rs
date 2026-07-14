@@ -159,6 +159,18 @@ impl From<&str> for UsageError {
 type CliResult = Result<(), UsageError>;
 
 fn run(args: &[String]) -> CliResult {
+    // Shippability guard (Task 20): a build whose trust-root pin is invalid
+    // or still the publicly-known modeled TEST key must be unmistakable on
+    // EVERY invocation — never a silent fallback (anyone who read the library
+    // source could sign manifests for such a wallet).
+    if let Some(reason) = test_root_reason() {
+        eprintln!("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+        eprintln!("!!! UNSHIPPABLE BUILD: {reason}.");
+        eprintln!("!!! Anyone can forge signed manifests for this wallet. DO NOT");
+        eprintln!("!!! DISTRIBUTE; rebuild with the real operator pubkey pinned in");
+        eprintln!("!!! PINNED_OPERATOR_XONLY (see scripts/build-release.sh).");
+        eprintln!("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+    }
     let Some((cmd, rest)) = args.split_first() else {
         return Err("no subcommand".into());
     };
@@ -175,12 +187,29 @@ fn run(args: &[String]) -> CliResult {
         "backup" => cmd_backup(&flags),
         "restore" => cmd_restore(&flags),
         "manifest" => cmd_manifest(&flags),
+        "quickstart" => cmd_quickstart(&flags),
+        "diag" => cmd_diag(&flags),
+        "version" | "--version" | "-V" => cmd_version(&flags),
         "help" | "--help" | "-h" => {
             print!("{HELP}");
             Ok(())
         }
         other => Err(format!("unknown subcommand `{other}`").into()),
     }
+}
+
+/// `Some(reason)` when this binary's pin is unshippable: not a valid x-only
+/// key, or equal to the modeled TEST root (whose SECRET is printed in the
+/// library source). One cheap curve derivation per process start.
+fn test_root_reason() -> Option<&'static str> {
+    use swapkey::wallet::manifest::{ManifestTrustRoot, ModeledTrustRoot};
+    if bitcoin::secp256k1::XOnlyPublicKey::from_slice(&PINNED_OPERATOR_XONLY).is_err() {
+        return Some("the pinned trust root is not a valid x-only key");
+    }
+    if PINNED_OPERATOR_XONLY == ModeledTrustRoot.operator_xonly() {
+        return Some("the pinned trust root is the PUBLIC modeled/test key");
+    }
+    None
 }
 
 const HELP: &str = "\
@@ -271,6 +300,14 @@ COMMANDS
                                 refusals (bad signature, non-increasing
                                 version, invariant violation) are printed
                                 verbatim
+  quickstart  Print the zero-to-first-swap walkthrough for new testers
+            (node setup, init, faucet, onboard, swap ticket — each step
+            names the next command). Start here.
+  diag      Print a REDACTED support bundle for bug reports: build version,
+            network, tip, manifest state, coin/record summary, alarms.
+            NEVER contains the seed, mnemonic, passphrase, or RPC secrets.
+  version   Print the build version (crate + git hash) and the pinned
+            manifest trust root. PRE-ALPHA, TESTNET/REGTEST ONLY.
   serve     Localhost JSON API for SwapKey-Wallet.html (LOOPBACK ONLY, no
             auth — any local process can drive the wallet; pre-alpha).
             --port <n>          bind 127.0.0.1:<n> (default 3316)
@@ -650,6 +687,9 @@ fn cmd_init(flags: &Flags) -> CliResult {
                     }
                 }
                 print_status(&wallet);
+                log("next: edit swapkey.toml's [node] section if you haven't, then");
+                log("      `swapkey-cli address` to get a deposit address");
+                log("      (full walkthrough: `swapkey-cli quickstart`)");
                 return Ok(());
             }
             Err(FirstRunError::Refused { first_run: fr, error }) => {
@@ -1602,6 +1642,181 @@ fn print_manifest_state(wallet: &Wallet) {
 }
 
 // ---------------------------------------------------------------------------
+// version / quickstart / diag — tester-facing provenance + onboarding + the
+// redacted support bundle (Task 20)
+// ---------------------------------------------------------------------------
+
+fn cmd_version(flags: &Flags) -> CliResult {
+    if !flags.positional.is_empty() {
+        return Err("version takes no arguments".into());
+    }
+    println!("swapkey-cli {}", api::BUILD_VERSION);
+    println!("Swap Key PRE-ALPHA — REGTEST/TESTNET ONLY, NO REAL FUNDS");
+    println!("(mainnet has no config variant by construction; external cryptographer review pending)");
+    println!("pinned manifest trust root: {}", hex32(&PINNED_OPERATOR_XONLY));
+    Ok(())
+}
+
+fn cmd_quickstart(flags: &Flags) -> CliResult {
+    if !flags.positional.is_empty() {
+        return Err("quickstart takes no arguments".into());
+    }
+    // Static walkthrough by design: printing instructions can never touch
+    // funds, and every command below is the same one the tester will run
+    // (each of those already prints its own next step). Full detail:
+    // docs/TESTER-GUIDE.md.
+    print!("{QUICKSTART}");
+    Ok(())
+}
+
+const QUICKSTART: &str = "\
+Swap Key quickstart — zero to your first swap (PRE-ALPHA)
+==========================================================
+
+READ THIS FIRST — the two realities every tester must know up front:
+ * TESTNET/REGTEST ONLY, NO REAL FUNDS. This software has not had its
+   external cryptographer review. Phase-0 warning: treat every coin in this
+   wallet as expendable test money, because it is.
+ * ~HALF of swap attempts refuse at the role/CSV guard and close through
+   REFUNDS. That is BY DESIGN pre-alpha (the fix is cryptographer-gated).
+   Your funds come back at the refund timelock (~24-36h on testnet) — a
+   refunded swap is the system working, not a bug. Just retry.
+
+STEP 0 — a Bitcoin node (once)
+   Install Bitcoin Core 28+ and run it on testnet4 (or regtest for a purely
+   local rehearsal): bitcoind -testnet4 -server=1
+   Wait for sync. Details + config: docs/TESTER-GUIDE.md section 2.
+
+STEP 1 — create your wallet
+   swapkey-cli init --network testnet --data-dir <where wallet data lives>
+   This writes swapkey.toml next to you, prompts for a NEW passphrase,
+   shows your 24-word recovery mnemonic ONCE (write it down, retype it),
+   and shows the Phase-0 warning (type ACCEPT).
+   Then EDIT swapkey.toml: uncomment [node] and point it at your bitcoind
+   (rpc_url + rpc_user/rpc_password, or rpc_cookie_file).
+   next: swapkey-cli address
+
+STEP 2 — get a deposit address
+   swapkey-cli address
+   next: send testnet coins to it (STEP 3)
+
+STEP 3 — get testnet coins (faucet)
+   Send at least 0.011 tBTC (1,100,000 sats) to your deposit address —
+   enough for one swap unit (0.01) + fee margin + the CPFP reserve. Any
+   testnet4 faucet works (search: \"bitcoin testnet4 faucet\"; e.g. the
+   mempool.space or coinfaucet.eu testnet4 faucets at the time of writing).
+   Wait for 1 confirmation, note the funding txid and output index.
+   next: swapkey-cli onboard <txid:vout>
+
+STEP 4 — onboard the deposit
+   swapkey-cli onboard <txid:vout>
+   This splits your deposit into swap-ready units + the fee reserve, then
+   anchors the privacy delay: coins become swappable after a randomized
+   24-72h decorrelation delay (testnet keeps real delays; regtest
+   fast-forwards the wall clock). Check readiness anytime with:
+   swapkey-cli status
+
+STEP 5 — swap with a partner (the ticket flow)
+   One of you MAKES the offer (binds a port, prints a one-line ticket):
+     swapkey-cli swap --make <your-reachable-host:port>
+   Send the printed skt1... ticket line to your partner, who TAKES it:
+     swapkey-cli swap --take <ticket>
+   Both wallets negotiate, fund, and settle automatically. Leave both
+   running until you see SWAP COMPLETED (or a refund resolution — see the
+   refund reality above; retry after a refund).
+
+STEP 6 — optional but recommended: the second-device safety net
+   swapkey-cli backup <bundle-file>          (on this device)
+   swapkey-cli restore --from <bundle-file>  (on a second device/dir)
+   swapkey-cli watch                         (on that second device)
+   The watchtower fires your pre-armed refund even if this device dies
+   mid-swap. Full story: docs/TESTER-GUIDE.md section 7.
+
+If anything breaks: swapkey-cli diag   (redacted support bundle), then file
+a report per docs/BUG-REPORT-TEMPLATE.md. Full guide: docs/TESTER-GUIDE.md.
+";
+
+fn cmd_diag(flags: &Flags) -> CliResult {
+    if !flags.positional.is_empty() {
+        return Err("diag takes no arguments".into());
+    }
+    // REDACTION CONTRACT (asserted by tests/cli.rs): this output may never
+    // contain the seed, the mnemonic, any passphrase, or RPC credentials.
+    // Structurally enforced — nothing below touches those values: the node
+    // block prints the URL (which config validation guarantees carries no
+    // userinfo) and the auth MODE only.
+    let wallet = open_ready(flags)?;
+    let config = wallet.config();
+    println!("=== swapkey diag (redacted support bundle) ===");
+    println!("version:      swapkey-cli {}", api::BUILD_VERSION);
+    println!("trust root:   {}", hex32(&PINNED_OPERATOR_XONLY));
+    println!("network:      {}", config.network);
+    println!("data dir:     {}", config.data_dir.display());
+    match &config.node {
+        None => println!("node:         none configured"),
+        Some(n) => {
+            let auth = match &n.auth {
+                swapkey::wallet::config::RpcAuth::UserPass { .. } => "user/pass (redacted)",
+                swapkey::wallet::config::RpcAuth::CookieFile(_) => "cookie file",
+            };
+            println!("node:         {} (auth: {auth})", n.url);
+            match chain_view(config) {
+                Ok(chain) => {
+                    println!("tip height:   {}", chain.tip_height());
+                    if let Some(e) = chain.last_rpc_error() {
+                        println!("node error:   {e}");
+                    }
+                }
+                Err(e) => println!("tip height:   node unreachable ({})", e.0),
+            }
+        }
+    }
+    let manifest = wallet.engine().manifest();
+    println!(
+        "manifest:     v{} (id {}, floor {}, provisional: {})",
+        manifest.current().version(),
+        hex32(&manifest.current().id()),
+        manifest.floor(),
+        manifest.is_provisional(),
+    );
+    println!("manifest open report: {:?}", wallet.manifest_open_report());
+    println!("claim posture: {:?}", wallet.engine().effective_claim_posture());
+
+    let ledger = wallet.engine().ledger();
+    let coins = ledger.coins();
+    println!("coins ({}):", coins.len());
+    for c in coins {
+        println!(
+            "  {:>12} sats  {:?}/{:?}  {}:{}",
+            c.amount_sats, c.class, c.state, c.outpoint.txid, c.outpoint.vout
+        );
+    }
+    println!(
+        "reserve:      {}",
+        if ledger.has_leasable_reserve(1) { "leasable" } else { "NONE (backstop inert)" }
+    );
+    match wallet.engine().store().list() {
+        Ok((records, unreadable)) => {
+            println!("swap records ({}):", records.len());
+            for r in &records {
+                println!("  {}  {:?}", hex32(&r.swap_session_id), r.phase);
+            }
+            for p in unreadable {
+                println!("  ALARM unreadable record: {}", p.display());
+            }
+        }
+        Err(e) => println!("swap records: store enumeration failed: {e}"),
+    }
+    for action in wallet.open_actions() {
+        println!("ALARM (store open): {action:?}");
+    }
+    println!("=== end diag — paste this whole block into your bug report ===");
+    println!("(also note your Bitcoin Core version and re-run the failing command");
+    println!(" with its full stderr captured; see docs/BUG-REPORT-TEMPLATE.md)");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // serve — the localhost JSON API for SwapKey-Wallet.html (Task 09)
 // ---------------------------------------------------------------------------
 
@@ -2495,4 +2710,22 @@ fn serve_onboard(
         plan.pre_encumbrance_count, plan.reserve_sats
     ));
     Ok((plan.txid, plan.tx_bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Task-20 shippability: THIS build's pin must be a valid x-only key and
+    /// must NOT be the publicly-known modeled/test root. If this fails, the
+    /// binary prints the UNSHIPPABLE banner on every run — and the release
+    /// script (scripts/build-release.sh) refuses to package it.
+    #[test]
+    fn pinned_trust_root_is_real_and_shippable() {
+        assert!(
+            test_root_reason().is_none(),
+            "unshippable pin: {:?}",
+            test_root_reason()
+        );
+    }
 }

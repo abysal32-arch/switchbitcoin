@@ -95,9 +95,15 @@ fn status_snapshot_reflects_the_seeded_engine() {
         "\"claim_posture\":\"moderate\"",
         "\"offer_ticket\":\"skt1exampleticket\"",
         "\"max_swaps\":4",
+        "\"version\":\"",
     ] {
         assert!(json.contains(needle), "missing {needle} in {json}");
     }
+    // Build provenance (Task 20): the snapshot names the exact build.
+    assert!(
+        json.contains(swapkey::wallet::api::BUILD_VERSION),
+        "snapshot must carry BUILD_VERSION: {json}"
+    );
     // The one active view rides BOTH in the legacy `swap` field and in the
     // Task-16 `active_swaps` list.
     assert!(json.contains("\"active_swaps\":[{\"sid\":"), "{json}");

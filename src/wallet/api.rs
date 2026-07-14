@@ -46,6 +46,13 @@ use crate::wallet::runner::hex32;
 /// Conventional local port (0x0CF4 = 3316, the spec version tag).
 pub const DEFAULT_API_PORT: u16 = 3316;
 
+/// The build provenance string (Task 20): crate version + git short hash
+/// (stamped by build.rs; `unknown` outside a git checkout, `-dirty` on an
+/// unclean tree). This is what a tester report must name — it rides in
+/// `swapkey-cli --version`, the `/status` snapshot, and the `diag` bundle.
+pub const BUILD_VERSION: &str =
+    concat!(env!("CARGO_PKG_VERSION"), " (git ", env!("NEWKEY_GIT_HASH"), ")");
+
 /// Default `--max-swaps` concurrency cap (Task 16). Small on purpose: every
 /// live swap holds a leased pre-encumbrance coin, and the CPFP reserve pool
 /// that guards their refunds is shared — a generous cap would let a tester
@@ -435,6 +442,11 @@ pub fn status_snapshot(
         ClaimDelayPosture::Aggressive => "aggressive",
     };
 
+    // Build provenance (Task 20) — APPENDED at the tail of the snapshot
+    // (fields are append-only; the UI and the tests/api.rs needles key on
+    // names, never positions).
+    let version = json_string(BUILD_VERSION);
+
     format!(
         "{{\"ready\":true,\"network\":{},\"tip\":{},\"node_online\":{},\
          \"spendable_sats\":{spendable_sats},\"reserve_leasable\":{},\
@@ -442,7 +454,8 @@ pub fn status_snapshot(
          \"coins\":{coins},\"records\":{swaps},\"unreadable_records\":{unreadable},\
          \"swap\":{},\"busy\":{},\"alarms\":{alarms_json},\
          \"phase0_warning\":{},\"claim_posture_applied\":true,\"claim_posture\":{},\
-         \"offer_ticket\":{},\"active_swaps\":{active_json},\"max_swaps\":{max_swaps}}}",
+         \"offer_ticket\":{},\"active_swaps\":{active_json},\"max_swaps\":{max_swaps},\
+         \"version\":{version}}}",
         json_string(network.as_str()),
         tip_height.map(|h| h.to_string()).unwrap_or_else(|| "null".into()),
         node_online,

@@ -1,4 +1,6 @@
 target/
+# release packages (scripts/build-release.sh) — binaries never enter git
+dist/
 fuzz/target/
 fuzz/corpus/
 fuzz/artifacts/

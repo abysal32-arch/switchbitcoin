@@ -397,3 +397,143 @@ fn pinned_root_manifest_ingest_via_the_cli() {
     assert!(out.status.success(), "{t}");
     assert!(t.contains("manifest: v1"), "{t}");
 }
+
+/// Task 20: `version` and `quickstart` are pre-alpha-branded provenance/
+/// onboarding surfaces; `diag` is the REDACTED support bundle — no seed, no
+/// mnemonic, no passphrase, no RPC password, ever.
+#[test]
+fn version_quickstart_and_diag_are_branded_and_secretless() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("swapkey.toml");
+    let data_dir = dir.path().join("data");
+
+    // ---- version: build provenance + the pinned root, and NOT unshippable.
+    let out = run_cli(&config, &["version"], "");
+    let t = text(&out);
+    assert!(out.status.success(), "version failed:\n{t}");
+    assert!(t.contains(&format!("swapkey-cli {}", swapkey::wallet::api::BUILD_VERSION)), "{t}");
+    assert!(t.contains("(git "), "the git hash stamp:\n{t}");
+    assert!(t.contains("PRE-ALPHA"), "{t}");
+    assert!(t.contains("NO REAL FUNDS"), "{t}");
+    assert!(
+        t.contains("pinned manifest trust root: fbb01df4f947cf69e8a24e4e907c60e8c903eb199e6dd949a2fabe5a5ea2191e"),
+        "the REAL pinned root:\n{t}"
+    );
+    assert!(!t.contains("UNSHIPPABLE"), "a shippable build must not warn:\n{t}");
+
+    // ---- quickstart: the walkthrough surfaces the realities UP FRONT.
+    let out = run_cli(&config, &["quickstart"], "");
+    let t = text(&out);
+    assert!(out.status.success(), "quickstart failed:\n{t}");
+    for needle in [
+        "NO REAL FUNDS",
+        "~HALF",           // the refund reality, before any step
+        "REFUNDS",
+        "faucet",
+        "Phase-0",
+        "swapkey-cli init",
+        "swapkey-cli onboard",
+        "--make",
+        "--take",
+        "watch",
+        "diag",
+    ] {
+        assert!(t.contains(needle), "quickstart must mention {needle:?}:\n{t}");
+    }
+
+    // ---- diag: init a wallet whose config carries an RPC PASSWORD, then
+    // assert the bundle names the build/network/manifest and leaks nothing.
+    let out = run_cli(
+        &config,
+        &[
+            "init",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "--passphrase-stdin",
+            "--accept-phase0",
+            "--skip-backup-verification",
+        ],
+        PASSPHRASE,
+    );
+    let t = text(&out);
+    assert!(out.status.success(), "init failed:\n{t}");
+    assert!(t.contains("next:"), "init must point at the next command:\n{t}");
+    // Capture the mnemonic so we can assert diag never echoes any of it.
+    let words = t
+        .lines()
+        .skip_while(|l| !l.starts_with("=== RECOVERY MNEMONIC"))
+        .nth(1)
+        .expect("mnemonic line")
+        .trim()
+        .to_string();
+
+    // Rewrite the config with a [node] section carrying a password and a
+    // dead localhost port (diag must degrade, not hang).
+    std::fs::write(
+        &config,
+        format!(
+            "network = \"regtest\"\ndata_dir = '{}'\n[node]\nrpc_url = \"http://127.0.0.1:1\"\nrpc_user = \"diaguser\"\nrpc_password = \"hunter2-diag-secret\"\n",
+            data_dir.display()
+        ),
+    )
+    .unwrap();
+
+    let out = run_cli(&config, &["diag", "--passphrase-stdin"], PASSPHRASE);
+    let t = text(&out);
+    assert!(out.status.success(), "diag failed:\n{t}");
+    for needle in [
+        "swapkey diag (redacted support bundle)",
+        &format!("swapkey-cli {}", swapkey::wallet::api::BUILD_VERSION),
+        "trust root:",
+        "network:      regtest",
+        "manifest:     v0",
+        "auth: user/pass (redacted)",
+        "coins (0):",
+        "swap records (0):",
+        "end diag",
+    ] {
+        assert!(t.contains(needle), "diag must contain {needle:?}:\n{t}");
+    }
+    // THE redaction contract.
+    assert!(!t.contains("hunter2-diag-secret"), "diag leaked the RPC password:\n{t}");
+    assert!(
+        !t.contains(PASSPHRASE.trim()),
+        "diag leaked the wallet passphrase:\n{t}"
+    );
+    // Single BIP39 words can occur in prose; the leak signature is a 3-word
+    // run of the mnemonic appearing verbatim.
+    let three_words: Vec<&str> = words.split(' ').take(3).collect();
+    assert!(
+        !t.contains(&three_words.join(" ")),
+        "diag leaked mnemonic material:\n{t}"
+    );
+}
+
+/// Task 20 scripted check: every `swapkey-cli <verb>` the quickstart tells a
+/// tester to run must be a real, dispatched verb (HELP lists it). The flow
+/// itself (init → address → onboard → swap → refund/recovery) is the exact
+/// sequence the Task-11 regtest harness validated live — this guards the
+/// TEXT against drifting from the binary.
+#[test]
+fn quickstart_commands_all_exist_in_help() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("swapkey.toml");
+    let q = text(&run_cli(&config, &["quickstart"], ""));
+    let help = text(&run_cli(&config, &["help"], ""));
+    let mut checked = 0;
+    for chunk in q.split("swapkey-cli ").skip(1) {
+        let verb: String = chunk
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .collect();
+        if verb.is_empty() {
+            continue;
+        }
+        assert!(
+            help.contains(&format!("\n  {verb}")),
+            "quickstart names `swapkey-cli {verb}` but help does not list it:\n{help}"
+        );
+        checked += 1;
+    }
+    assert!(checked >= 8, "the quickstart must actually walk through commands ({checked})");
+}
