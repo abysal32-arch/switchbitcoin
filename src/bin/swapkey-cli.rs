@@ -22,6 +22,11 @@
 //!   swap      run ONE swap against a peer (--listen or --connect).
 //!   recover   startup reconcile + crash-recovery scan; drives each tick's
 //!             broadcast.
+//!   backup    write one portable, integrity-hashed bundle of the data dir's
+//!             durable files (refused while the wallet runs; no passphrase).
+//!   restore   unpack a bundle into a fresh data dir (verify-then-rename
+//!             atomic) and verify the wallet opens; --rescan raises the
+//!             key-index floor when the bundle may be stale.
 //!
 //! Logging: plain lines to stderr, no secrets — the mnemonic is printed ONCE
 //! (deliberately, to the terminal, for backup) by `init`; passphrases are
@@ -132,6 +137,8 @@ fn run(args: &[String]) -> CliResult {
         "swap" => cmd_swap(&flags),
         "recover" => cmd_recover(&flags),
         "serve" => cmd_serve(&flags),
+        "backup" => cmd_backup(&flags),
+        "restore" => cmd_restore(&flags),
         "help" | "--help" | "-h" => {
             print!("{HELP}");
             Ok(())
@@ -151,6 +158,10 @@ COMMANDS
             --data-dir <path>   data dir for a fresh config template
             --network <net>     regtest|testnet for a fresh template (default regtest)
             --restore           restore the keystore from a BIP39 mnemonic
+            --rescan <floor>    with --restore: raise the ledger key-index
+                                floor afterwards — a mnemonic-only restore
+                                rewinds issuance to 0, and without a floor new
+                                addresses REUSE old on-chain indices
             --skip-backup-verification   waive the retype-the-words check (DANGER)
   address   Issue a fresh deposit address.
   status    Show coins, reserve, swap records, and operator alarms.
@@ -185,6 +196,20 @@ COMMANDS
   recover   Startup reconcile + crash-recovery scan; drive each tick.
             --dry-run           decide but never broadcast
             --assume-congested  as for swap
+  backup <path>  Write a portable backup bundle of the wallet data dir's
+            durable files to <path>. Sealed files stay sealed; the swap
+            template sidecars / manifest ride public-by-design — the bundle
+            cannot move funds but reveals swap METADATA (treat as
+            restore-only material). Refused while the wallet is running;
+            never overwrites <path>; needs no passphrase.
+  restore   Unpack a bundle into the config's data_dir (must be fresh) and
+            verify the wallet opens. The unpack is verify-then-rename atomic:
+            a corrupt bundle leaves nothing behind. Then run `recover` to
+            re-enter any in-flight swap.
+            --from <bundle>     the file `backup` wrote (required)
+            --rescan <floor>    raise the key-index floor after opening — use
+                                when the bundle may be OLDER than the last
+                                address this wallet ever issued
   serve     Localhost JSON API for SwapKey-Wallet.html (LOOPBACK ONLY, no
             auth — any local process can drive the wallet; pre-alpha).
             --port <n>          bind 127.0.0.1:<n> (default 3316)
@@ -240,6 +265,8 @@ const VALUE_FLAGS: &[&str] = &[
     "--port",
     "--claim-posture",
     "--max-swaps",
+    "--from",
+    "--rescan",
 ];
 
 /// Every boolean switch any subcommand accepts.
@@ -451,12 +478,18 @@ fn cmd_init(flags: &Flags) -> CliResult {
     }
     let config = load_config(flags)?;
 
+    let restoring = flags.switch("restore");
+    let rescan_floor = flags.num_opt::<u32>("rescan")?;
+    if rescan_floor.is_some() && !restoring {
+        return Err("--rescan applies to `init --restore` (or to `restore --from`)".into());
+    }
+
     // ONE passphrase read serves restore AND open — a second prompt would
     // break the documented --passphrase-stdin single-line contract and can
     // seal/open under different strings (Fable review).
     let passphrase = read_passphrase(flags, true)?;
 
-    if flags.switch("restore") {
+    if restoring {
         // Dead-device recovery: re-seal the seed from the mnemonic into the
         // data dir, then fall through to the normal open (which resumes the
         // first-run ledger creation under the established-wallet guards).
@@ -464,8 +497,9 @@ fn cmd_init(flags: &Flags) -> CliResult {
         let words = prompt_line("BIP39 mnemonic (24 words, single line): ")?;
         SoftwareKeyStore::restore(&config.data_dir, &words, &passphrase)?;
         log("keystore restored from mnemonic");
-        log("NOTE: restore recovers the SEED only. Restore ledger.bin from backup too, or");
-        log("      key issuance rewinds into address reuse (Ledger::raise_key_index_floor).");
+        log("NOTE: the mnemonic recovers the SEED only. If you have a `backup` bundle,");
+        log("      use `swapkey-cli restore --from <bundle>` instead — it brings back the");
+        log("      coin ledger, swap records, and key index too.");
     }
 
     let mut first_run = match Wallet::open(config, &passphrase)? {
@@ -505,8 +539,24 @@ fn cmd_init(flags: &Flags) -> CliResult {
         let phase0 = phase0_gate(flags)?;
 
         match first_run.complete(phase0, backup_echo.as_deref()) {
-            Ok(wallet) => {
+            Ok(mut wallet) => {
                 log("wallet created");
+                if restoring {
+                    match rescan_floor {
+                        Some(floor) => {
+                            wallet.engine_mut().ledger_mut().raise_key_index_floor(floor)?;
+                            log(&format!(
+                                "key-index floor raised to {floor} — issuance resumes past every index this wallet ever used"
+                            ));
+                        }
+                        None => {
+                            log("WARNING: a mnemonic-only restore rewinds key issuance to index 0. If this");
+                            log("         wallet EVER issued an address, new addresses will REUSE on-chain");
+                            log("         indices — re-run with --rescan <floor> (any generous over-estimate");
+                            log("         of addresses ever issued is safe; gaps are never a problem).");
+                        }
+                    }
+                }
                 print_status(&wallet);
                 return Ok(());
             }
@@ -1147,6 +1197,93 @@ fn cmd_recover(flags: &Flags) -> CliResult {
     let chain = chain_view(wallet.config())?;
     startup_with_alarms(&mut wallet, &chain, &opts)?;
     log("recovery scan driven; re-run as the chain advances until every swap is terminal");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// backup / restore (Task 17) — see wallet::backup for the format + decisions
+// ---------------------------------------------------------------------------
+
+fn cmd_backup(flags: &Flags) -> CliResult {
+    let [dest] = flags.positional.as_slice() else {
+        return Err("backup takes exactly one argument: the bundle file to write".into());
+    };
+    let config = load_config(flags)?;
+    let dest = PathBuf::from(dest);
+    // Deliberately NO passphrase: the bundle is a byte-faithful snapshot of
+    // files that are already sealed at rest — backup must stay runnable from
+    // a script/cron without unlocking the wallet.
+    let summary = swapkey::wallet::backup_data_dir(&config.data_dir, &dest)?;
+    for (name, len) in &summary.files {
+        log(&format!("  bundled {name} ({len} bytes)"));
+    }
+    log(&format!(
+        "backup written: {} ({} files, {} bytes)",
+        dest.display(),
+        summary.files.len(),
+        summary.total_bytes()
+    ));
+    log("NOTE: sealed files stay encrypted in the bundle; the swap-template sidecars");
+    log("      and manifest ride public-by-design. The bundle alone cannot move funds,");
+    log("      but it reveals swap METADATA — treat it as restore-only material.");
+    Ok(())
+}
+
+fn cmd_restore(flags: &Flags) -> CliResult {
+    let Some(bundle) = flags.value("from") else {
+        return Err("restore needs --from <bundle> (use `init --restore` for the mnemonic-only path)".into());
+    };
+    if !flags.positional.is_empty() {
+        return Err("restore takes no positional arguments (did you mean --from <bundle>?)".into());
+    }
+    let rescan_floor = flags.num_opt::<u32>("rescan")?;
+    let config = load_config(flags)?;
+    let data_dir = config.data_dir.clone();
+
+    let summary = swapkey::wallet::restore_data_dir(Path::new(bundle), &data_dir)?;
+    log(&format!(
+        "restored {} files ({} bytes) into {}",
+        summary.files.len(),
+        summary.total_bytes(),
+        data_dir.display()
+    ));
+
+    // Verification open — the acceptance gate: a restored dir must open
+    // cleanly, and any store-open alarms must reach the operator NOW.
+    let passphrase = read_passphrase(flags, false)?;
+    let mut wallet = match Wallet::open(config, &passphrase) {
+        Ok(OpenedWallet::Ready(w)) => *w,
+        Ok(OpenedWallet::FirstRun(_)) => {
+            return Err(
+                "restore: the restored dir routed to first-run — the bundle was not an established wallet"
+                    .into(),
+            )
+        }
+        Err(e) => {
+            return Err(format!(
+                "the files were restored, but the wallet did not open ({e}) — check the passphrase; the restored dir was left in place"
+            )
+            .into())
+        }
+    };
+    for action in wallet.open_actions() {
+        log(&format!("ALARM (store open): {action:?}"));
+    }
+    match rescan_floor {
+        Some(floor) => {
+            wallet.engine_mut().ledger_mut().raise_key_index_floor(floor)?;
+            log(&format!(
+                "key-index floor raised to {floor} — issuance resumes past every index this wallet ever used"
+            ));
+        }
+        None => {
+            log("NOTE: if this bundle is OLDER than the last address this wallet issued, key");
+            log("      issuance has rewound — re-run `restore` guidance: raise the floor with");
+            log("      --rescan <floor> (a generous over-estimate is safe; gaps never hurt).");
+        }
+    }
+    print_status(&wallet);
+    log("restore complete — run `swapkey-cli recover` to re-enter any in-flight swap");
     Ok(())
 }
 

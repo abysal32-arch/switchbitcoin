@@ -83,6 +83,7 @@
 pub mod abort_hygiene;
 pub mod api;
 pub mod app;
+pub mod backup;
 pub mod config;
 pub mod runtime;
 pub mod backstop_driver;
@@ -103,6 +104,7 @@ pub mod ticket;
 pub mod transport;
 
 pub use app::{AppTick, BackstopRun, StalledParent, SwapApp};
+pub use backup::{backup_data_dir, restore_data_dir, BackupSummary};
 pub use backstop_driver::{
     run_cpfp_bump, BackstopDriver, BackstopTick, BumpOutcome, CpfpBumpRequest,
 };

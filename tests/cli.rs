@@ -193,3 +193,112 @@ fn commands_needing_a_node_refuse_without_a_node_section() {
     assert!(!out.status.success(), "recover without [node] must refuse:\n{t}");
     assert!(t.contains("[node]"), "the refusal must point at the config:\n{t}");
 }
+
+/// The Task-17 wallet-portability story end to end at the CLI surface:
+/// `backup` (no passphrase) → `restore --from` into a fresh data dir (with
+/// the verification open) → refused re-restore → the mnemonic-only path
+/// (`init --restore --rescan`) resuming issuance past the floor.
+#[test]
+fn backup_restore_and_mnemonic_rescan_round_trip_via_the_cli() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_a = dir.path().join("a.toml");
+    let data_a = dir.path().join("data-a");
+    let out = run_cli(
+        &config_a,
+        &[
+            "init",
+            "--data-dir",
+            data_a.to_str().unwrap(),
+            "--passphrase-stdin",
+            "--accept-phase0",
+            "--skip-backup-verification",
+        ],
+        PASSPHRASE,
+    );
+    let t = text(&out);
+    assert!(out.status.success(), "init failed:\n{t}");
+    // Capture the mnemonic for the mnemonic-only leg below (the line after
+    // the RECOVERY MNEMONIC banner).
+    let words = t
+        .lines()
+        .skip_while(|l| !l.starts_with("=== RECOVERY MNEMONIC"))
+        .nth(1)
+        .expect("mnemonic line")
+        .trim()
+        .to_string();
+    assert_eq!(words.split(' ').count(), 24, "not a 24-word line: {words}");
+
+    // backup: works WITHOUT a passphrase (nothing is unsealed), refuses to
+    // overwrite its own bundle.
+    let bundle = dir.path().join("wallet.skbak");
+    let out = run_cli(&config_a, &["backup", bundle.to_str().unwrap()], "");
+    let t = text(&out);
+    assert!(out.status.success(), "backup failed:\n{t}");
+    assert!(bundle.exists(), "bundle file must exist");
+    assert!(t.contains("backup written"), "{t}");
+    assert!(t.contains("bundled keystore.bin"), "{t}");
+    let out = run_cli(&config_a, &["backup", bundle.to_str().unwrap()], "");
+    assert!(!out.status.success(), "a second backup onto the same path must refuse");
+
+    // restore into a FRESH data dir under its own config; the verification
+    // open must succeed and point at `recover`.
+    let config_b = dir.path().join("b.toml");
+    let data_b = dir.path().join("data-b");
+    std::fs::write(
+        &config_b,
+        format!("network = \"regtest\"\ndata_dir = '{}'\n", data_b.display()),
+    )
+    .unwrap();
+    let out = run_cli(
+        &config_b,
+        &["restore", "--from", bundle.to_str().unwrap(), "--passphrase-stdin"],
+        PASSPHRASE,
+    );
+    let t = text(&out);
+    assert!(out.status.success(), "restore failed:\n{t}");
+    assert!(data_b.join("keystore.bin").exists() && data_b.join("ledger.bin").exists(), "{t}");
+    assert!(t.contains("restore complete"), "{t}");
+    let out = run_cli(&config_b, &["status", "--passphrase-stdin"], PASSPHRASE);
+    let t = text(&out);
+    assert!(out.status.success(), "status on the restored wallet failed:\n{t}");
+    assert!(t.contains("network:  regtest"), "{t}");
+
+    // A second restore over the now-established dir must refuse (and fail
+    // BEFORE any passphrase is consumed — the dir gate comes first).
+    let out = run_cli(
+        &config_b,
+        &["restore", "--from", bundle.to_str().unwrap(), "--passphrase-stdin"],
+        PASSPHRASE,
+    );
+    assert!(!out.status.success(), "restore over an established wallet must refuse");
+
+    // Mnemonic-only leg: a THIRD wallet from the words alone, with the
+    // key-index floor raised so issuance can never reuse an on-chain index.
+    let config_c = dir.path().join("c.toml");
+    let data_c = dir.path().join("data-c");
+    let out = run_cli(
+        &config_c,
+        &[
+            "init",
+            "--restore",
+            "--rescan",
+            "50",
+            "--data-dir",
+            data_c.to_str().unwrap(),
+            "--passphrase-stdin",
+            "--accept-phase0",
+        ],
+        &format!("{PASSPHRASE}{words}\n"),
+    );
+    let t = text(&out);
+    assert!(out.status.success(), "init --restore --rescan failed:\n{t}");
+    assert!(t.contains("key-index floor raised to 50"), "{t}");
+    let out = run_cli(&config_c, &["address", "--passphrase-stdin"], PASSPHRASE);
+    let t = text(&out);
+    assert!(out.status.success(), "address on the restored wallet failed:\n{t}");
+    assert!(t.contains("(key index 50)"), "issuance must resume past the floor:\n{t}");
+
+    // --rescan without --restore is a usage error, not a silent no-op.
+    let out = run_cli(&config_c, &["init", "--rescan", "9", "--passphrase-stdin"], PASSPHRASE);
+    assert!(!out.status.success(), "--rescan without --restore must be refused");
+}

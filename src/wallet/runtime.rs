@@ -33,10 +33,18 @@
 //!                       this same dir
 //!   hygiene.bin         abort-hygiene cooldown tracker  lock: .hygiene.lock
 //!   .store.lock         swap-store single-instance lock
+//!   leases/<sid>        single-signer nonce-lease tombstones (INV-3, one
+//!                       per live signing session; a crash leaves the file,
+//!                       so that swap can only abort-refund — conservative)
 //! ```
 //!
 //! `swapkey.toml` is NOT required to live here — the config file is wherever
 //! the runner is pointed, and it *contains* `data_dir`.
+//!
+//! [`crate::wallet::backup`] snapshots this whole durable set (locks and
+//! `.tmp` transients excluded) into ONE portable, integrity-hashed bundle and
+//! restores it atomically into a fresh dir — see that module for the
+//! backup-vs-running-wallet and encryption-posture decisions.
 //!
 //! # Single-instance locking
 //!
