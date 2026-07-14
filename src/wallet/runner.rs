@@ -566,8 +566,10 @@ pub const FALLBACK_TARGET_FEERATE_SAT_VB: u64 = 2;
 
 /// Resolve the backstop's CPFP target feerate for one pass: operator override
 /// → live node estimate → hardcoded fallback. Returns the resolved sat/vB and a
-/// short static label naming which source won (for the log line).
-fn resolve_target_feerate(
+/// short static label naming which source won (for the log line). Shared with
+/// the standalone watch mode ([`wallet::watch`](crate::wallet::watch)) so the
+/// two resolve identically.
+pub(crate) fn resolve_target_feerate(
     override_sat_vb: Option<u64>,
     live_estimate: Option<u64>,
 ) -> (u64, &'static str) {
@@ -971,8 +973,10 @@ fn rec_refund_bytes(engine: &SwapEngine, sid: &[u8; 32]) -> Result<Vec<u8>> {
 /// already-tracked and missing-sidecar cases log and return (the coin is
 /// still recoverable by key derivation), never failing the babysit terminal.
 /// `deposit_linked` is `false`: this runner never executes a consent-linked
-/// completion bump (dead-device policy passes `consent = None`).
-fn register_settlement_output(
+/// completion bump (dead-device policy passes `consent = None`). Shared with
+/// the standalone watch mode ([`wallet::watch`](crate::wallet::watch)), whose
+/// confirmed dead-device refund pays the same `SwapDestination` key.
+pub(crate) fn register_settlement_output(
     engine: &mut SwapEngine,
     chain: &impl AuthoritativeChainView,
     data_dir: &Path,

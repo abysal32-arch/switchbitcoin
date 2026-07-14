@@ -60,6 +60,13 @@
 //!     refund fire) + the congestion fee-backstop routing (silent for
 //!     refunds, consent-gated for completions), rank 6.
 
+//!   * `watch` — the STANDALONE watchtower run mode (Task 19): arm one guard
+//!     per persisted swap from the record alone (no live ctx, no session key)
+//!     and poll the dead-device refund guard from a second device until every
+//!     escrow's exit confirms. Fires ONLY own pre-armed refunds; stands down
+//!     on completions; delegation packet = the Task-17 backup bundle (see the
+//!     module docs' decision).
+
 //!
 //!   * `transport` — real peer transport (pre-alpha): blocking TCP with
 //!     u32-BE length framing behind the settlement core's `Transport` trait.
@@ -93,6 +100,7 @@ pub mod engine;
 pub mod funding_driver;
 pub mod keys;
 pub mod keystore;
+pub mod watch;
 pub mod watchtower_driver;
 pub mod ledger;
 pub mod manifest;
@@ -124,5 +132,6 @@ pub use runner::{
     SwapStepOutcome,
 };
 pub use runtime::{FirstRun, FirstRunError, OpenedWallet, Wallet};
+pub use watch::{arm_guards, watch_pass, watch_step, WatchGuard, WatchOptions, WatchSet, WatchStatus};
 pub use store::{EnclaveKeyProvider, ModeledEnclave, RecoveryAction, SwapPhase, SwapRecord, SwapStore};
 pub use transport::{TcpTransport, DEFAULT_IO_TIMEOUT, MAX_FRAME};

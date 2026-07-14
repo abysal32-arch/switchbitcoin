@@ -667,67 +667,35 @@ impl SwapApp {
     }
 
     /// The pre-armed refund viewed as a bumpable STALLED PARENT: its signed
-    /// bytes (held in ctx since `begin`), its own fee (escrow amount minus the
-    /// sum of its outputs — checked, so hostile values error rather than
-    /// wrap), and its vsize.
+    /// bytes (held in ctx since `begin`), its own fee, and its vsize — the
+    /// fee/vsize computation is the shared
+    /// [`refund_parent_meta`](crate::wallet::watchtower_driver::refund_parent_meta)
+    /// (one definition with the standalone watch mode).
     fn refund_parent(&self) -> Result<(&[u8], u64, u64)> {
         let bytes = self.ctx.pre_armed_refund.tx_bytes();
-        let tx: bitcoin::Transaction = bitcoin::consensus::encode::deserialize(bytes)
-            .map_err(|_| Error::Validation("pre-armed refund bytes do not decode"))?;
-        let out_sum: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
-        let fee = self
-            .ctx
-            .escrow_amount
-            .checked_sub(out_sum)
-            .ok_or(Error::Validation("refund outputs exceed the escrow amount"))?;
-        Ok((bytes, fee, tx.vsize() as u64))
+        let (fee, vsize) = crate::wallet::watchtower_driver::refund_parent_meta(
+            bytes,
+            self.ctx.escrow_amount,
+        )?;
+        Ok((bytes, fee, vsize))
     }
 
     /// The Task 14 auto-congestion predicate, fully gated (doc on the call
-    /// site in [`backstop_execute`](Self::backstop_execute)): a fresh estimate
-    /// demands more for the pre-armed refund's own vsize than the refund pays,
-    /// AND the refund is relayed-but-unconfirmed attributable to OUR txid, AND
-    /// its P2A anchor is still unspent (no bump child in flight — an evicted
-    /// child re-arms this automatically on the next pass). Every failure mode
-    /// answers `false`: a bad estimate only ever degrades to "no auto signal",
-    /// with the manual flag still available.
+    /// site in [`backstop_execute`](Self::backstop_execute)) — delegates to
+    /// the shared
+    /// [`refund_congestion_auto`](crate::wallet::watchtower_driver::refund_congestion_auto)
+    /// so the live loop and the standalone watch mode apply identical gates.
     fn refund_congestion_auto(
         &self,
         chain: &impl AuthoritativeChainView,
         est_sat_vb: u64,
     ) -> bool {
-        let Ok((bytes, fee, vsize)) = self.refund_parent() else {
-            return false;
-        };
-        if est_sat_vb.saturating_mul(vsize) <= fee {
-            return false; // the refund already pays the demanded floor
-        }
-        let Ok(tx) = bitcoin::consensus::encode::deserialize::<bitcoin::Transaction>(bytes) else {
-            return false;
-        };
-        let Some(escrow_op) = tx.input.first().map(|i| i.previous_output) else {
-            return false;
-        };
-        let refund_txid = tx.compute_txid();
-        // Relayed, unconfirmed, and OURS — a foreign mempool spend is a race
-        // (the tower's own arms handle it), not congestion.
-        if chain.spend_status(escrow_op) != crate::chain::SpendStatus::InMempool
-            || chain.spend_txid(escrow_op) != Some(refund_txid)
-        {
-            return false;
-        }
-        // No bump child already in flight on the anchor.
-        match tx
-            .output
-            .iter()
-            .position(|o| crate::chain::policy::is_p2a(&o.script_pubkey))
-        {
-            Some(v) => {
-                chain.spend_status(bitcoin::OutPoint::new(refund_txid, v as u32))
-                    == crate::chain::SpendStatus::Unspent
-            }
-            None => false,
-        }
+        crate::wallet::watchtower_driver::refund_congestion_auto(
+            chain,
+            est_sat_vb,
+            self.ctx.pre_armed_refund.tx_bytes(),
+            self.ctx.escrow_amount,
+        )
     }
 
     /// Whole-wallet crash re-entry: re-enter every non-terminal swap in the

@@ -230,6 +230,73 @@ impl WatchtowerDriver {
     }
 }
 
+/// The pre-armed refund viewed as a bumpable STALLED PARENT: its own absolute
+/// fee (the escrow amount minus the sum of its outputs — checked, so hostile
+/// values error rather than wrap) and its vsize. ONE definition shared by the
+/// live app's backstop executor ([`SwapApp::backstop_execute`]) and the
+/// standalone watch mode ([`wallet::watch`](crate::wallet::watch)), so the two
+/// can never diverge on bump sizing.
+///
+/// [`SwapApp::backstop_execute`]: crate::wallet::app::SwapApp::backstop_execute
+pub(crate) fn refund_parent_meta(tx_bytes: &[u8], escrow_amount: u64) -> Result<(u64, u64)> {
+    let tx: bitcoin::Transaction = bitcoin::consensus::encode::deserialize(tx_bytes)
+        .map_err(|_| crate::Error::Validation("pre-armed refund bytes do not decode"))?;
+    let out_sum: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
+    let fee = escrow_amount
+        .checked_sub(out_sum)
+        .ok_or(crate::Error::Validation("refund outputs exceed the escrow amount"))?;
+    Ok((fee, tx.vsize() as u64))
+}
+
+/// The Task-14 auto-congestion predicate for an ALREADY-RELAYED pre-armed
+/// refund, fully gated (Fable review — see the `backstop_execute` call site):
+/// a fresh estimate demands more for the refund's own vsize than the refund
+/// pays, AND the refund is relayed-but-unconfirmed attributable to OUR txid
+/// (the one stall the tower cannot detect internally), AND its P2A anchor is
+/// still unspent (no bump child in flight — an evicted child re-arms this
+/// automatically on the next pass). Every failure mode answers `false`: a bad
+/// estimate only ever degrades to "no auto signal", with the manual flag
+/// still available. Shared by the live app and the standalone watch mode.
+pub(crate) fn refund_congestion_auto(
+    chain: &impl AuthoritativeChainView,
+    est_sat_vb: u64,
+    tx_bytes: &[u8],
+    escrow_amount: u64,
+) -> bool {
+    let Ok((fee, vsize)) = refund_parent_meta(tx_bytes, escrow_amount) else {
+        return false;
+    };
+    if est_sat_vb.saturating_mul(vsize) <= fee {
+        return false; // the refund already pays the demanded floor
+    }
+    let Ok(tx) = bitcoin::consensus::encode::deserialize::<bitcoin::Transaction>(tx_bytes) else {
+        return false;
+    };
+    let Some(escrow_op) = tx.input.first().map(|i| i.previous_output) else {
+        return false;
+    };
+    let refund_txid = tx.compute_txid();
+    // Relayed, unconfirmed, and OURS — a foreign mempool spend is a race
+    // (the tower's own arms handle it), not congestion.
+    if chain.spend_status(escrow_op) != crate::chain::SpendStatus::InMempool
+        || chain.spend_txid(escrow_op) != Some(refund_txid)
+    {
+        return false;
+    }
+    // No bump child already in flight on the anchor.
+    match tx
+        .output
+        .iter()
+        .position(|o| crate::chain::policy::is_p2a(&o.script_pubkey))
+    {
+        Some(v) => {
+            chain.spend_status(OutPoint::new(refund_txid, v as u32))
+                == crate::chain::SpendStatus::Unspent
+        }
+        None => false,
+    }
+}
+
 /// Which contract tx the backstop would bump. The distinction is REVEAL- and
 /// role-aware (finding #5): the safe no-reserve fallback differs by whether an
 /// already-signed refund exit still exists.

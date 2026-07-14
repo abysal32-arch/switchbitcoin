@@ -136,6 +136,7 @@ fn run(args: &[String]) -> CliResult {
         "onboard" => cmd_onboard(&flags),
         "swap" => cmd_swap(&flags),
         "recover" => cmd_recover(&flags),
+        "watch" => cmd_watch(&flags),
         "serve" => cmd_serve(&flags),
         "backup" => cmd_backup(&flags),
         "restore" => cmd_restore(&flags),
@@ -196,6 +197,20 @@ COMMANDS
   recover   Startup reconcile + crash-recovery scan; drive each tick.
             --dry-run           decide but never broadcast
             --assume-congested  as for swap
+  watch     Standalone watchtower (second-device dead-device refund guard):
+            guard every persisted swap's escrow, firing ONLY this wallet's own
+            pre-armed refunds at CSV maturity and standing down when a
+            completion wins. Never negotiates, never signs or broadcasts a
+            completion, never claims. Typically run against a data dir
+            restored from a `backup` bundle on a second device (the
+            delegation packet — see wallet::watch). Requires [node]. Exits
+            once every guarded escrow's exit confirms.
+            --poll-secs <n>     chain poll cadence (default 10)
+            --feerate <sat/vB>  silent refund-CPFP feerate override (default:
+                                live node estimate, fallback 2)
+            --assume-congested  as for swap (treat a relayed refund as below
+                                the fee floor; fires the silent refund CPFP)
+            --once              one pass then exit (cron/scripting)
   backup <path>  Write a portable backup bundle of the wallet data dir's
             durable files to <path>. Sealed files stay sealed; the swap
             template sidecars / manifest ride public-by-design — the bundle
@@ -277,6 +292,7 @@ const KNOWN_SWITCHES: &[&str] = &[
     "--restore",
     "--dry-run",
     "--assume-congested",
+    "--once",
 ];
 
 impl Flags {
@@ -1198,6 +1214,106 @@ fn cmd_recover(flags: &Flags) -> CliResult {
     startup_with_alarms(&mut wallet, &chain, &opts)?;
     log("recovery scan driven; re-run as the chain advances until every swap is terminal");
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// watch — the standalone watchtower (Task 19); see wallet::watch for the
+// delegation-packet decision and the theft/grief argument
+// ---------------------------------------------------------------------------
+
+fn cmd_watch(flags: &Flags) -> CliResult {
+    // Same rule as swap/serve (Fable review lineage): a watch tick's PURPOSE
+    // is to fire the dead-device refund — nothing about it can be "dry".
+    if flags.switch("dry-run") {
+        return Err(
+            "watch does not support --dry-run (a tick fires the dead-device refund); \
+             use `recover --dry-run` to observe decisions"
+                .into(),
+        );
+    }
+    let poll = Duration::from_secs(flags.num("poll-secs", 10)?);
+    let once = flags.switch("once");
+
+    let mut wallet = open_ready(flags)?;
+    let chain = chain_view(wallet.config())?;
+    let data_dir = wallet.config().data_dir.clone();
+
+    for action in wallet.open_actions() {
+        log(&format!("ALARM (store open): {action:?}"));
+    }
+    // Reconcile ONLY — deliberately NOT the full startup_with_alarms: driving
+    // recovery ticks would broadcast completions (`Extract`/`Rebroadcast`),
+    // which stay the owning wallet's business; a watchtower fires nothing but
+    // its own pre-armed refunds. The reconcile gates reserve leases per the
+    // Task-E caller contract; its failure gates the CPFP off but never the
+    // refund FIRE (a pure chain action the tower performs regardless).
+    let allow_bump = match wallet.engine_mut().reconcile_with_chain(&chain) {
+        Ok(r) => {
+            if !r.reserves_swept.is_empty() {
+                log(&format!("reconcile: swept {} phantom reserve(s)", r.reserves_swept.len()));
+            }
+            true
+        }
+        Err(e) => {
+            log(&format!(
+                "ALARM: chain reconcile failed ({e}); reserve CPFP bumps are gated off — \
+                 refund fires are unaffected"
+            ));
+            false
+        }
+    };
+
+    let opts = swapkey::wallet::watch::WatchOptions {
+        target_feerate_sat_vb: flags.num_opt("feerate")?,
+        refund_congested: flags.switch("assume-congested"),
+        allow_bump,
+    };
+    let set = swapkey::wallet::watch::arm_guards(wallet.engine())?;
+    for p in &set.unreadable {
+        log(&format!("ALARM: unreadable swap record {}", p.display()));
+    }
+    for (sid, why) in &set.unguardable {
+        log(&format!("ALARM: cannot guard {}: {why}", hex32(sid)));
+    }
+    let mut guards = set.guards;
+    if guards.is_empty() {
+        log("no guardable swaps in the store — nothing to watch");
+        return Ok(());
+    }
+    log(&format!(
+        "watchtower armed: guarding {} escrow(s) — this process fires ONLY this wallet's \
+         own pre-armed refunds and stands down on completions",
+        guards.len()
+    ));
+    for g in &guards {
+        log(&format!(
+            "  guarding {} escrow {}:{} ({:?})",
+            hex32(g.sid()),
+            g.escrow().txid,
+            g.escrow().vout,
+            g.phase_at_arm()
+        ));
+    }
+    let mut sink = |line: String| log(&line);
+    loop {
+        let remaining = swapkey::wallet::watch::watch_pass(
+            &mut guards,
+            wallet.engine_mut(),
+            &chain,
+            &data_dir,
+            &opts,
+            &mut sink,
+        );
+        if remaining == 0 {
+            log("every guarded escrow's exit is confirmed — watchtower standing down");
+            return Ok(());
+        }
+        if once {
+            log(&format!("--once: {remaining} escrow(s) still guarded — re-run to keep guarding"));
+            return Ok(());
+        }
+        std::thread::sleep(poll);
+    }
 }
 
 // ---------------------------------------------------------------------------
