@@ -324,6 +324,24 @@ impl SwapEngine {
         self.ledger.reconcile_leases_with_chain(&live, chain)
     }
 
+    /// [`reconcile_leases_with_chain`](Self::reconcile_leases_with_chain) with
+    /// EXTRA in-memory live lessees unioned into the keep-set. A multi-swap
+    /// runner (Task 16 `serve`) holds swaps whose lease exists but whose store
+    /// record has NOT persisted yet — the coin leases at negotiate time, the
+    /// record lands with the Setup broadcast, and the funding-order WAITER can
+    /// sit in that window for many ticks. Healing a SIBLING's failed attempt
+    /// through the store-only keep-set would release that live lease, and a
+    /// later swap could then lease the same coin into a Setup double-spend.
+    pub fn reconcile_leases_with_chain_keeping(
+        &mut self,
+        chain: &dyn crate::chain::AuthoritativeChainView,
+        also_live: &[[u8; 32]],
+    ) -> Result<crate::wallet::ledger::LeaseReconcile> {
+        let mut live = live_lessees(&self.store)?;
+        live.extend_from_slice(also_live);
+        self.ledger.reconcile_leases_with_chain(&live, chain)
+    }
+
     /// The COMPOSED post-open chain reconciliation — THE startup seam. The
     /// canonical wallet startup sequence is:
     ///

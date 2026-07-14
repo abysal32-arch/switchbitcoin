@@ -46,6 +46,12 @@ use crate::wallet::runner::hex32;
 /// Conventional local port (0x0CF4 = 3316, the spec version tag).
 pub const DEFAULT_API_PORT: u16 = 3316;
 
+/// Default `--max-swaps` concurrency cap (Task 16). Small on purpose: every
+/// live swap holds a leased pre-encumbrance coin, and the CPFP reserve pool
+/// that guards their refunds is shared — a generous cap would let a tester
+/// oversubscribe the reserve long before the ledger runs out of coins.
+pub const DEFAULT_MAX_SWAPS: usize = 4;
+
 /// Trace ring-buffer cap (old lines are dropped; `/events` reports `next`).
 const TRACE_CAP: usize = 2_000;
 /// Max lines a single `/events` reply carries.
@@ -98,12 +104,21 @@ pub struct ApiState {
     next_seq: u64,
     /// Swap views by sid hex (the active one also flagged in the snapshot).
     pub swaps: HashMap<String, SwapView>,
-    /// The in-flight worker command, if any (409 gate for new commands).
+    /// The in-flight worker command, if any. Since Task 16 this is a SHORT
+    /// dispatch latch for swap commands (set at the route, cleared by the
+    /// worker the moment the command lands in a slot or is refused); only
+    /// `onboard` still holds it through its whole split tail.
     pub busy: Option<&'static str>,
     /// The currently-offered swap ticket (a `skt1…` string) while a
     /// `SwapOffer` waits for its taker; cleared once a taker rendezvouses or
     /// the offer deadline passes. Surfaced in `/status` so the UI can show it.
     pub offer_ticket: Option<String>,
+    /// Worker-maintained count of LIVE swap slots (accepting/offering/running/
+    /// babysitting/guarding). The route's cap gate reads it; the worker
+    /// refreshes it every dispatch and every tick.
+    pub active_swaps: usize,
+    /// The serve concurrency cap (`--max-swaps`); set once at startup.
+    pub max_swaps: usize,
 }
 
 impl Default for ApiState {
@@ -115,6 +130,8 @@ impl Default for ApiState {
             swaps: HashMap::new(),
             busy: None,
             offer_ticket: None,
+            active_swaps: 0,
+            max_swaps: DEFAULT_MAX_SWAPS,
         }
     }
 }
@@ -242,7 +259,7 @@ pub fn route(
                 }
                 _ => {}
             }
-            enqueue(state, cmds, "swap", ApiCmd::SwapBegin { listen, connect })
+            enqueue_swap(state, cmds, ApiCmd::SwapBegin { listen, connect })
         }
         ("POST", "/swap/offer") => {
             let Some(listen) = json_str_field(body, "listen") else {
@@ -251,7 +268,7 @@ pub fn route(
             if listen.is_empty() || !listen.contains(':') {
                 return (400, err_json("listen must be host:port"));
             }
-            enqueue(state, cmds, "swap", ApiCmd::SwapOffer { listen })
+            enqueue_swap(state, cmds, ApiCmd::SwapOffer { listen })
         }
         ("POST", "/swap/take") => {
             let Some(ticket) = json_str_field(body, "ticket") else {
@@ -263,7 +280,7 @@ pub fn route(
             if let Err(e) = crate::wallet::ticket::Ticket::decode(&ticket) {
                 return (400, err_json(&e.to_string()));
             }
-            enqueue(state, cmds, "swap", ApiCmd::SwapTake { ticket })
+            enqueue_swap(state, cmds, ApiCmd::SwapTake { ticket })
         }
         ("GET", _) | ("POST", _) => (404, err_json("unknown endpoint")),
         _ => (405, err_json("method not allowed")),
@@ -286,6 +303,38 @@ fn enqueue(
     }
     st.busy = Some(label);
     st.push_trace(format!("api: {label} accepted"));
+    (202, "{\"accepted\":true}".into())
+}
+
+/// Reserve the worker for a SWAP command (Task 16: swaps are concurrent, so
+/// the gates differ from [`enqueue`]). Checked under ONE lock: the short
+/// dispatch latch (`busy` — one command in flight at a time; the worker clears
+/// it the moment the command lands in a slot), then the concurrency cap
+/// (`active_swaps < max_swaps`, worker-maintained), then — for an offer — the
+/// one-outstanding-offer rule (there is a single `offer_ticket` surface). A
+/// capped swap is a loud 409, never a silent drop.
+fn enqueue_swap(state: &SharedState, cmds: &Sender<ApiCmd>, cmd: ApiCmd) -> (u16, String) {
+    let mut st = state.lock().unwrap();
+    if let Some(busy) = st.busy {
+        return (409, err_json(&format!("worker busy with {busy}")));
+    }
+    if st.active_swaps >= st.max_swaps {
+        return (
+            409,
+            err_json(&format!(
+                "swap cap reached ({} of {} active) — wait for a swap to finish or raise --max-swaps",
+                st.active_swaps, st.max_swaps
+            )),
+        );
+    }
+    if matches!(cmd, ApiCmd::SwapOffer { .. }) && st.offer_ticket.is_some() {
+        return (409, err_json("an offer is already outstanding (one ticket at a time)"));
+    }
+    if cmds.send(cmd).is_err() {
+        return (503, err_json("worker is gone"));
+    }
+    st.busy = Some("swap");
+    st.push_trace("api: swap accepted".to_string());
     (202, "{\"accepted\":true}".into())
 }
 
@@ -313,10 +362,11 @@ pub fn status_snapshot(
     network: Network,
     tip_height: Option<u32>,
     node_online: bool,
-    active_swap: Option<&SwapView>,
+    active: &[SwapView],
     busy: Option<&str>,
     alarms: &[String],
     offer_ticket: Option<&str>,
+    max_swaps: usize,
 ) -> String {
     let ledger = engine.ledger();
     let mut coins = String::from("[");
@@ -365,6 +415,17 @@ pub fn status_snapshot(
     }
     alarms_json.push(']');
 
+    // Every live slot's view (Task 16) — accepting/offering slots included,
+    // so the UI sees a pending offer before its sid derives.
+    let mut active_json = String::from("[");
+    for (i, v) in active.iter().enumerate() {
+        if i > 0 {
+            active_json.push(',');
+        }
+        active_json.push_str(&swap_view_json(v));
+    }
+    active_json.push(']');
+
     // The SL claim-delay posture is now wired into the run loop (Task 13), so
     // this is `true` and the ACTIVE posture (override else the manifest's) is
     // reported lowercase for the UI.
@@ -381,7 +442,7 @@ pub fn status_snapshot(
          \"coins\":{coins},\"records\":{swaps},\"unreadable_records\":{unreadable},\
          \"swap\":{},\"busy\":{},\"alarms\":{alarms_json},\
          \"phase0_warning\":{},\"claim_posture_applied\":true,\"claim_posture\":{},\
-         \"offer_ticket\":{}}}",
+         \"offer_ticket\":{},\"active_swaps\":{active_json},\"max_swaps\":{max_swaps}}}",
         json_string(network.as_str()),
         tip_height.map(|h| h.to_string()).unwrap_or_else(|| "null".into()),
         node_online,
@@ -389,7 +450,9 @@ pub fn status_snapshot(
         params.tier_d_sats,
         params.escrow_amount_sats(),
         params.pre_encumbrance_sats(),
-        active_swap.map(swap_view_json).unwrap_or_else(|| "null".into()),
+        // Legacy single-swap field the UI predates Task 16 on: the FIRST
+        // active view (null when idle). The full list rides in active_swaps.
+        active.first().map(swap_view_json).unwrap_or_else(|| "null".into()),
         busy.map(json_string).unwrap_or_else(|| "null".into()),
         json_string(crate::wallet::ledger::PHASE0_WARNING),
         json_string(claim_posture),

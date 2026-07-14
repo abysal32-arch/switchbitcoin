@@ -1594,3 +1594,330 @@ fn ticket_rendezvous_then_negotiate_over_tcp_loopback() {
     let maker_sid = maker.join().unwrap().expect("maker side");
     assert_eq!(maker_sid, taker_sid, "both sides must derive the same session id");
 }
+
+// ============================================================================
+// Task 16: TWO concurrent swaps over ONE shared wallet/ledger — the serve
+// model (a single thread interleaving both swaps' steps), against two
+// independent peer wallets. The crux is shared-resource correctness: the two
+// negotiations must lease DISTINCT pre-encumbrance coins (keyed by sid), both
+// swaps must close forward-or-refund, and the shared ledger must end with no
+// stranded lease and BOTH received coins registered.
+// ============================================================================
+
+/// Onboard ONE deposit sized for TWO pre-encumbrance units (the concurrent-
+/// swap wallet), leaving both UNLEASED. Returns both outpoints.
+fn onboard_two_unleased(dir: &std::path::Path, params: &Params, dep_seed: u8) -> Vec<OutPoint> {
+    let ack = acknowledge_phase0(PHASE0_WARNING).unwrap();
+    let mut ledger = Ledger::create(dir, &ModeledEnclave, ack).unwrap();
+    let keys = ModeledKeySource::new(&ModeledEnclave);
+    let (idx, spk) = ledger.next_deposit_address(&keys).unwrap();
+    let dep = OutPoint::new(txid_from(dep_seed), 0);
+    // Sized so the split carves its reserve AND still divides into two full
+    // units (the reserve is carved BEFORE the k-unit division).
+    ledger
+        .register_deposit(
+            dep,
+            2 * params.pre_encumbrance_sats() + params.cpfp_reserve_sats + 2_000,
+            100,
+            idx,
+            &spk,
+            &keys,
+            Some(acknowledge_phase0(PHASE0_WARNING).unwrap()),
+        )
+        .unwrap();
+    let plan = ledger.split_deposit(dep, params, 2_000, &keys).unwrap();
+    assert_eq!(plan.pre_encumbrance_count, 2, "the deposit must split into TWO units");
+    ledger.confirm_split(plan.txid, 150, &FixedClock(1_000)).unwrap();
+    let pres: Vec<OutPoint> = ledger
+        .coins()
+        .iter()
+        .filter(|c| c.class == CoinClass::PreEncumbrance && c.state == CoinState::Unspent)
+        .map(|c| c.outpoint)
+        .collect();
+    assert_eq!(pres.len(), 2);
+    pres
+}
+
+/// One interleaved babysit tick for a terminal swap; `true` once the record
+/// is terminal (errors retry like the binary's loops).
+fn babysit_once(
+    engine: &mut SwapEngine,
+    chain: &SimChain,
+    dir: &std::path::Path,
+    sid: &[u8; 32],
+    outcome: &SwapOutcome,
+    opts: &RunOptions,
+) -> bool {
+    let mut log = no_log();
+    match outcome {
+        SwapOutcome::Completed { .. } => {
+            completion_babysit_step(engine, chain, dir, sid, opts, &mut log)
+                .map(|o| o.is_some())
+                .unwrap_or(false)
+        }
+        SwapOutcome::Refunding { .. } => refund_babysit_step(engine, chain, dir, sid, opts, &mut log)
+            .map(|o| o.is_some())
+            .unwrap_or(false),
+        SwapOutcome::Aborted { .. } => true,
+    }
+}
+
+#[test]
+fn two_concurrent_swaps_share_one_ledger_without_collisions() {
+    let params = Params::testnet_provisional();
+    let base = 500_000u32;
+    let chain = SimChain::new(base);
+
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let dir_c = tempfile::tempdir().unwrap();
+    let pres_a = onboard_two_unleased(dir_a.path(), &params, 0xA7);
+    let pre_b = onboard_unleased(dir_b.path(), &params, 0xB7);
+    let pre_c = onboard_unleased(dir_c.path(), &params, 0xC7);
+    for op in pres_a.iter().copied().chain([pre_b, pre_c]) {
+        chain.fund_with_amount(op, base, params.pre_encumbrance_sats());
+    }
+
+    let block_x = base + 400;
+    let done = Arc::new(AtomicUsize::new(0));
+    let (io1_a, io1_b) = duplex();
+    let (io2_a, io2_c) = duplex();
+    let sk_b = Scalar::random(&mut rand::rng());
+    let sk_c = Scalar::random(&mut rand::rng());
+
+    let hb = {
+        let (dir, chain, done) = (dir_b.path().to_path_buf(), chain.clone(), done.clone());
+        std::thread::spawn(move || run_party("B", dir, chain, io1_b, sk_b, block_x, done, None))
+    };
+    let hc = {
+        let (dir, chain, done) = (dir_c.path().to_path_buf(), chain.clone(), done.clone());
+        std::thread::spawn(move || run_party("C", dir, chain, io2_c, sk_c, block_x, done, None))
+    };
+    let miner = {
+        let (chain, done) = (chain.clone(), done.clone());
+        std::thread::spawn(move || {
+            for _ in 0..4_000 {
+                if done.load(AtomicOrdering::SeqCst) >= 3 {
+                    break;
+                }
+                chain.mine();
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        })
+    };
+
+    // ---- wallet A: ONE engine, TWO interleaved swaps (the serve model) ----
+    let mut engine = open_engine(dir_a.path());
+    let clock = FixedClock(u64::MAX);
+    let mut io1_a = io1_a;
+    let mut io2_a = io2_a;
+    let sk_a1 = Scalar::random(&mut rand::rng());
+    let sk_a2 = Scalar::random(&mut rand::rng());
+    let n1 = negotiate_swap(
+        &mut io1_a, &mut engine, &chain, &clock, Network::Regtest, dir_a.path(), sk_a1,
+    )
+    .expect("negotiate swap 1");
+    let n2 = negotiate_swap(
+        &mut io2_a, &mut engine, &chain, &clock, Network::Regtest, dir_a.path(), sk_a2,
+    )
+    .expect("negotiate swap 2");
+    let sid1 = n1.artifacts.session_id;
+    let sid2 = n2.artifacts.session_id;
+    assert_ne!(sid1, sid2);
+
+    // THE lease crux: the two negotiations took two DISTINCT coins, each
+    // tagged with its own sid — the transactional Unspent→Leased flip can
+    // never hand one coin to two swaps.
+    {
+        let leased: Vec<(OutPoint, Option<[u8; 32]>)> = engine
+            .ledger()
+            .coins()
+            .iter()
+            .filter(|c| c.state == CoinState::Leased)
+            .map(|c| (c.outpoint, c.lessee))
+            .collect();
+        assert_eq!(leased.len(), 2, "exactly the two negotiated leases");
+        assert_ne!(leased[0].0, leased[1].0, "two swaps must never share a coin");
+        let lessees: Vec<[u8; 32]> = leased.iter().map(|(_, l)| l.unwrap()).collect();
+        assert!(lessees.contains(&sid1) && lessees.contains(&sid2));
+    }
+
+    let peer1 = PeerSession::new(sid1, Box::new(io1_a));
+    let peer2 = PeerSession::new(sid2, Box::new(io2_a));
+    let mut app1 =
+        swapkey::wallet::SwapApp::begin(&engine, n1.ctx, peer1, block_x, 0).expect("begin 1");
+    let mut app2 =
+        swapkey::wallet::SwapApp::begin(&engine, n2.ctx, peer2, block_x, 0).expect("begin 2");
+    let art1 = n1.artifacts;
+    let art2 = n2.artifacts;
+    let opts = RunOptions::default();
+    let mut log1 = |l: String| eprintln!("[A/1] {l}");
+    let mut log2 = |l: String| eprintln!("[A/2] {l}");
+    let mut st1 = SwapRunState::new();
+    let mut st2 = SwapRunState::new();
+    let (mut out1, mut out2) = (None, None);
+    for _ in 0..8_000 {
+        if out1.is_none() {
+            if let SwapStepOutcome::Done(o) =
+                swap_step(&mut app1, &mut engine, &chain, &art1, &mut st1, &opts, &mut log1)
+                    .expect("swap 1 step")
+            {
+                out1 = Some(o);
+            }
+        }
+        if out2.is_none() {
+            if let SwapStepOutcome::Done(o) =
+                swap_step(&mut app2, &mut engine, &chain, &art2, &mut st2, &opts, &mut log2)
+                    .expect("swap 2 step")
+            {
+                out2 = Some(o);
+            }
+        }
+        if out1.is_some() && out2.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let out1 = out1.expect("swap 1 reached a terminal");
+    let out2 = out2.expect("swap 2 reached a terminal");
+
+    // Interleaved babysit of BOTH swaps to confirmed record terminals over
+    // the one shared engine.
+    let (mut settled1, mut settled2) = (false, false);
+    for _ in 0..8_000 {
+        if !settled1 {
+            settled1 = babysit_once(&mut engine, &chain, dir_a.path(), &sid1, &out1, &opts);
+        }
+        if !settled2 {
+            settled2 = babysit_once(&mut engine, &chain, dir_a.path(), &sid2, &out2, &opts);
+        }
+        if settled1 && settled2 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(settled1 && settled2, "both swaps must settle");
+    done.fetch_add(1, AtomicOrdering::SeqCst);
+
+    let rb = hb.join().unwrap().expect("party B");
+    let rc = hc.join().unwrap().expect("party C");
+    miner.join().unwrap();
+
+    // Per-swap cross-side agreement.
+    assert_eq!(rb.sid, sid1);
+    assert_eq!(rc.sid, sid2);
+    assert_eq!(
+        matches!(out1, SwapOutcome::Completed { .. }),
+        matches!(rb.outcome, SwapOutcome::Completed { .. }),
+        "swap 1's two sides must agree on the terminal"
+    );
+    assert_eq!(
+        matches!(out2, SwapOutcome::Completed { .. }),
+        matches!(rc.outcome, SwapOutcome::Completed { .. }),
+        "swap 2's two sides must agree on the terminal"
+    );
+    // Forward-or-refund closure for BOTH swaps: all four escrows spent.
+    chain.mine();
+    for op in [rb.our_escrow_op, rb.their_escrow_op, rc.our_escrow_op, rc.their_escrow_op] {
+        assert!(
+            matches!(chain.spend_status(op), SpendStatus::Confirmed(_)),
+            "every escrow must be closed by a completion or a refund"
+        );
+    }
+    // A's SHARED ledger closed clean: both received coins registered (each
+    // exit pays a fresh SwapDestination)...
+    assert_eq!(
+        engine.ledger().coins().iter().filter(|c| c.class == CoinClass::Swapped).count(),
+        2,
+        "both swaps' settlement outputs must be ledger-tracked"
+    );
+    // ...and after the chain-aware lease reconcile (the heal serve runs on
+    // failures and every startup), NO lease survives two terminal swaps: both
+    // funding coins are confirmed-spent by their Setups → swept to Spent.
+    engine.reconcile_leases_with_chain(&chain).unwrap();
+    let coins = engine.ledger().coins();
+    assert!(coins.iter().all(|c| c.state != CoinState::Leased), "no stranded lease");
+    assert_eq!(
+        coins.iter().filter(|c| c.class == CoinClass::PreEncumbrance && c.state == CoinState::Spent).count(),
+        2,
+        "both funding coins closed as Spent, exactly once each"
+    );
+}
+
+// ============================================================================
+// Task 16: the shared-ledger primitives under concurrent swaps — the lease
+// picker cannot double-assign, and the orphan heal's keep-set protects the
+// record-less negotiate→Setup-broadcast window.
+// ============================================================================
+
+#[test]
+fn concurrent_negotiations_lease_distinct_coins_and_reconcile_keeps_the_live_set() {
+    let params = Params::testnet_provisional();
+    let dir = tempfile::tempdir().unwrap();
+    let pres = onboard_two_unleased(dir.path(), &params, 0xE1);
+    let mut ledger = Ledger::open(dir.path(), &ModeledEnclave).unwrap();
+    let sid1 = [0x11u8; 32];
+    let sid2 = [0x22u8; 32];
+    let c1 = ledger
+        .lease_pre_encumbrance(params.pre_encumbrance_sats(), &FixedClock(u64::MAX), u32::MAX, sid1)
+        .unwrap()
+        .expect("first lease");
+    let c2 = ledger
+        .lease_pre_encumbrance(params.pre_encumbrance_sats(), &FixedClock(u64::MAX), u32::MAX, sid2)
+        .unwrap()
+        .expect("second lease");
+    assert_ne!(c1.outpoint, c2.outpoint, "the picker must never double-assign a coin");
+    assert!(pres.contains(&c1.outpoint) && pres.contains(&c2.outpoint));
+    // Pool exhausted: a THIRD concurrent negotiation is a clean None (the
+    // no-coin refusal), never a shared coin.
+    assert!(ledger
+        .lease_pre_encumbrance(
+            params.pre_encumbrance_sats(),
+            &FixedClock(u64::MAX),
+            u32::MAX,
+            [0x33u8; 32]
+        )
+        .unwrap()
+        .is_none());
+    // The reconcile keep-set: with only sid1 live, sid2's orphan releases and
+    // sid1's lease SURVIVES — the exact contract the serve heal relies on.
+    let released = ledger.reconcile_leases(&[sid1]).unwrap();
+    assert_eq!(released, vec![c2.outpoint]);
+    assert_eq!(ledger.find(&c1.outpoint).unwrap().state, CoinState::Leased);
+    assert_eq!(ledger.find(&c2.outpoint).unwrap().state, CoinState::Unspent);
+}
+
+#[test]
+fn orphan_heal_keeps_the_record_less_sibling_lease() {
+    // The Task-16 hazard: a sibling swap's coin leases at negotiate time but
+    // its store record only lands with the Setup broadcast — the funding-order
+    // waiter sits record-less for many ticks. A store-only heal (run for a
+    // DIFFERENT failed attempt) would release that live lease into a later
+    // double-lease; the keep-set variant must hold it.
+    let params = Params::testnet_provisional();
+    let dir = tempfile::tempdir().unwrap();
+    let pres = onboard_two_unleased(dir.path(), &params, 0xE2);
+    let chain = SimChain::new(500_000);
+    for op in &pres {
+        chain.fund_with_amount(*op, 500_000, params.pre_encumbrance_sats());
+    }
+    let mut engine = open_engine(dir.path());
+    let sibling = [0x77u8; 32];
+    let coin = engine
+        .ledger_mut()
+        .lease_pre_encumbrance(
+            params.pre_encumbrance_sats(),
+            &FixedClock(u64::MAX),
+            chain.tip_height(),
+            sibling,
+        )
+        .unwrap()
+        .expect("sibling lease");
+    // The keep-set heal holds the record-less sibling's lease...
+    engine.reconcile_leases_with_chain_keeping(&chain, &[sibling]).unwrap();
+    assert_eq!(engine.ledger().find(&coin.outpoint).unwrap().state, CoinState::Leased);
+    // ...and the store-only shape (empty keep-set) releases it — the exact
+    // hazard the keeping variant exists to close.
+    engine.reconcile_leases_with_chain_keeping(&chain, &[]).unwrap();
+    assert_eq!(engine.ledger().find(&coin.outpoint).unwrap().state, CoinState::Unspent);
+}

@@ -543,3 +543,106 @@ fn evicted_cpfp_child_does_not_poison_the_reserve_pool() {
         "the pool is not disabled — the reserve is leasable again"
     );
 }
+
+/// Task 16: two swaps' backstops CONTENDING for one shared reserve coin — the
+/// serve worker interleaves them on one thread, so "concurrent" is sequential
+/// interleaving over one ledger. Exactly one bump wins the coin; the loser is
+/// a clean `NoBump` (no double-spend, no stranded lease); the mid-flight F5
+/// heal never activates an unconfirmed change; and once the winner's child
+/// CONFIRMS, the heal replenishes the pool so the loser's RETRY bumps from the
+/// change. Reserve key-index issuance stays monotonic throughout.
+#[test]
+fn contending_backstop_bumps_cannot_oversubscribe_one_reserve() {
+    let (mut ledger, keys, reserve_op, reserve_amount, _dir) = provision_reserve();
+    let chain = SimChain::new(500_000);
+    let anchor_sats = 240u64;
+
+    // Two independent stalled parents (two swaps' refunds), ONE reserve coin.
+    let in_a = OutPoint::new(txid(0x0C), 0);
+    let in_b = OutPoint::new(txid(0x0D), 0);
+    seed_chain(&chain, in_a, reserve_op, reserve_amount);
+    chain.fund_with_amount(in_b, 500_000, reserve_amount + 1_000_000);
+    let (bytes_a, txid_a, vsize_a) = parent_with_anchor(in_a, 500_000, anchor_sats);
+    let (bytes_b, txid_b, vsize_b) = parent_with_anchor(in_b, 490_000, anchor_sats);
+
+    // Key-index issuance for the two changes: strictly monotonic, no reuse.
+    let (idx1, _) = ledger.next_reserve_key(&keys).unwrap();
+    let (idx2, _) = ledger.next_reserve_key(&keys).unwrap();
+    assert!(idx2 > idx1, "reserve key issuance must be monotonic across concurrent bumps");
+
+    // Swap A's backstop bumps first and takes the coin.
+    let out_a = run_cpfp_bump(
+        &mut ledger,
+        &keys,
+        &chain,
+        CpfpBumpRequest {
+            target: BumpTarget::Refund,
+            linkage_ack: None,
+            lessee: [0xA1; 32],
+            parent_bytes: &bytes_a,
+            parent_anchor: OutPoint::new(txid_a, ANCHOR_VOUT),
+            anchor_value_sats: anchor_sats,
+            parent_fee_sats: 200,
+            parent_vsize_vb: vsize_a,
+            target_feerate_sat_vb: 10,
+            change_key_index: idx1,
+        },
+    )
+    .unwrap();
+    let change_outpoint = match out_a {
+        BumpOutcome::Submitted { reserve_outpoint, change_outpoint, .. } => {
+            assert_eq!(reserve_outpoint, reserve_op);
+            change_outpoint
+        }
+        BumpOutcome::NoBump => panic!("the first bump must win the reserve"),
+    };
+    assert_eq!(ledger.find(&reserve_op).unwrap().state, CoinState::Spent);
+
+    // Mid-flight F5 heal with A's change still UNCONFIRMED: it must stay
+    // PendingConfirm (an evictable change must never poison the pool), so the
+    // pool reads empty.
+    ledger.heal_pending_reserve_changes(&chain).unwrap();
+    assert!(!ledger.has_leasable_reserve(1), "an unconfirmed change is not leasable");
+
+    // Swap B's backstop contends: the pool is empty — a clean NoBump, never a
+    // second spend of the same coin, never a stranded lease.
+    let req_b = |idx| CpfpBumpRequest {
+        target: BumpTarget::Refund,
+        linkage_ack: None,
+        lessee: [0xB2; 32],
+        parent_bytes: &bytes_b,
+        parent_anchor: OutPoint::new(txid_b, ANCHOR_VOUT),
+        anchor_value_sats: anchor_sats,
+        parent_fee_sats: 200,
+        parent_vsize_vb: vsize_b,
+        target_feerate_sat_vb: 10,
+        change_key_index: idx,
+    };
+    let out_b = run_cpfp_bump(&mut ledger, &keys, &chain, req_b(idx2)).unwrap();
+    assert!(matches!(out_b, BumpOutcome::NoBump), "the contender must fall back, got {out_b:?}");
+    assert_eq!(
+        ledger.find(&reserve_op).unwrap().state,
+        CoinState::Spent,
+        "the won coin is spent exactly once"
+    );
+    assert!(
+        ledger.coins().iter().all(|c| c.state != CoinState::Leased),
+        "a NoBump leaves no stranded lease"
+    );
+
+    // A's child confirms → the heal activates the change → B's retry bumps
+    // from the replenished pool (the mid-session F5 replenish, end to end).
+    chain.mine();
+    ledger.heal_pending_reserve_changes(&chain).unwrap();
+    assert_eq!(ledger.find(&change_outpoint).unwrap().state, CoinState::Unspent);
+    let out_b2 = run_cpfp_bump(&mut ledger, &keys, &chain, req_b(idx2)).unwrap();
+    match out_b2 {
+        BumpOutcome::Submitted { reserve_outpoint, .. } => {
+            assert_eq!(reserve_outpoint, change_outpoint, "the retry bumps from A's change");
+        }
+        BumpOutcome::NoBump => panic!("the retry must bump from the healed change"),
+    }
+    // Issuance floor held end to end: the next index is past both used ones.
+    let (idx3, _) = ledger.next_reserve_key(&keys).unwrap();
+    assert!(idx3 > idx2);
+}

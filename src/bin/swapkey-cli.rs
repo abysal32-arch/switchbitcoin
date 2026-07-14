@@ -160,6 +160,9 @@ COMMANDS
             --key-index <n>     skip the address scan (index from `address`)
             --wait-secs <n>     confirmation wait budget (default 600)
   swap      Run ONE swap against a peer (to a CONFIRMED terminal). Requires [node].
+            Deliberately single-swap (the scripted one-off path); CONCURRENT
+            swaps live in `serve` (--max-swaps). A `swap` and a `serve` on the
+            same data dir cannot run together (the store single-instance lock).
             Exactly one addressing mode (explicit flags outrank [peer] config):
             --make <host:port>  bind + mint a paste-able swap TICKET (printed on
                                 stdout) and wait for a taker to dial it
@@ -188,11 +191,15 @@ COMMANDS
             --poll-secs / --feerate / --assume-congested as for swap
             --claim-posture <fast|balanced|private>  as for swap (default: the
                                 signed manifest's active posture)
+            --max-swaps <n>     concurrent-swap cap (default 4); a swap past
+                                the cap is a loud 409, never silently dropped
             Endpoints: GET /status /events?since=N /swap/<sid>;
             POST /onboard {deposit, ack_phase0, split_fee?},
             POST /swap/begin {connect|listen},
             POST /swap/offer {listen}  (mint a ticket; it appears in /status
                                 as offer_ticket), POST /swap/take {ticket}
+            /status lists every live swap in active_swaps (the legacy `swap`
+            field carries the first).
 
 COMMON FLAGS
   --config <path>        config file (default ./swapkey.toml)
@@ -232,6 +239,7 @@ const VALUE_FLAGS: &[&str] = &[
     "--accept-timeout-secs",
     "--port",
     "--claim-posture",
+    "--max-swaps",
 ];
 
 /// Every boolean switch any subcommand accepts.
@@ -999,7 +1007,7 @@ fn cmd_swap(flags: &Flags) -> CliResult {
         // (Fable review): a periodic whole-wallet recovery pass, excluding
         // the live swap (its ticks belong to the app above).
         if iter.is_multiple_of(12) && iter > 0 {
-            recovery_pass(&mut wallet, &chain, &data_dir, &opts, Some(&sid));
+            recovery_pass(&mut wallet, &chain, &data_dir, &opts, &[sid]);
         }
         iter += 1;
         std::thread::sleep(poll);
@@ -1082,7 +1090,7 @@ fn guard_funded_escrow(
         if let Err(e) = backstop_step(app, wallet.engine_mut(), chain, opts, &mut sink) {
             log(&format!("[{sid_hint}] backstop pass failed (retrying): {e}"));
         }
-        recovery_pass(wallet, chain, data_dir, opts, None);
+        recovery_pass(wallet, chain, data_dir, opts, &[]);
         if matches!(chain.spend_status(escrow), swapkey::chain::SpendStatus::Confirmed(_)) {
             log("escrow exit confirmed; run `recover` to reconcile the records");
             return Err("swap errored after funding; the escrow was resolved via its exit".into());
@@ -1099,13 +1107,13 @@ fn recovery_pass(
     chain: &impl AuthoritativeChainView,
     data_dir: &Path,
     opts: &RunOptions,
-    exclude: Option<&[u8; 32]>,
+    exclude: &[[u8; 32]],
 ) {
     let mut sink = |line: String| log(&line);
     match SwapApp::recover(wallet.engine(), chain) {
         Ok(scan) => {
             for (sid, tick) in &scan.ticks {
-                if exclude == Some(sid) {
+                if exclude.contains(sid) {
                     continue;
                 }
                 if let Err(e) = apply_recovery_tick(
@@ -1196,6 +1204,12 @@ fn cmd_serve(flags: &Flags) -> CliResult {
     };
     let block_x_delta: u32 = flags.num("block-x-delta", 144)?;
     let jitter: u32 = flags.num("jitter", 0)?;
+    // Concurrency cap (Task 16): loud and bounded, never silent. 0 would be a
+    // serve that can never swap — refuse it as the config error it is.
+    let max_swaps: usize = flags.num("max-swaps", swapkey::wallet::api::DEFAULT_MAX_SWAPS)?;
+    if max_swaps == 0 {
+        return Err("--max-swaps must be at least 1".into());
+    }
 
     let mut wallet = open_ready(flags)?;
     // Operator claim-delay posture override (else the signed manifest's active
@@ -1224,6 +1238,8 @@ fn cmd_serve(flags: &Flags) -> CliResult {
     }
 
     let state: SharedState = Arc::new(Mutex::new(ApiState::new()));
+    state.lock().unwrap().max_swaps = max_swaps;
+    log(&format!("swap concurrency cap: {max_swaps} (--max-swaps)"));
     let (tx, rx) = std::sync::mpsc::channel::<ApiCmd>();
 
     // HTTP accept loop (spawned); the worker below owns the wallet.
@@ -1249,7 +1265,7 @@ fn cmd_serve(flags: &Flags) -> CliResult {
 
     serve_worker(
         &mut wallet, chain.as_ref(), network, &data_dir, &state, rx, &opts, poll,
-        block_x_delta, jitter, reconcile_ok, alarms,
+        block_x_delta, jitter, reconcile_ok, alarms, max_swaps,
     )
 }
 
@@ -1289,11 +1305,19 @@ fn serve_worker(
     jitter: u32,
     reconcile_ok: bool,
     alarms: Vec<String>,
+    max_swaps: usize,
 ) -> CliResult {
-    let mut live = Live::Idle;
+    // The live swap SLOTS (Task 16): each is its own state machine over the
+    // ONE shared wallet, stepped in turn every tick by this single thread —
+    // concurrency is interleaving, so every ledger call stays serialized and
+    // the lease/reserve gates (Unspent-only pickers flipping to Leased inside
+    // one transact) hold by construction.
+    let mut slots: Vec<Slot> = Vec::new();
     // A split whose confirmation we poll: (txid, signed bytes, start iter).
     let mut pending_split: Option<(bitcoin::Txid, Vec<u8>, u64)> = None;
-    let mut active_sid_hex: Option<String> = None;
+    // Unique view keys for not-yet-negotiated slots ("pending-N"): two
+    // accepting offers must never collide on one "pending" view entry.
+    let mut pending_seq: u64 = 0;
     let mut iter: u64 = 0;
 
     loop {
@@ -1303,8 +1327,10 @@ fn serve_worker(
             sink_state.lock().unwrap().push_trace(line);
         };
 
-        // 1. Commands (one at a time; `busy` was set by the route).
-        if matches!(live, Live::Idle) && pending_split.is_none() {
+        // 1. Commands (one DISPATCH per tick; `busy` was set by the route and
+        //    is cleared here the moment a swap command lands in a slot or is
+        //    refused — only onboard holds it through its split tail).
+        if pending_split.is_none() {
             match rx.try_recv() {
                 Ok(ApiCmd::Onboard { deposit, split_fee }) => match chain {
                     Some(chain) => {
@@ -1323,97 +1349,25 @@ fn serve_worker(
                         state.lock().unwrap().busy = None;
                     }
                 },
-                Ok(ApiCmd::SwapBegin { listen, connect }) => match (chain, reconcile_ok) {
-                    (Some(node), true) => {
-                        if let Some(addr) = connect {
-                            match TcpTransport::connect(addr.as_str()) {
-                                Ok(t) => {
-                                    live = begin_swap(
-                                        wallet, node, network, data_dir, t, poll, block_x_delta,
-                                        jitter, state, &mut active_sid_hex, &mut sink,
-                                    );
-                                }
-                                Err(e) => {
-                                    sink(format!("connect {addr} failed: {e}"));
-                                    state.lock().unwrap().busy = None;
-                                }
-                            }
-                        } else if let Some(addr) = listen {
-                            match std::net::TcpListener::bind(addr.as_str()) {
-                                Ok(l) => {
-                                    sink(format!("listening on {addr} for a swap peer (10 min)"));
-                                    set_swap_view(
-                                        state, &mut active_sid_hex, "pending", "accepting", None,
-                                    );
-                                    live = Live::Accepting {
-                                        listener: l,
-                                        deadline: std::time::Instant::now()
-                                            + Duration::from_secs(600),
-                                        expected_nonce: None,
-                                    };
-                                }
-                                Err(e) => {
-                                    sink(format!("bind {addr} failed: {e}"));
-                                    state.lock().unwrap().busy = None;
-                                }
-                            }
-                        }
+                Ok(cmd) => {
+                    // A swap command (begin/offer/take). The route already
+                    // gated on the cap; re-check here (defense against a
+                    // route/worker count race) and dispatch into a NEW slot.
+                    if let Some(slot) = dispatch_swap(
+                        cmd, wallet, chain, network, data_dir, state, poll, block_x_delta,
+                        jitter, reconcile_ok, max_swaps, &slots, &mut pending_seq, &mut sink,
+                    ) {
+                        slots.push(slot);
                     }
-                    _ => {
-                        sink("swap refused: node offline or reconcile failed".into());
-                        state.lock().unwrap().busy = None;
+                    // The dispatch latch releases NOW — the swap itself no
+                    // longer holds the worker (that is the whole point of the
+                    // slots) — and the route's cap gate sees the new count.
+                    {
+                        let mut st = state.lock().unwrap();
+                        st.busy = None;
+                        st.active_swaps = slots.len();
                     }
-                },
-                Ok(ApiCmd::SwapOffer { listen }) => match (chain, reconcile_ok) {
-                    (Some(_), true) => {
-                        // Mint the ticket over THIS wallet's network + params
-                        // (the advertised address is the given listen addr),
-                        // then bind and wait — a taker must pass the maker-half
-                        // rendezvous before any lease.
-                        match offer_ticket(wallet, network, &listen) {
-                            Ok((ticket, encoded)) => match std::net::TcpListener::bind(listen.as_str())
-                            {
-                                Ok(l) => {
-                                    sink(format!("swap ticket offered on {listen}: {encoded}"));
-                                    state.lock().unwrap().offer_ticket = Some(encoded);
-                                    set_swap_view(
-                                        state, &mut active_sid_hex, "pending", "offering", None,
-                                    );
-                                    live = Live::Accepting {
-                                        listener: l,
-                                        deadline: std::time::Instant::now()
-                                            + Duration::from_secs(600),
-                                        expected_nonce: Some(ticket.nonce),
-                                    };
-                                }
-                                Err(e) => {
-                                    sink(format!("bind {listen} failed: {e}"));
-                                    state.lock().unwrap().busy = None;
-                                }
-                            },
-                            Err(e) => {
-                                sink(format!("swap offer refused: {}", e.0));
-                                state.lock().unwrap().busy = None;
-                            }
-                        }
-                    }
-                    _ => {
-                        sink("swap offer refused: node offline or reconcile failed".into());
-                        state.lock().unwrap().busy = None;
-                    }
-                },
-                Ok(ApiCmd::SwapTake { ticket }) => match (chain, reconcile_ok) {
-                    (Some(node), true) => {
-                        live = take_ticket(
-                            wallet, node, network, data_dir, &ticket, poll, block_x_delta, jitter,
-                            state, &mut active_sid_hex, &mut sink,
-                        );
-                    }
-                    _ => {
-                        sink("swap take refused: node offline or reconcile failed".into());
-                        state.lock().unwrap().busy = None;
-                    }
-                },
+                }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => {
                     return Err("api accept loop died".into());
@@ -1447,35 +1401,45 @@ fn serve_worker(
             }
         }
 
-        // 3. Advance the live swap one step.
-        live = step_live(
-            live, wallet, chain, data_dir, state, &mut active_sid_hex, opts, poll,
-            block_x_delta, jitter, &mut sink,
-        );
+        // 3. Advance EVERY live swap one step; a slot that reaches Idle
+        //    retires. The exclude set (all live sids) is computed BEFORE
+        //    stepping so a Guard slot's whole-wallet recovery pass cannot
+        //    re-enter a SIBLING swap's record (a mid-HOLD `Completed` record
+        //    would rebroadcast the completion, defeating the posture hold).
+        let exclude = live_sids(&slots);
+        let mut next_slots: Vec<Slot> = Vec::with_capacity(slots.len());
+        for mut slot in slots {
+            let live = step_live(
+                slot.live, wallet, chain, data_dir, state, &mut slot.active, opts, poll,
+                block_x_delta, jitter, &exclude, &mut sink,
+            );
+            if !matches!(live, Live::Idle) {
+                next_slots.push(Slot { active: slot.active, live });
+            }
+        }
+        slots = next_slots;
 
-        // 4. Whole-wallet recovery pass on a slow cadence (other swaps'
-        //    deadlines stay driven while this one runs). EXCLUDE the live
-        //    swap's own record: its ticks belong to `step_live` above, and a
-        //    recovery pass would re-enter a mid-HOLD `Completed` record and
-        //    REBROADCAST the completion immediately — defeating the posture
-        //    hold. Copy the sid out of `live` FIRST so the reference borrow ends
-        //    before `recovery_pass` takes `&mut wallet`.
-        let exclude_sid: Option<[u8; 32]> = match &live {
-            Live::Running { artifacts, .. } => Some(artifacts.session_id),
-            Live::BabysitCompletion { sid, .. } | Live::BabysitRefund { sid, .. } => Some(*sid),
-            _ => None,
-        };
+        // 4. Whole-wallet recovery pass on a slow cadence: every CRASHED (or
+        //    otherwise recordful) swap stays driven while the live ones run.
+        //    EXCLUDE every live slot's record — their ticks belong to
+        //    `step_live` above (the Task-13 hold-rebroadcast lesson,
+        //    generalized to N slots).
         if let Some(chain) = chain {
             if iter.is_multiple_of(10) && iter > 0 {
-                recovery_pass(wallet, chain, data_dir, opts, exclude_sid.as_ref());
+                let exclude = live_sids(&slots);
+                recovery_pass(wallet, chain, data_dir, opts, &exclude);
             }
         }
 
-        // 5. Snapshot refresh.
+        // 5. Snapshot refresh: every slot's view + the shared worker facts.
         {
             let params = wallet.params().clone();
             let mut st = state.lock().unwrap();
-            let active = active_sid_hex.as_ref().and_then(|s| st.swaps.get(s)).cloned();
+            st.active_swaps = slots.len();
+            let views: Vec<SwapView> = slots
+                .iter()
+                .filter_map(|s| s.active.as_ref().and_then(|k| st.swaps.get(k)).cloned())
+                .collect();
             let offer_ticket = st.offer_ticket.clone();
             st.status_json = status_snapshot(
                 wallet.engine(),
@@ -1483,15 +1447,153 @@ fn serve_worker(
                 network,
                 chain.map(|c| c.tip_height()),
                 chain.is_some(),
-                active.as_ref(),
+                &views,
                 st.busy,
                 &alarms,
                 offer_ticket.as_deref(),
+                max_swaps,
             );
         }
 
         iter += 1;
         std::thread::sleep(poll);
+    }
+}
+
+/// One live swap slot: its `Live` state machine plus ITS OWN view key in
+/// `ApiState.swaps` (`pending-N` until negotiation derives the sid).
+struct Slot {
+    active: Option<String>,
+    live: Live,
+}
+
+/// Every live slot's session id — the exclude set for whole-wallet recovery
+/// passes and the keep-set for orphan-lease heals. Accepting slots have no
+/// sid yet; Guard slots deliberately stay OUT (their records are recovery's
+/// to drive — the guard itself only runs the backstop).
+fn live_sids(slots: &[Slot]) -> Vec<[u8; 32]> {
+    slots
+        .iter()
+        .filter_map(|s| match &s.live {
+            Live::Running { artifacts, .. } => Some(artifacts.session_id),
+            Live::BabysitCompletion { sid, .. } | Live::BabysitRefund { sid, .. } => Some(*sid),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Dispatch one swap command (begin/offer/take) into a fresh slot. Returns
+/// `None` when the command was refused or failed before becoming a live slot
+/// (the view records the failure; the caller clears the dispatch latch).
+#[allow(clippy::too_many_arguments)]
+fn dispatch_swap(
+    cmd: ApiCmd,
+    wallet: &mut Wallet,
+    chain: Option<&NodeChain>,
+    network: Network,
+    data_dir: &Path,
+    state: &SharedState,
+    poll: Duration,
+    block_x_delta: u32,
+    jitter: u32,
+    reconcile_ok: bool,
+    max_swaps: usize,
+    slots: &[Slot],
+    pending_seq: &mut u64,
+    sink: &mut dyn FnMut(String),
+) -> Option<Slot> {
+    if slots.len() >= max_swaps {
+        sink(format!(
+            "swap refused: concurrency cap reached ({} of {max_swaps} active)",
+            slots.len()
+        ));
+        return None;
+    }
+    let chain = match (chain, reconcile_ok) {
+        (Some(c), true) => c,
+        _ => {
+            sink("swap refused: node offline or reconcile failed".into());
+            return None;
+        }
+    };
+    // Sibling live sids: a failed dispatch heals orphaned leases, and the
+    // heal must keep every sibling's lease — including the record-less
+    // negotiate→Setup-broadcast window (see reconcile_leases_with_chain_keeping).
+    let live = live_sids(slots);
+    *pending_seq += 1;
+    let mut active: Option<String> = Some(format!("pending-{pending_seq}"));
+    let next = match cmd {
+        ApiCmd::SwapBegin { listen, connect } => {
+            if let Some(addr) = connect {
+                match TcpTransport::connect(addr.as_str()) {
+                    Ok(t) => begin_swap(
+                        wallet, chain, network, data_dir, t, poll, block_x_delta, jitter,
+                        state, &mut active, &live, sink,
+                    ),
+                    Err(e) => {
+                        sink(format!("connect {addr} failed: {e}"));
+                        Live::Idle
+                    }
+                }
+            } else if let Some(addr) = listen {
+                match std::net::TcpListener::bind(addr.as_str()) {
+                    Ok(l) => {
+                        sink(format!("listening on {addr} for a swap peer (10 min)"));
+                        let key = active.clone().unwrap_or_else(|| "pending".into());
+                        set_swap_view(state, &mut active, &key, "accepting", None);
+                        Live::Accepting {
+                            listener: l,
+                            deadline: std::time::Instant::now() + Duration::from_secs(600),
+                            expected_nonce: None,
+                        }
+                    }
+                    Err(e) => {
+                        sink(format!("bind {addr} failed: {e}"));
+                        Live::Idle
+                    }
+                }
+            } else {
+                Live::Idle
+            }
+        }
+        ApiCmd::SwapOffer { listen } => {
+            // Mint the ticket over THIS wallet's network + params (the
+            // advertised address is the given listen addr), then bind and
+            // wait — a taker must pass the maker-half rendezvous before any
+            // lease.
+            match offer_ticket(wallet, network, &listen) {
+                Ok((ticket, encoded)) => match std::net::TcpListener::bind(listen.as_str()) {
+                    Ok(l) => {
+                        sink(format!("swap ticket offered on {listen}: {encoded}"));
+                        state.lock().unwrap().offer_ticket = Some(encoded);
+                        let key = active.clone().unwrap_or_else(|| "pending".into());
+                        set_swap_view(state, &mut active, &key, "offering", None);
+                        Live::Accepting {
+                            listener: l,
+                            deadline: std::time::Instant::now() + Duration::from_secs(600),
+                            expected_nonce: Some(ticket.nonce),
+                        }
+                    }
+                    Err(e) => {
+                        sink(format!("bind {listen} failed: {e}"));
+                        Live::Idle
+                    }
+                },
+                Err(e) => {
+                    sink(format!("swap offer refused: {}", e.0));
+                    Live::Idle
+                }
+            }
+        }
+        ApiCmd::SwapTake { ticket } => take_ticket(
+            wallet, chain, network, data_dir, &ticket, poll, block_x_delta, jitter, state,
+            &mut active, &live, sink,
+        ),
+        ApiCmd::Onboard { .. } => Live::Idle, // routed elsewhere; unreachable
+    };
+    match next {
+        Live::Idle => None,
+        live => Some(Slot { active, live }),
     }
 }
 
@@ -1522,8 +1624,20 @@ fn set_swap_view(
 /// the one-shot `swap` command, but a long-running serve process would leak
 /// one coin per failed attempt until restart (Fable review, HIGH). This runs
 /// the same chain-aware reconcile in-process.
-fn heal_orphan_leases(wallet: &mut Wallet, chain: &NodeChain, sink: &mut dyn FnMut(String)) {
-    if let Err(e) = wallet.engine_mut().reconcile_leases_with_chain(chain) {
+///
+/// `also_live` (Task 16): SIBLING slots' sids. A sibling's lease can exist
+/// with NO store record yet (leased at negotiate; the record lands with its
+/// Setup broadcast — the funding-order waiter sits in that window for many
+/// ticks), and the store-only keep-set would release it into a later
+/// double-lease. The failed attempt's OWN sid must NOT be in this set, or its
+/// orphan survives the heal.
+fn heal_orphan_leases(
+    wallet: &mut Wallet,
+    chain: &NodeChain,
+    also_live: &[[u8; 32]],
+    sink: &mut dyn FnMut(String),
+) {
+    if let Err(e) = wallet.engine_mut().reconcile_leases_with_chain_keeping(chain, also_live) {
         sink(format!(
             "ALARM: orphan-lease heal failed ({e}); a pre-encumbrance coin may stay leased \
              until the next restart"
@@ -1563,26 +1677,24 @@ fn take_ticket(
     jitter: u32,
     state: &SharedState,
     active: &mut Option<String>,
+    live: &[[u8; 32]],
     sink: &mut dyn FnMut(String),
 ) -> Live {
     let ticket = match Ticket::decode(ticket_str) {
         Ok(t) => t,
         Err(e) => {
             sink(format!("swap take refused: {e}"));
-            state.lock().unwrap().busy = None;
             return Live::Idle;
         }
     };
     if let Err(e) = ticket.validate(network, wallet.params()) {
         sink(format!("swap take refused: {e}"));
-        state.lock().unwrap().busy = None;
         return Live::Idle;
     }
     let mut t = match TcpTransport::connect(ticket.addr()) {
         Ok(t) => t,
         Err(e) => {
             sink(format!("dial {} failed: {e}", ticket.addr()));
-            state.lock().unwrap().busy = None;
             return Live::Idle;
         }
     };
@@ -1590,19 +1702,22 @@ fn take_ticket(
     // restores the normal poll-scaled budget.
     if let Err(e) = t.set_io_timeout(Some(Duration::from_secs(10))) {
         sink(format!("transport setup failed: {e}"));
-        state.lock().unwrap().busy = None;
         return Live::Idle;
     }
     if let Err(e) = taker_rendezvous(&mut t, &ticket.nonce) {
         sink(format!("swap ticket rendezvous failed: {e}"));
-        state.lock().unwrap().busy = None;
         return Live::Idle;
     }
     sink("ticket rendezvous ok — negotiating".into());
-    begin_swap(wallet, chain, network, data_dir, t, poll, block_x_delta, jitter, state, active, sink)
+    begin_swap(
+        wallet, chain, network, data_dir, t, poll, block_x_delta, jitter, state, active, live,
+        sink,
+    )
 }
 
 /// Negotiate + begin over an established transport; returns the next state.
+/// `live` is the SIBLING slots' sid set — the keep-set a failure heal must
+/// respect (never the sid THIS attempt derives; its own orphan must release).
 #[allow(clippy::too_many_arguments)]
 fn begin_swap(
     wallet: &mut Wallet,
@@ -1615,15 +1730,18 @@ fn begin_swap(
     jitter: u32,
     state: &SharedState,
     active: &mut Option<String>,
+    live: &[[u8; 32]],
     sink: &mut dyn FnMut(String),
 ) -> Live {
+    // This slot's view key while the sid is still unknown (unique per slot —
+    // two negotiating slots must not share one "pending" view entry).
+    let pending_key = active.clone().unwrap_or_else(|| "pending".to_string());
     let io_timeout = Duration::from_secs(120.max(poll.as_secs().saturating_mul(3)));
     if let Err(e) = transport.set_io_timeout(Some(io_timeout)) {
         sink(format!("transport setup failed: {e}"));
-        state.lock().unwrap().busy = None;
         return Live::Idle;
     }
-    set_swap_view(state, active, "pending", "negotiating", None);
+    set_swap_view(state, active, &pending_key, "negotiating", None);
     let session_seckey = secp::Scalar::random(&mut rand::rng());
     let negotiated = match negotiate_swap(
         &mut transport,
@@ -1637,9 +1755,8 @@ fn begin_swap(
         Ok(n) => n,
         Err(e) => {
             sink(format!("negotiation failed: {e}"));
-            heal_orphan_leases(wallet, chain, sink);
-            set_swap_view(state, active, "pending", "failed", Some(format!("negotiation: {e}")));
-            state.lock().unwrap().busy = None;
+            heal_orphan_leases(wallet, chain, live, sink);
+            set_swap_view(state, active, &pending_key, "failed", Some(format!("negotiation: {e}")));
             return Live::Idle;
         }
     };
@@ -1664,16 +1781,19 @@ fn begin_swap(
         }
         Err(e) => {
             sink(format!("SwapApp::begin failed: {e}"));
-            heal_orphan_leases(wallet, chain, sink);
+            heal_orphan_leases(wallet, chain, live, sink);
             set_swap_view(state, active, &sid_hex, "failed", Some(format!("begin: {e}")));
-            state.lock().unwrap().busy = None;
             Live::Idle
         }
     }
 }
 
-/// One tick of the live-activity state machine (the serve twin of
-/// `cmd_swap`'s loops, incl. the fund-exposure guard discipline).
+/// One tick of ONE slot's live-activity state machine (the serve twin of
+/// `cmd_swap`'s loops, incl. the fund-exposure guard discipline). `exclude`
+/// is every live slot's sid (computed before the tick's step loop): the
+/// Guard arm's whole-wallet recovery pass must not re-enter a SIBLING's
+/// record, and a pre-fund failure's orphan heal must keep the siblings'
+/// leases while releasing its own.
 #[allow(clippy::too_many_arguments)]
 fn step_live(
     live: Live,
@@ -1686,6 +1806,7 @@ fn step_live(
     poll: Duration,
     block_x_delta: u32,
     jitter: u32,
+    exclude: &[[u8; 32]],
     sink: &mut dyn FnMut(String),
 ) -> Live {
     let Some(chain) = chain else { return live };
@@ -1711,7 +1832,7 @@ fn step_live(
                                 let dir = wallet.config().data_dir.clone();
                                 begin_swap(
                                     wallet, chain, network, &dir, t, poll, block_x_delta, jitter,
-                                    state, active, sink,
+                                    state, active, exclude, sink,
                                 )
                             }
                             Err(e) => {
@@ -1728,7 +1849,7 @@ fn step_live(
                         let dir = wallet.config().data_dir.clone();
                         begin_swap(
                             wallet, chain, network, &dir, t, poll, block_x_delta, jitter, state,
-                            active, sink,
+                            active, exclude, sink,
                         )
                     }
                 },
@@ -1740,8 +1861,8 @@ fn step_live(
                     if expected_nonce.is_some() {
                         state.lock().unwrap().offer_ticket = None;
                     }
-                    set_swap_view(state, active, "pending", "failed", Some("no peer".into()));
-                    state.lock().unwrap().busy = None;
+                    let key = active.clone().unwrap_or_else(|| "pending".into());
+                    set_swap_view(state, active, &key, "failed", Some("no peer".into()));
                     Live::Idle
                 }
             }
@@ -1780,7 +1901,6 @@ fn step_live(
                 Ok(SwapStepOutcome::Done(SwapOutcome::Aborted { reason })) => {
                     sink(format!("swap aborted cleanly: {reason}"));
                     set_swap_view(state, active, &sid_hex, "aborted", Some(reason.to_string()));
-                    state.lock().unwrap().busy = None;
                     Live::Idle
                 }
                 Err(e) if run.setup_on_wire => {
@@ -1790,9 +1910,12 @@ fn step_live(
                 }
                 Err(e) => {
                     sink(format!("swap failed before fund exposure: {e}"));
-                    heal_orphan_leases(wallet, chain, sink);
+                    // Keep the SIBLINGS' leases; release only OUR orphan (the
+                    // failing sid must not shield its own lease from the heal).
+                    let keep: Vec<[u8; 32]> =
+                        exclude.iter().copied().filter(|s| s != &sid).collect();
+                    heal_orphan_leases(wallet, chain, &keep, sink);
                     set_swap_view(state, active, &sid_hex, "failed", Some(e.to_string()));
-                    state.lock().unwrap().busy = None;
                     Live::Idle
                 }
             }
@@ -1806,7 +1929,6 @@ fn step_live(
                 Ok(Some(())) => {
                     sink("SWAP COMPLETED — completion confirmed on chain".into());
                     set_swap_view(state, active, &sid_hex, "completed", Some("completed".into()));
-                    state.lock().unwrap().busy = None;
                     Live::Idle
                 }
                 Ok(None) => Live::BabysitCompletion { app, sid },
@@ -1825,7 +1947,6 @@ fn step_live(
                 Ok(Some(phase)) => {
                     sink(format!("refund resolved — record terminal {phase:?}"));
                     set_swap_view(state, active, &sid_hex, "refunded", Some(format!("{phase:?}")));
-                    state.lock().unwrap().busy = None;
                     Live::Idle
                 }
                 Ok(None) => Live::BabysitRefund { app, sid },
@@ -1839,7 +1960,10 @@ fn step_live(
             if let Err(e) = backstop_step(&app, wallet.engine_mut(), chain, opts, sink) {
                 sink(format!("guard backstop failed (retrying): {e}"));
             }
-            recovery_pass(wallet, chain, data_dir, opts, None);
+            // Whole-wallet recovery keeps running from the guard (its OWN
+            // record is recovery's to drive), but SIBLING live swaps stay
+            // excluded — their ticks belong to their own slots.
+            recovery_pass(wallet, chain, data_dir, opts, exclude);
             if matches!(
                 chain.spend_status(app.our_escrow()),
                 swapkey::chain::SpendStatus::Confirmed(_)
@@ -1848,7 +1972,6 @@ fn step_live(
                 if let Some(sid_hex) = active.clone() {
                     set_swap_view(state, active, &sid_hex, "guard-resolved", Some("refunded".into()));
                 }
-                state.lock().unwrap().busy = None;
                 Live::Idle
             } else {
                 Live::Guard { app }

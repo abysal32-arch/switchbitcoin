@@ -63,17 +63,18 @@ fn status_snapshot_reflects_the_seeded_engine() {
     let dir = tempfile::tempdir().unwrap();
     let engine = seeded_engine(dir.path());
     let params = Params::testnet_provisional();
-    let active = SwapView { sid: "ab".repeat(32), phase: "funding".into(), outcome: None };
+    let active = [SwapView { sid: "ab".repeat(32), phase: "funding".into(), outcome: None }];
     let json = status_snapshot(
         &engine,
         &params,
         Network::Regtest,
         Some(123_456),
         true,
-        Some(&active),
+        &active,
         Some("swap"),
         &["disk almost full".into()],
         Some("skt1exampleticket"),
+        4,
     );
     for needle in [
         "\"ready\":true",
@@ -93,17 +94,41 @@ fn status_snapshot_reflects_the_seeded_engine() {
         "\"claim_posture_applied\":true",
         "\"claim_posture\":\"moderate\"",
         "\"offer_ticket\":\"skt1exampleticket\"",
+        "\"max_swaps\":4",
     ] {
         assert!(json.contains(needle), "missing {needle} in {json}");
     }
+    // The one active view rides BOTH in the legacy `swap` field and in the
+    // Task-16 `active_swaps` list.
+    assert!(json.contains("\"active_swaps\":[{\"sid\":"), "{json}");
     // The Phase-0 display contract: the warning copy rides in the snapshot.
     assert!(json.contains("\"phase0_warning\":"));
-    // No-node shape: tip null, offline, no offer outstanding.
+    // No-node shape: tip null, offline, no offer outstanding, no live swaps.
     let offline =
-        status_snapshot(&engine, &params, Network::Regtest, None, false, None, None, &[], None);
+        status_snapshot(&engine, &params, Network::Regtest, None, false, &[], None, &[], None, 4);
     assert!(offline.contains("\"tip\":null") && offline.contains("\"node_online\":false"));
     assert!(offline.contains("\"swap\":null") && offline.contains("\"busy\":null"));
     assert!(offline.contains("\"offer_ticket\":null"), "{offline}");
+    assert!(offline.contains("\"active_swaps\":[]"), "{offline}");
+}
+
+#[test]
+fn status_snapshot_lists_every_live_swap() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = seeded_engine(dir.path());
+    let params = Params::testnet_provisional();
+    let active = [
+        SwapView { sid: "ab".repeat(32), phase: "funding".into(), outcome: None },
+        SwapView { sid: "cd".repeat(32), phase: "babysit-refund".into(), outcome: None },
+    ];
+    let json = status_snapshot(
+        &engine, &params, Network::Regtest, Some(1), true, &active, None, &[], None, 4,
+    );
+    // Both views ride in active_swaps; the legacy single `swap` field carries
+    // the FIRST.
+    assert!(json.contains(&format!("\"active_swaps\":[{{\"sid\":\"{}\"", "ab".repeat(32))), "{json}");
+    assert!(json.contains(&"cd".repeat(32)), "{json}");
+    assert!(json.contains(&format!("\"swap\":{{\"sid\":\"{}\"", "ab".repeat(32))), "{json}");
 }
 
 #[test]
@@ -200,6 +225,64 @@ fn swap_begin_route_validates_exclusive_addressing() {
         rx.try_recv().unwrap(),
         ApiCmd::SwapBegin { listen: Some("0.0.0.0:9735".into()), connect: None }
     );
+}
+
+#[test]
+fn swap_commands_gate_on_the_cap_and_the_dispatch_latch() {
+    let (state, tx, rx) = fresh();
+    let good_ticket = Ticket::mint(Network::Regtest, &Params::testnet_provisional(), "127.0.0.1", 9)
+        .unwrap()
+        .encode();
+
+    // AT the cap (default max_swaps = 4): every swap command is a loud 409
+    // that never enqueues — never a silent drop.
+    state.lock().unwrap().active_swaps = 4;
+    for (path, body) in [
+        ("/swap/begin", "{\"connect\":\"127.0.0.1:9\"}".to_string()),
+        ("/swap/offer", "{\"listen\":\"127.0.0.1:9\"}".to_string()),
+        ("/swap/take", format!("{{\"ticket\":\"{good_ticket}\"}}")),
+    ] {
+        let (code, resp) = route(&state, &tx, "POST", path, &body);
+        assert_eq!(code, 409, "{path} must refuse at the cap: {resp}");
+        assert!(resp.contains("cap"), "the refusal must NAME the cap: {resp}");
+    }
+    assert!(rx.try_recv().is_err(), "capped commands must never enqueue");
+    assert!(state.lock().unwrap().busy.is_none(), "a capped refusal must not latch busy");
+
+    // BELOW the cap the latch is per-DISPATCH, not per-swap: once the worker
+    // clears it (command landed in a slot), the next swap command enqueues
+    // even though the first swap is still live.
+    state.lock().unwrap().active_swaps = 1;
+    let (code, _) = route(&state, &tx, "POST", "/swap/begin", "{\"connect\":\"127.0.0.1:9\"}");
+    assert_eq!(code, 202);
+    assert_eq!(state.lock().unwrap().busy, Some("swap"));
+    // While the dispatch is in flight, a second command still 409s...
+    let (code, _) = route(&state, &tx, "POST", "/swap/begin", "{\"connect\":\"127.0.0.1:9\"}");
+    assert_eq!(code, 409);
+    // ...and the moment the worker releases the latch, it goes through.
+    {
+        let mut st = state.lock().unwrap();
+        st.busy = None;
+        st.active_swaps = 2;
+    }
+    let (code, _) = route(&state, &tx, "POST", "/swap/begin", "{\"connect\":\"127.0.0.1:9\"}");
+    assert_eq!(code, 202);
+    assert_eq!(rx.try_recv().unwrap(), ApiCmd::SwapBegin { listen: None, connect: Some("127.0.0.1:9".into()) });
+    assert!(rx.try_recv().is_ok(), "the post-latch begin enqueued too");
+
+    // One offer at a time: an outstanding offer_ticket refuses a second offer
+    // but leaves begin/take alone.
+    {
+        let mut st = state.lock().unwrap();
+        st.busy = None;
+        st.offer_ticket = Some("skt1outstanding".into());
+    }
+    let (code, resp) = route(&state, &tx, "POST", "/swap/offer", "{\"listen\":\"127.0.0.1:9\"}");
+    assert_eq!(code, 409, "{resp}");
+    assert!(resp.contains("offer"), "{resp}");
+    let (code, _) =
+        route(&state, &tx, "POST", "/swap/take", &format!("{{\"ticket\":\"{good_ticket}\"}}"));
+    assert_eq!(code, 202, "an outstanding offer must not block a take");
 }
 
 #[test]
