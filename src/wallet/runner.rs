@@ -533,23 +533,48 @@ fn artifacts_path(data_dir: &Path, sid: &[u8; 32]) -> std::path::PathBuf {
 // ---------------------------------------------------------------------------
 
 /// Caller knobs for the run loop.
+#[derive(Default)]
 pub struct RunOptions {
-    /// Target feerate handed to the congestion backstop's CPFP sizing.
-    pub target_feerate_sat_vb: u64,
+    /// Backstop CPFP target feerate (sat/vB). `Some(n)` is an OPERATOR OVERRIDE
+    /// that wins unconditionally — it still works when the node can give no
+    /// live estimate. `None` selects AUTO: the live node estimate
+    /// ([`ChainView::estimated_feerate_sat_vb`](crate::chain::ChainView::estimated_feerate_sat_vb))
+    /// when available, else the [`FALLBACK_TARGET_FEERATE_SAT_VB`] floor of last
+    /// resort. Resolved FRESH on every [`backstop_step`] (never once at settle
+    /// time — the SL claim hold can delay a broadcast for hours, so a
+    /// settle-time read would be stale by the time the bump fires).
+    pub target_feerate_sat_vb: Option<u64>,
     /// Decide but never broadcast (and never mutate the ledger through the
     /// backstop executor). Useful for observing what the drivers WOULD do.
     pub dry_run: bool,
-    /// Operator observation that an ALREADY-RELAYED pre-armed refund pays
-    /// below the current confirmation floor (the one refund stall the tower
-    /// cannot detect internally). Auto-detection needs real node feerate
-    /// reads — a Task-10 item; until then this is the CLI's
-    /// `--assume-congested` escape hatch.
+    /// MANUAL congestion override for an ALREADY-RELAYED pre-armed refund that
+    /// pays below the current confirmation floor. Congestion is now
+    /// AUTO-DETECTED inside `backstop_execute` from the live node estimate vs
+    /// the pre-armed refund's baked feerate; this flag is the fallback for when
+    /// the view supplies no estimate (SimChain, a degraded node — the CLI's
+    /// `--assume-congested`), and `true` still forces the silent refund CPFP on
+    /// top of any auto-detection.
     pub refund_congested: bool,
 }
 
-impl Default for RunOptions {
-    fn default() -> Self {
-        RunOptions { target_feerate_sat_vb: 2, dry_run: false, refund_congested: false }
+/// The backstop CPFP target feerate used when no operator override is given AND
+/// the node can supply no live estimate — the no-node/no-estimate floor of last
+/// resort, kept at the historic hardcoded default. (`RunOptions::default`
+/// derives `target_feerate_sat_vb = None`, i.e. AUTO, so this floor applies
+/// only when no live estimate is available either.)
+pub const FALLBACK_TARGET_FEERATE_SAT_VB: u64 = 2;
+
+/// Resolve the backstop's CPFP target feerate for one pass: operator override
+/// → live node estimate → hardcoded fallback. Returns the resolved sat/vB and a
+/// short static label naming which source won (for the log line).
+fn resolve_target_feerate(
+    override_sat_vb: Option<u64>,
+    live_estimate: Option<u64>,
+) -> (u64, &'static str) {
+    match (override_sat_vb, live_estimate) {
+        (Some(n), _) => (n, "override"),
+        (None, Some(est)) => (est, "estimate"),
+        (None, None) => (FALLBACK_TARGET_FEERATE_SAT_VB, "fallback"),
     }
 }
 
@@ -833,18 +858,18 @@ pub fn backstop_step(
         log("dry-run: backstop pass skipped (a tick can fire the dead-device refund)".into());
         return Ok(());
     }
-    match app.backstop_execute(
-        engine,
-        chain,
-        opts.target_feerate_sat_vb,
-        opts.refund_congested,
-        None,
-        None,
-    )? {
-        BackstopRun::Decided(tick) => log(format!("backstop: {tick:?}")),
-        BackstopRun::Executed { decision, outcome } => {
-            log(format!("backstop executed: {decision:?} -> {outcome:?}"))
+    // Resolve the CPFP target feerate FRESH every pass (override → live node
+    // estimate → fallback): the SL claim hold can delay a broadcast by hours,
+    // so a settle-time read would be stale when the bump finally fires.
+    let live = chain.estimated_feerate_sat_vb();
+    let (target, source) = resolve_target_feerate(opts.target_feerate_sat_vb, live);
+    match app.backstop_execute(engine, chain, target, opts.refund_congested, None, None)? {
+        BackstopRun::Decided(tick) => {
+            log(format!("backstop: {tick:?} [feerate {target} sat/vB, {source}]"))
         }
+        BackstopRun::Executed { decision, outcome } => log(format!(
+            "backstop executed: {decision:?} -> {outcome:?} [feerate {target} sat/vB, {source}]"
+        )),
     }
     Ok(())
 }
@@ -1215,4 +1240,23 @@ pub fn hex32(bytes: &[u8; 32]) -> String {
         let _ = write!(s, "{b:02x}");
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_target_feerate_prefers_override_then_estimate_then_fallback() {
+        // An operator override wins unconditionally — even over a live estimate.
+        assert_eq!(resolve_target_feerate(Some(25), Some(9)), (25, "override"));
+        assert_eq!(resolve_target_feerate(Some(25), None), (25, "override"));
+        // No override: the live estimate wins over the fallback.
+        assert_eq!(resolve_target_feerate(None, Some(9)), (9, "estimate"));
+        // Neither available: the hardcoded floor of last resort.
+        assert_eq!(
+            resolve_target_feerate(None, None),
+            (FALLBACK_TARGET_FEERATE_SAT_VB, "fallback")
+        );
+    }
 }

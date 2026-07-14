@@ -257,6 +257,23 @@ fn tx_from_hex(v: &Value) -> Option<Transaction> {
     bitcoin::consensus::encode::deserialize(&bytes).ok()
 }
 
+/// Convert a Core fee-rate JSON number in BTC/kvB to sat/vB, rounding UP.
+/// `None` for a missing/null field or a garbage value (non-finite, negative,
+/// or an absurd > 1.0 BTC/kvB reading): underpaying a fee is unsafe, so a value
+/// we cannot trust is discarded rather than guessed at. Core reports exact
+/// multiples of 1 sat/kvB, so `round()` to the nearest sat/kvB kills float
+/// representation noise before the ceil kvB→vB (which never underpays).
+fn btc_per_kvb_to_sat_vb(v: Option<&Value>) -> Option<u64> {
+    let btc = v?.as_f64()?;
+    // Reject negative, absurd (> 1.0 BTC/kvB), or non-finite readings —
+    // `RangeInclusive::contains` also rejects NaN/±inf (never contained).
+    if !(0.0..=1.0).contains(&btc) {
+        return None;
+    }
+    let sat_per_kvb = (btc * 100_000_000.0).round() as u64;
+    Some(sat_per_kvb.div_ceil(1000).max(1))
+}
+
 /// Does this verbose-tx JSON spend `want_txid:vout`? (Coinbase vins carry no
 /// "txid" — the getters just miss.)
 fn vin_spends(txv: &Value, want_txid: &str, vout: u32) -> bool {
@@ -352,6 +369,64 @@ impl<T: RpcTransport> BitcoinCoreChainView<T> {
                 st.last_tip
             }
             Err(_) => st.last_tip,
+        }
+    }
+
+    /// The advisory sat/vB feerate target (see
+    /// [`ChainView::estimated_feerate_sat_vb`]). Combines
+    /// `estimatesmartfee(2, "conservative")` with the current mempool/relay
+    /// floor from `getmempoolinfo`.
+    ///
+    /// FRESH-OR-NONE, deliberately unlike [`tip`](Self::tip)'s stale-serving
+    /// discipline (Fable review): a cached estimate through an outage would
+    /// keep the auto-congestion predicate latched and churn reserve leases
+    /// for the outage's whole duration, and during an outage a target is
+    /// useless anyway (nothing can be broadcast). No signal / no reach ⇒
+    /// `None`, and the caller's override/fallback applies.
+    ///
+    /// conf_target 2 ("conservative") is deliberate: the backstop is
+    /// deadline-driven (refund/claim deadlines), so a near-term estimate is
+    /// the right bias — any overshoot is capped downstream by
+    /// `MAX_BUMP_FEE_SATS`.
+    fn estimate_feerate(&self, st: &mut IndexState) -> Option<u64> {
+        // estimatesmartfee: when Core has no data it answers HTTP 200 with
+        // {"errors":[...], "blocks":N} and NO "feerate" field (or null) — that
+        // is "no smart estimate", NOT an RPC error, so a missing field is a
+        // clean None here, not an outage.
+        let smart = match self.call(st, "estimatesmartfee", &[json!(2), json!("conservative")]) {
+            Ok(v) => btc_per_kvb_to_sat_vb(v.get("feerate")),
+            Err(_) => None,
+        };
+
+        // The relay/mempool floor a tx must clear right now.
+        let (mempoolmin, minrelay) = match self.call(st, "getmempoolinfo", &[]) {
+            Ok(v) => (
+                btc_per_kvb_to_sat_vb(v.get("mempoolminfee")),
+                btc_per_kvb_to_sat_vb(v.get("minrelaytxfee")),
+            ),
+            Err(_) => (None, None),
+        };
+        let floor = match (mempoolmin, minrelay) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        };
+
+        if let Some(s) = smart {
+            // A smart estimate wins, but never propose below the current floor.
+            Some(s.max(floor.unwrap_or(0)))
+        } else if let (Some(mm), Some(mr)) = (mempoolmin, minrelay) {
+            // No smart estimate: a mempool whose min fee has RISEN above the
+            // relay floor is a real congestion signal (a purging mempool) even
+            // with no smartfee history — the "fresh testnet" fallback. A quiet
+            // mempool (equal) carries no signal.
+            if mm > mr {
+                Some(mm)
+            } else {
+                None
+            }
+        } else {
+            None
         }
     }
 
@@ -717,6 +792,11 @@ impl<T: RpcTransport> ChainView for BitcoinCoreChainView<T> {
         let input = rec.tx.input.iter().find(|i| i.previous_output == outpoint)?;
         let elem = input.witness.iter().next()?;
         elem.get(..64)?.try_into().ok()
+    }
+
+    fn estimated_feerate_sat_vb(&self) -> Option<u64> {
+        let mut st = self.state.lock().unwrap();
+        self.estimate_feerate(&mut st)
     }
 
     // `verified_funding_reading` and `authoritative_funding_height` keep the
@@ -1415,6 +1495,134 @@ mod tests {
         let view2 = BitcoinCoreChainView::new(mock2);
         assert_eq!(view2.spend_status(op2), SpendStatus::InMempool);
         assert_eq!(view2.spending_witness_sig(op2), None);
+    }
+
+    // ---- fee estimation ------------------------------------------------------
+
+    #[test]
+    fn estimated_feerate_happy_path_smartfee_over_floor() {
+        let mock = MockTransport::new();
+        mock.on_method("estimatesmartfee", json!({ "feerate": 0.00012345, "blocks": 2 }));
+        mock.on_method(
+            "getmempoolinfo",
+            json!({ "mempoolminfee": 0.00001000, "minrelaytxfee": 0.00001000 }),
+        );
+        let view = BitcoinCoreChainView::new(mock);
+        // 0.00012345 BTC/kvB = 12345 sat/kvB → ceil(12345/1000) = 13 sat/vB;
+        // above the 1 sat/vB relay floor, so the smart estimate stands.
+        assert_eq!(view.estimated_feerate_sat_vb(), Some(13));
+    }
+
+    #[test]
+    fn estimated_feerate_exact_multiples_have_no_float_noise() {
+        // Core reports exact multiples of 1 sat/kvB; the round-to-nearest guard
+        // must map them cleanly (0.00001 → 1, 0.00002 → 2), never 0 or 3.
+        for (feerate, expect) in [(0.00001000_f64, 1u64), (0.00002000, 2)] {
+            let mock = MockTransport::new();
+            mock.on_method("estimatesmartfee", json!({ "feerate": feerate, "blocks": 2 }));
+            mock.on_method(
+                "getmempoolinfo",
+                json!({ "mempoolminfee": 0.00001000, "minrelaytxfee": 0.00001000 }),
+            );
+            let view = BitcoinCoreChainView::new(mock);
+            assert_eq!(
+                view.estimated_feerate_sat_vb(),
+                Some(expect),
+                "feerate {feerate} → {expect} sat/vB"
+            );
+        }
+    }
+
+    #[test]
+    fn estimated_feerate_mempool_floor_can_win_over_smart() {
+        let mock = MockTransport::new();
+        // Smart says 1 sat/vB, but the mempool min fee is 50 — the floor wins.
+        mock.on_method("estimatesmartfee", json!({ "feerate": 0.00001000, "blocks": 2 }));
+        mock.on_method(
+            "getmempoolinfo",
+            json!({ "mempoolminfee": 0.00050000, "minrelaytxfee": 0.00001000 }),
+        );
+        let view = BitcoinCoreChainView::new(mock);
+        assert_eq!(view.estimated_feerate_sat_vb(), Some(50));
+    }
+
+    #[test]
+    fn estimated_feerate_no_smart_quiet_mempool_is_none() {
+        // Core has no smartfee data (errors, no feerate field) and the mempool
+        // is quiet (min == relay): no signal, no cache → None.
+        let mock = MockTransport::new();
+        mock.on_method(
+            "estimatesmartfee",
+            json!({ "errors": ["Insufficient data or no feerate found"], "blocks": 2 }),
+        );
+        mock.on_method(
+            "getmempoolinfo",
+            json!({ "mempoolminfee": 0.00001000, "minrelaytxfee": 0.00001000 }),
+        );
+        let view = BitcoinCoreChainView::new(mock);
+        assert_eq!(view.estimated_feerate_sat_vb(), None);
+    }
+
+    #[test]
+    fn estimated_feerate_no_smart_purging_mempool_signals_congestion() {
+        // No smartfee history, but a PURGING mempool (min 25 > relay 1) is a
+        // real congestion signal — the fresh-testnet fallback.
+        let mock = MockTransport::new();
+        mock.on_method(
+            "estimatesmartfee",
+            json!({ "errors": ["Insufficient data or no feerate found"], "blocks": 2 }),
+        );
+        mock.on_method(
+            "getmempoolinfo",
+            json!({ "mempoolminfee": 0.00025000, "minrelaytxfee": 0.00001000 }),
+        );
+        let view = BitcoinCoreChainView::new(mock);
+        assert_eq!(view.estimated_feerate_sat_vb(), Some(25));
+    }
+
+    #[test]
+    fn estimated_feerate_outage_is_none_never_stale() {
+        // One good reading, then both RPCs go dark: the estimator answers None
+        // (fresh-or-None — a stale spike served through an outage would keep
+        // the auto-congestion predicate latched; the caller's override/fallback
+        // covers the CPFP target), NEVER the previous value.
+        let mock = MockTransport::new();
+        mock.on(
+            "estimatesmartfee",
+            json!([2, "conservative"]),
+            json!({ "feerate": 0.00012345, "blocks": 2 }),
+        );
+        mock.on_transport_err("estimatesmartfee", json!([2, "conservative"]));
+        mock.on(
+            "getmempoolinfo",
+            json!([]),
+            json!({ "mempoolminfee": 0.00001000, "minrelaytxfee": 0.00001000 }),
+        );
+        mock.on_transport_err("getmempoolinfo", json!([]));
+        let view = BitcoinCoreChainView::new(mock);
+        assert_eq!(view.estimated_feerate_sat_vb(), Some(13), "healthy read answers fresh");
+        assert_eq!(view.estimated_feerate_sat_vb(), None, "an outage is None, not the stale 13");
+
+        // No prior reading + a total outage ⇒ None (never fabricated).
+        let cold = BitcoinCoreChainView::new(MockTransport::new());
+        assert_eq!(cold.estimated_feerate_sat_vb(), None);
+    }
+
+    #[test]
+    fn estimated_feerate_rejects_garbage_smartfee() {
+        // A non-finite/negative/absurd smartfee is discarded; with a quiet
+        // mempool it falls to None (proving the garbage was ignored, never
+        // surfaced as a fee).
+        for bad in [json!(21_000_000.0), json!(-1.0)] {
+            let mock = MockTransport::new();
+            mock.on_method("estimatesmartfee", json!({ "feerate": bad, "blocks": 2 }));
+            mock.on_method(
+                "getmempoolinfo",
+                json!({ "mempoolminfee": 0.00001000, "minrelaytxfee": 0.00001000 }),
+            );
+            let view = BitcoinCoreChainView::new(mock);
+            assert_eq!(view.estimated_feerate_sat_vb(), None, "garbage feerate {bad} must be ignored");
+        }
     }
 
     // ---- broadcast / package -------------------------------------------------

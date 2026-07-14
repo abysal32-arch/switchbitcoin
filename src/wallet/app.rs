@@ -530,12 +530,17 @@ impl SwapApp {
     /// fallback stands and nothing is stranded. A reserve key index issued for
     /// a bump that falls through is skipped, never reused.
     ///
-    /// `refund_congested` is the caller's observation that an ALREADY-RELAYED
-    /// pre-armed refund pays below the current confirmation floor — the one
-    /// stall the tower cannot detect internally (its own broadcast-time relay
-    /// stall and the unspent-arm fire are internal; see
-    /// [`WatchtowerDriver::tick`]). Without it a mempool-stuck refund reads
-    /// `Idle` forever and the silent refund CPFP never fires.
+    /// Congestion detection is now AUTOMATIC: this reads the live advisory
+    /// feerate ([`ChainView::estimated_feerate_sat_vb`](crate::chain::ChainView::estimated_feerate_sat_vb))
+    /// and treats the swap as congested when that estimate demands more for the
+    /// pre-armed refund's OWN vsize than the refund actually pays — i.e. an
+    /// already-relayed refund would sit below the current confirmation floor,
+    /// the one stall the tower cannot detect internally (its own broadcast-time
+    /// relay stall and the unspent-arm fire are internal; see
+    /// [`WatchtowerDriver::tick`]). `refund_congested` is the MANUAL
+    /// fallback/override for when the view supplies no estimate (SimChain, a
+    /// degraded node): passing `true` forces the congested path on top of any
+    /// auto-detection, so the silent refund CPFP still fires.
     pub fn backstop_execute(
         &self,
         engine: &mut SwapEngine,
@@ -545,7 +550,21 @@ impl SwapApp {
         stalled_parent: Option<&StalledParent<'_>>,
         consent: Option<LinkageAck>,
     ) -> Result<BackstopRun> {
-        let congested = refund_congested || stalled_parent.is_some();
+        // Auto-detect refund congestion from the live advisory feerate, behind
+        // three gates (Fable review): the estimate must be FRESH (the view
+        // answers `None` on an outage, never a stale cache — a cached spike
+        // must not congest through a node outage), the pre-armed refund must be
+        // ALREADY-RELAYED and still unconfirmed as OUR txid (the one stall the
+        // tower cannot see internally — everywhere else `congested` would leak
+        // a refund-only predicate into completion/setup-side decisions), and no
+        // bump child may already be in flight on its anchor (re-submitting an
+        // equal-fee sibling is rejected by TRUC and would churn a key index +
+        // three ledger writes per tick). `refund_congested` remains the manual
+        // override for when the view supplies no estimate.
+        let auto_congested = chain
+            .estimated_feerate_sat_vb()
+            .is_some_and(|est| self.refund_congestion_auto(chain, est));
+        let congested = refund_congested || auto_congested || stalled_parent.is_some();
 
         // Pass 1 — identify the ACTIVE side with the reserve assumed
         // UNAVAILABLE, so the tick's own refund-first priority picks the side
@@ -662,6 +681,53 @@ impl SwapApp {
             .checked_sub(out_sum)
             .ok_or(Error::Validation("refund outputs exceed the escrow amount"))?;
         Ok((bytes, fee, tx.vsize() as u64))
+    }
+
+    /// The Task 14 auto-congestion predicate, fully gated (doc on the call
+    /// site in [`backstop_execute`](Self::backstop_execute)): a fresh estimate
+    /// demands more for the pre-armed refund's own vsize than the refund pays,
+    /// AND the refund is relayed-but-unconfirmed attributable to OUR txid, AND
+    /// its P2A anchor is still unspent (no bump child in flight — an evicted
+    /// child re-arms this automatically on the next pass). Every failure mode
+    /// answers `false`: a bad estimate only ever degrades to "no auto signal",
+    /// with the manual flag still available.
+    fn refund_congestion_auto(
+        &self,
+        chain: &impl AuthoritativeChainView,
+        est_sat_vb: u64,
+    ) -> bool {
+        let Ok((bytes, fee, vsize)) = self.refund_parent() else {
+            return false;
+        };
+        if est_sat_vb.saturating_mul(vsize) <= fee {
+            return false; // the refund already pays the demanded floor
+        }
+        let Ok(tx) = bitcoin::consensus::encode::deserialize::<bitcoin::Transaction>(bytes) else {
+            return false;
+        };
+        let Some(escrow_op) = tx.input.first().map(|i| i.previous_output) else {
+            return false;
+        };
+        let refund_txid = tx.compute_txid();
+        // Relayed, unconfirmed, and OURS — a foreign mempool spend is a race
+        // (the tower's own arms handle it), not congestion.
+        if chain.spend_status(escrow_op) != crate::chain::SpendStatus::InMempool
+            || chain.spend_txid(escrow_op) != Some(refund_txid)
+        {
+            return false;
+        }
+        // No bump child already in flight on the anchor.
+        match tx
+            .output
+            .iter()
+            .position(|o| crate::chain::policy::is_p2a(&o.script_pubkey))
+        {
+            Some(v) => {
+                chain.spend_status(bitcoin::OutPoint::new(refund_txid, v as u32))
+                    == crate::chain::SpendStatus::Unspent
+            }
+            None => false,
+        }
     }
 
     /// Whole-wallet crash re-entry: re-enter every non-terminal swap in the

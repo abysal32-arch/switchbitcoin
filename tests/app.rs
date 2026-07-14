@@ -1434,6 +1434,10 @@ struct BackstopFixture {
     app: SwapApp,
     reserve_op: OutPoint,
     refund_fee: u64,
+    /// The signed pre-armed refund bytes — so a test can relay it into the
+    /// mempool directly (the auto-congestion path acts on an in-mempool refund).
+    refund_bytes: Vec<u8>,
+    our_op: OutPoint,
     _dirs: Vec<tempfile::TempDir>,
 }
 
@@ -1490,6 +1494,7 @@ fn record_less_funded_with_reserve(base: u32, seed: u8) -> BackstopFixture {
         PreArmedRefund::arm(&e_ours, our_op, escrow_amt, &sl.sk, dest, d, params.anchor_sats, base).unwrap();
     let maturity = refund.csv_maturity_height();
     let refund_fee = escrow_amt - d - params.anchor_sats;
+    let refund_bytes = refund.tx_bytes().to_vec();
     let receipt = confirm_watchtower_handoff(&refund, refund.fingerprint()).unwrap();
 
     let (engine, _) = SwapEngine::open(
@@ -1515,7 +1520,16 @@ fn record_less_funded_with_reserve(base: u32, seed: u8) -> BackstopFixture {
     while chain.tip_height() < maturity {
         chain.mine();
     }
-    BackstopFixture { engine, chain, app, reserve_op, refund_fee, _dirs: vec![lease, possession, wallet_dir] }
+    BackstopFixture {
+        engine,
+        chain,
+        app,
+        reserve_op,
+        refund_fee,
+        refund_bytes,
+        our_op,
+        _dirs: vec![lease, possession, wallet_dir],
+    }
 }
 
 /// Review finding 4 (per-side reserve gate): a stalled refund whose OWN small
@@ -1576,6 +1590,167 @@ fn backstop_execute_short_circuits_a_futile_zero_fee_bump() {
         f.engine.ledger().find(&f.reserve_op).unwrap().state,
         CoinState::Unspent
     );
+}
+
+/// A `SimChain` that ALSO reports a fixed live feerate estimate, to exercise
+/// the auto-congestion path in `backstop_execute` (`SimChain` itself returns
+/// `None`, so without this the manual flag is the only congestion lever).
+/// Everything else delegates to the underlying chain.
+struct EstimatingChain<'a>(&'a SimChain, u64);
+impl ChainView for EstimatingChain<'_> {
+    fn tip_height(&self) -> u32 {
+        self.0.tip_height()
+    }
+    fn funding_height(&self, op: OutPoint) -> Option<u32> {
+        self.0.funding_height(op)
+    }
+    fn funding_amount(&self, op: OutPoint) -> Option<u64> {
+        self.0.funding_amount(op)
+    }
+    fn funding_spk(&self, op: OutPoint) -> Option<bitcoin::ScriptBuf> {
+        self.0.funding_spk(op)
+    }
+    fn spend_status(&self, op: OutPoint) -> SpendStatus {
+        self.0.spend_status(op)
+    }
+    fn spend_txid(&self, op: OutPoint) -> Option<bitcoin::Txid> {
+        self.0.spend_txid(op)
+    }
+    fn spending_witness_sig(&self, op: OutPoint) -> Option<[u8; 64]> {
+        self.0.spending_witness_sig(op)
+    }
+    fn broadcast(&self, tx: &[u8]) -> Result<bitcoin::Txid> {
+        self.0.broadcast(tx)
+    }
+    fn submit_package(&self, p: &[u8], c: &[u8]) -> Result<(bitcoin::Txid, bitcoin::Txid)> {
+        self.0.submit_package(p, c)
+    }
+    fn estimated_feerate_sat_vb(&self) -> Option<u64> {
+        Some(self.1)
+    }
+}
+impl swapkey::chain::AuthoritativeChainView for EstimatingChain<'_> {}
+
+/// Task 14 (auto-congestion): a pre-armed refund already relayed into the
+/// mempool, plus a live feerate estimate that demands MORE for the refund's own
+/// vsize than the refund pays, routes to the silent refund CPFP — WITHOUT the
+/// manual `--assume-congested` flag. SimChain returns no estimate, so the
+/// wrapper supplies one; the flag stays false throughout.
+#[test]
+fn backstop_execute_auto_congestion_from_live_estimate_bumps_without_the_flag() {
+    let mut f = record_less_funded_with_reserve(750_000, 0xE7);
+    // Relay the (matured) refund so it sits in the mempool — the arm the auto
+    // signal acts on (an already-relayed refund below the confirmation floor).
+    assert!(f.chain.broadcast(&f.refund_bytes).is_ok());
+    assert!(matches!(f.chain.spend_status(f.our_op), SpendStatus::InMempool));
+
+    // A high live estimate (10_000 sat/vB) ≫ the refund's baked feerate
+    // (~22 sat/vB) ⇒ auto-congested. The manual flag stays FALSE; the modest
+    // target (50 sat/vB) keeps the child fee under the absurd-fee ceiling.
+    let est = EstimatingChain(&f.chain, 10_000);
+    match f.app.backstop_execute(&mut f.engine, &est, 50, false, None, None).unwrap() {
+        BackstopRun::Executed {
+            decision: BackstopTick::Bump { target: BumpTarget::Refund },
+            outcome: BumpOutcome::Submitted { reserve_outpoint, .. },
+        } => assert_eq!(reserve_outpoint, f.reserve_op, "auto-congestion fired the silent refund CPFP"),
+        other => panic!("a below-estimate relayed refund must auto-bump, got {other:?}"),
+    }
+}
+
+/// The negative twin: a live estimate AT-OR-BELOW the refund's baked feerate is
+/// NOT congestion — the relayed refund is healthy (about to confirm), so the
+/// backstop stays idle and never bumps (manual flag still false).
+#[test]
+fn backstop_execute_estimate_at_or_below_baked_feerate_is_idle() {
+    let mut f = record_less_funded_with_reserve(760_000, 0xE9);
+    assert!(f.chain.broadcast(&f.refund_bytes).is_ok());
+    assert!(matches!(f.chain.spend_status(f.our_op), SpendStatus::InMempool));
+
+    // A low live estimate (1 sat/vB) ≤ the refund's baked feerate ⇒ not
+    // congested; no manual flag ⇒ the relayed refund is left to confirm.
+    let est = EstimatingChain(&f.chain, 1);
+    match f.app.backstop_execute(&mut f.engine, &est, 50, false, None, None).unwrap() {
+        BackstopRun::Decided(BackstopTick::Idle) => {}
+        other => panic!("an at-or-below-estimate relayed refund must stay Idle, got {other:?}"),
+    }
+}
+
+/// Fable review (Task 14): with the refund NOT relayed, a huge estimate must
+/// change NOTHING — auto-congestion is gated on an already-relayed refund, so
+/// the refund-only predicate never leaks into the completion/setup-side
+/// decisions. Asserted by decision equality against the identical fixture on
+/// a plain (no-estimate) chain.
+#[test]
+fn backstop_execute_auto_congestion_requires_a_relayed_refund() {
+    let baseline = {
+        let mut g = record_less_funded_with_reserve(770_000, 0xEB);
+        let out = g.app.backstop_execute(&mut g.engine, &g.chain, 50, false, None, None).unwrap();
+        format!("{out:?}")
+    };
+    let mut f = record_less_funded_with_reserve(770_000, 0xEB);
+    let est = EstimatingChain(&f.chain, 10_000);
+    let out = f.app.backstop_execute(&mut f.engine, &est, 50, false, None, None).unwrap();
+    assert_eq!(
+        format!("{out:?}"),
+        baseline,
+        "an unrelayed refund must not auto-congest — the decision must match the plain chain"
+    );
+}
+
+/// Fable review (Task 14): once a bump child is in flight on the refund's P2A
+/// anchor, auto-congestion must STAND DOWN — an equal-fee TRUC sibling would
+/// be rejected and burn a key index + three ledger writes per tick. (A child
+/// that evicts re-arms the predicate on the next pass by the same gate.)
+#[test]
+fn backstop_execute_auto_congestion_stands_down_with_a_child_in_flight() {
+    let mut f = record_less_funded_with_reserve(780_000, 0xED);
+    assert!(f.chain.broadcast(&f.refund_bytes).is_ok());
+    assert!(matches!(f.chain.spend_status(f.our_op), SpendStatus::InMempool));
+
+    // A policy-valid CPFP-shaped child on the refund's anchor: v3, spending
+    // the 240-sat P2A anchor + a funded side-input, one non-dust output.
+    let refund: bitcoin::Transaction =
+        bitcoin::consensus::encode::deserialize(&f.refund_bytes).unwrap();
+    let refund_txid = refund.compute_txid();
+    let anchor_vout = refund
+        .output
+        .iter()
+        .position(|o| o.script_pubkey.as_bytes() == [0x51, 0x02, 0x4e, 0x73])
+        .expect("the pre-armed refund carries a P2A anchor") as u32;
+    let side_in = OutPoint::new(txid_from(0xC4), 0);
+    f.chain.fund_with_amount(side_in, 780_000, 50_000);
+    let child = {
+        use bitcoin::{
+            absolute, transaction::Version, Amount, ScriptBuf, Sequence, Transaction, TxIn, TxOut,
+            Witness,
+        };
+        let mut spk = vec![0x51u8, 0x20];
+        spk.extend_from_slice(&[0x66u8; 32]);
+        let input = |op: OutPoint| TxIn {
+            previous_output: op,
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        };
+        let tx = Transaction {
+            version: Version(3),
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![input(OutPoint::new(refund_txid, anchor_vout)), input(side_in)],
+            output: vec![TxOut {
+                value: Amount::from_sat(40_000),
+                script_pubkey: ScriptBuf::from_bytes(spk),
+            }],
+        };
+        bitcoin::consensus::encode::serialize(&tx)
+    };
+    assert!(f.chain.broadcast(&child).is_ok(), "the in-flight bump child relays");
+
+    // The estimate still screams congestion, but the anchor is spent ⇒ Idle.
+    let est = EstimatingChain(&f.chain, 10_000);
+    match f.app.backstop_execute(&mut f.engine, &est, 50, false, None, None).unwrap() {
+        BackstopRun::Decided(BackstopTick::Idle) => {}
+        other => panic!("a child in flight must stand auto-congestion down, got {other:?}"),
+    }
 }
 
 /// A SECOND record-less funded swap over an EXISTING engine + chain (same

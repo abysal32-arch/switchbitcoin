@@ -1229,6 +1229,70 @@ fn drive_sl_swap_to_first_hold() -> HeldSwap {
     }
 }
 
+/// Task 14 step 3: the baked fee params validated against the MEASURED vsizes
+/// of the three ACTUAL signed transactions (not the doc-comment estimates) —
+/// Setup and the pre-armed Refund straight from the artifacts sidecar, the
+/// Completion reassembled exactly the way the runner broadcasts it
+/// (`finalize_key_spend(template, final_sig)`). The floor is bitcoind's stock
+/// `minrelaytxfee` of 1 sat/vB (testnet4 and mainnet defaults agree); the
+/// baked fees must clear it with at least 3x margin so a mildly raised relay
+/// floor never strands a pre-signed tx whose fee can't be renegotiated. vsize
+/// is network-independent, so this regtest-shaped measurement is the testnet
+/// number (cross-checked on-chain by the Task 14 testnet run).
+#[test]
+fn task14_baked_fees_clear_the_relay_floor_with_margin() {
+    let held = drive_sl_swap_to_first_hold();
+    let params = Params::testnet_provisional();
+    let decode = |bytes: &[u8]| -> bitcoin::Transaction {
+        bitcoin::consensus::encode::deserialize(bytes).expect("a signed tx from the fixture")
+    };
+
+    let setup = decode(&held.artifacts.setup_tx);
+    let refund = decode(&held.artifacts.refund_tx);
+    let rec = held
+        .engine
+        .store()
+        .get(&held.artifacts.session_id)
+        .unwrap()
+        .expect("the held swap has a persisted record");
+    let sig: [u8; 64] = rec
+        .completion_tx
+        .as_deref()
+        .expect("a held SL swap has its FINALIZED 64-byte completion sig persisted")
+        .try_into()
+        .unwrap();
+    let completion = decode(&finalize_key_spend(held.artifacts.comp_sl.clone(), sig));
+
+    // Fees measured from the actual outputs against the params-known input
+    // values (Setup spends the pre-encumbrance; both exits spend the escrow).
+    let out_sum = |tx: &bitcoin::Transaction| {
+        tx.output.iter().map(|o| o.value.to_sat()).sum::<u64>()
+    };
+    let setup_fee = params.pre_encumbrance_sats() - out_sum(&setup);
+    let completion_fee = params.escrow_amount_sats() - out_sum(&completion);
+    let refund_fee = params.escrow_amount_sats() - out_sum(&refund);
+    assert_eq!(setup_fee, params.setup_fee_sats, "Setup pays exactly the baked setup fee");
+    assert_eq!(completion_fee, params.settlement_fee_sats(), "Completion pays the settlement fee");
+    assert_eq!(refund_fee, params.settlement_fee_sats(), "Refund pays the settlement fee");
+
+    // The relay-floor margin: fee >= 3 sat/vB * measured vsize (3x the 1 sat/vB
+    // default floor). Printed so a `--nocapture` run documents the numbers.
+    for (name, tx, fee) in
+        [("setup", &setup, setup_fee), ("completion", &completion, completion_fee), ("refund", &refund, refund_fee)]
+    {
+        let vsize = tx.vsize() as u64;
+        println!(
+            "measured {name}: {vsize} vB, baked fee {fee} sats = {} sat/vB (floor margin {}x)",
+            fee / vsize,
+            fee / vsize
+        );
+        assert!(
+            fee >= vsize * 3,
+            "{name}: baked fee {fee} sats must clear 3 sat/vB over its measured {vsize} vB"
+        );
+    }
+}
+
 /// Task 13 (Fable review, MEDIUM): a foreign spend racing the swept escrow in
 /// the MEMPOOL during the hold must ABANDON the hold and fight immediately —
 /// `Done(Completed)` strictly before the posture target height, never a

@@ -68,12 +68,24 @@ pub struct Params {
 
 impl Params {
     /// Provisional testnet defaults (Requirement 6 table).
+    ///
+    /// Fee baseline VALIDATED against measured vsizes (Task 14; the signed
+    /// fixture txs, asserted by `task14_baked_fees_clear_the_relay_floor_with_
+    /// margin` in tests/runner.rs): Setup 124 vB → 1_200 sats ≈ 9.7 sat/vB;
+    /// Completion 124 vB and Refund 143 vB → 3_320 sats (the derived
+    /// `settlement_fee_sats`) ≈ 26.8 / 23.2 sat/vB. All three clear bitcoind's
+    /// stock 1 sat/vB relay floor with 9–26x margin, so the numbers KEEP.
+    /// When live congestion outruns a baked feerate (estimate above ~9 sat/vB
+    /// strands a Setup, above ~23 an exit), the DYNAMIC backstop (Task 14:
+    /// `estimated_feerate_sat_vb` → CPFP) bridges the gap — the
+    /// `cpfp_reserve_sats` below sustains a refund-package bump (143+120 vB)
+    /// to ≈107 sat/vB, and `MAX_BUMP_FEE_SATS` caps the burn.
     pub fn testnet_provisional() -> Self {
         Params {
             tier_d_sats: 1_000_000,      // 0.01 tBTC
-            delta_fee_sats: 5_000,       // placeholder; TUNE on testnet
+            delta_fee_sats: 5_000,       // = setup_fee + 2*anchor + settlement_fee (measured-validated)
             anchor_sats: 240,            // the P2A dust floor (Core 28+)
-            setup_fee_sats: 1_200,       // Setup ~125 vB; TUNE on testnet
+            setup_fee_sats: 1_200,       // Setup MEASURED 124 vB → ~9.7 sat/vB baked
             cpfp_reserve_sats: 25_000,   // 0.00025 BTC — the advertised reserve
             delta_early: 144,            // ~24 h
             margin: 72,                  // ~12 h -> delta_late ~ 216

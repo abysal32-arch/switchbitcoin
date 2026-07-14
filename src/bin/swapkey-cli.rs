@@ -160,14 +160,16 @@ COMMANDS
             --wait-secs <n>     confirmation wait budget (default 600)
   swap      Run ONE swap against a peer (to a CONFIRMED terminal). Requires [node].
             --listen <addr> | --connect <addr>   (flags outrank [peer] config)
-            --feerate <sat/vB>  backstop CPFP target feerate (default 2)
+            --feerate <sat/vB>  backstop CPFP feerate override (default: live
+                                node estimate, fallback 2)
             --block-x-delta <blocks>  funding no-show deadline (default 144)
             --jitter <blocks>   co-funding jitter (default 0)
             --poll-secs <n>     chain poll cadence (default 5; the peer i/o
                                 deadline scales with it)
             --accept-timeout-secs <n>  --listen wait budget (default 600)
-            --assume-congested  treat a relayed refund as below the fee floor
-                                (fires the silent refund CPFP)
+            --assume-congested  manual congestion fallback when the node gives
+                                no estimate: treat a relayed refund as below the
+                                fee floor (fires the silent refund CPFP)
             --claim-posture <fast|balanced|private>  SL claim-delay privacy
                                 (default: the signed manifest's active posture;
                                  maps to the manifest minimal/moderate/aggressive
@@ -268,6 +270,14 @@ impl Flags {
         match self.value(name) {
             None => Ok(default),
             Some(v) => v.parse().map_err(|_| format!("--{name}: not a number").into()),
+        }
+    }
+    /// Presence-detecting numeric flag: `Some(n)` when given, `None` when
+    /// absent (so a caller can distinguish "operator set it" from "use auto").
+    fn num_opt<T: FromStr>(&self, name: &str) -> Result<Option<T>, UsageError> {
+        match self.value(name) {
+            None => Ok(None),
+            Some(v) => v.parse().map(Some).map_err(|_| format!("--{name}: not a number").into()),
         }
     }
     fn config_path(&self) -> PathBuf {
@@ -756,7 +766,7 @@ fn cmd_swap(flags: &Flags) -> CliResult {
         );
     }
     let opts = RunOptions {
-        target_feerate_sat_vb: flags.num("feerate", 2)?,
+        target_feerate_sat_vb: flags.num_opt("feerate")?,
         dry_run: false,
         refund_congested: flags.switch("assume-congested"),
     };
@@ -1032,7 +1042,7 @@ fn recovery_pass(
 
 fn cmd_recover(flags: &Flags) -> CliResult {
     let opts = RunOptions {
-        target_feerate_sat_vb: flags.num("feerate", 2)?,
+        target_feerate_sat_vb: flags.num_opt("feerate")?,
         dry_run: flags.switch("dry-run"),
         refund_congested: flags.switch("assume-congested"),
     };
@@ -1083,7 +1093,7 @@ fn cmd_serve(flags: &Flags) -> CliResult {
     let port: u16 = flags.num("port", DEFAULT_API_PORT)?;
     let poll = Duration::from_secs(flags.num("poll-secs", 3)?);
     let opts = RunOptions {
-        target_feerate_sat_vb: flags.num("feerate", 2)?,
+        target_feerate_sat_vb: flags.num_opt("feerate")?,
         dry_run: false,
         refund_congested: flags.switch("assume-congested"),
     };

@@ -88,6 +88,14 @@ pub trait ChainView {
     fn funding_amount(&self, _outpoint: OutPoint) -> Option<u64> {
         None
     }
+    /// Advisory feerate target in sat/vB for fee-bumping decisions (CPFP
+    /// sizing, congestion detection). `None` when this view cannot estimate
+    /// (SimChain, degraded/unreachable node, fresh node with no fee data) —
+    /// callers must fall back to an operator-supplied or default target.
+    /// Advisory only: it sizes fees, it never decides funds-at-risk questions.
+    fn estimated_feerate_sat_vb(&self) -> Option<u64> {
+        None
+    }
     /// Confirmed scriptPubKey of a funding output, if known. Default `None`
     /// for views that don't retain it; amount/tx-bearing views (SimChain, a
     /// real filter client reading the funding tx) override it. This is the
