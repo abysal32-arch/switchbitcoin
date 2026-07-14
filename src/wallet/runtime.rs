@@ -103,7 +103,7 @@ use crate::wallet::config::WalletConfig;
 use crate::wallet::engine::{ChainReconcile, SwapEngine};
 use crate::wallet::keystore::{probe_keystore_file, KeystoreFileState, SoftwareKeyStore};
 use crate::wallet::ledger::{acknowledge_phase0, Ledger, LEDGER_FILE, PHASE0_WARNING};
-use crate::wallet::manifest::ModeledTrustRoot;
+use crate::wallet::manifest::{ManifestOpenReport, ManifestTrustRoot, ModeledTrustRoot};
 use crate::wallet::recovery_driver::RecoveryScan;
 use crate::wallet::store::RecoveryAction;
 use crate::{Error, Result};
@@ -143,10 +143,14 @@ pub struct Wallet {
 
 /// First-run onboarding gate: holds the created keystore (and, on a truly
 /// fresh run, the one-shot mnemonic) until both acknowledgements are given.
+/// Carries the manifest trust root the opening call chose, so `complete`
+/// opens the engine under the SAME root (a binary that pins the real
+/// operator key must never fall back to the modeled one mid-onboarding).
 pub struct FirstRun {
     keystore: SoftwareKeyStore,
     config: WalletConfig,
     mnemonic: Option<Zeroizing<String>>,
+    manifest_root: Box<dyn ManifestTrustRoot>,
 }
 
 impl Wallet {
@@ -171,8 +175,24 @@ impl Wallet {
     ///
     /// A wrong passphrase is a clean `Err` with no state change — safe to
     /// re-prompt in a loop. Uses the prototype [`ModeledTrustRoot`] as the
-    /// manifest trust root; a real build pins the real operator key here.
+    /// manifest trust root — the LIBRARY/test default. The runnable binary
+    /// always calls [`Wallet::open_with_root`] with its build-time pinned
+    /// operator key instead (Task 18, DECISION 3).
     pub fn open(config: WalletConfig, passphrase: &str) -> Result<OpenedWallet> {
+        Self::open_with_root(config, passphrase, Box::new(ModeledTrustRoot))
+    }
+
+    /// [`Wallet::open`] with an explicit manifest trust root. The root is the
+    /// key every stored/ingested signed manifest must verify against; a
+    /// binary passes its compiled-in [`crate::wallet::manifest::PinnedTrustRoot`]
+    /// (a BUILD-TIME constant — deliberately not a config key; see that
+    /// type's docs). Boxed because a first run must carry the root through
+    /// [`FirstRun::complete`].
+    pub fn open_with_root(
+        config: WalletConfig,
+        passphrase: &str,
+        manifest_root: Box<dyn ManifestTrustRoot>,
+    ) -> Result<OpenedWallet> {
         config
             .validate()
             .map_err(|_| Error::Validation("wallet config failed validation"))?;
@@ -218,6 +238,7 @@ impl Wallet {
                     keystore,
                     config,
                     mnemonic: Some(mnemonic),
+                    manifest_root,
                 })))
             }
             KeystoreFileState::Plausible => {
@@ -239,21 +260,30 @@ impl Wallet {
                         keystore,
                         config,
                         mnemonic: None,
+                        manifest_root,
                     })));
                 }
-                Ok(OpenedWallet::Ready(Box::new(Self::open_engine(keystore, config)?)))
+                Ok(OpenedWallet::Ready(Box::new(Self::open_engine(
+                    keystore,
+                    config,
+                    &*manifest_root,
+                )?)))
             }
         }
     }
 
     /// STEP 1 of the canonical sequence, composed: the ONE keystore serves
     /// both engine key seams (enclave sealing root + signing source).
-    fn open_engine(keystore: SoftwareKeyStore, config: WalletConfig) -> Result<Wallet> {
+    fn open_engine(
+        keystore: SoftwareKeyStore,
+        config: WalletConfig,
+        manifest_root: &dyn ManifestTrustRoot,
+    ) -> Result<Wallet> {
         let (engine, open_actions) = SwapEngine::open(
             &config.data_dir,
             &keystore,
             Box::new(keystore.clone()),
-            &ModeledTrustRoot,
+            manifest_root,
         )?;
         Ok(Wallet { engine, keystore, config, open_actions })
     }
@@ -303,6 +333,12 @@ impl Wallet {
     /// manifest falls back to.
     pub fn params(&self) -> &Params {
         self.engine.manifest().current().params()
+    }
+    /// How the manifest store opened. The abnormal variants (fallback /
+    /// rollback / transient) mean the params changed underneath the user —
+    /// surface them as ALARMS alongside [`Wallet::open_actions`].
+    pub fn manifest_open_report(&self) -> &ManifestOpenReport {
+        self.engine.manifest_open_report()
     }
 }
 
@@ -402,7 +438,8 @@ impl FirstRun {
                 return Err(FirstRunError::Refused { first_run: Box::new(self), error })
             }
         }
-        Wallet::open_engine(self.keystore, self.config).map_err(FirstRunError::Fatal)
+        let FirstRun { keystore, config, manifest_root, .. } = self;
+        Wallet::open_engine(keystore, config, &*manifest_root).map_err(FirstRunError::Fatal)
     }
 }
 

@@ -302,3 +302,98 @@ fn backup_restore_and_mnemonic_rescan_round_trip_via_the_cli() {
     let out = run_cli(&config_c, &["init", "--rescan", "9", "--passphrase-stdin"], PASSPHRASE);
     assert!(!out.status.success(), "--rescan without --restore must be refused");
 }
+
+/// The Task-18 trust path at the SHIPPED binary's surface: this build pins
+/// the REAL pre-alpha operator key, so the committed v1 manifest (signed by
+/// the real key via swapkey-manifest) ingests, re-ingest is an idempotent
+/// no-op, and a MODELED-root-signed manifest — the key printed in the library
+/// source — is refused. Ingest is CLI-only (DECISION 6).
+#[test]
+fn pinned_root_manifest_ingest_via_the_cli() {
+    use swapkey::settlement::params::Params;
+    use swapkey::wallet::manifest::{
+        modeled_operator_seckey, sign_manifest, ClaimDelayPosture, SignedManifest,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("swapkey.toml");
+    let data_dir = dir.path().join("data");
+    let out = run_cli(
+        &config,
+        &[
+            "init",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "--passphrase-stdin",
+            "--accept-phase0",
+            "--skip-backup-verification",
+        ],
+        PASSPHRASE,
+    );
+    assert!(out.status.success(), "{}", text(&out));
+
+    // Fresh wallet: the compiled v0 baseline, loudly marked provisional.
+    let out = run_cli(&config, &["manifest", "show", "--passphrase-stdin"], PASSPHRASE);
+    let t = text(&out);
+    assert!(out.status.success(), "manifest show failed:\n{t}");
+    assert!(t.contains("manifest version: 0"), "{t}");
+    assert!(t.contains("fingerprintable anonymity"), "the v0 partition warning:\n{t}");
+
+    // The COMMITTED v1 artifact (docs/manifests/v1.manifest, signed by the
+    // real operator key) must ingest against this binary's pin.
+    let v1 = concat!(env!("CARGO_MANIFEST_DIR"), "/docs/manifests/v1.manifest");
+    let out = run_cli(&config, &["manifest", "ingest", v1, "--passphrase-stdin"], PASSPHRASE);
+    let t = text(&out);
+    assert!(out.status.success(), "the committed v1 manifest must ingest:\n{t}");
+    assert!(t.contains("manifest v1 ACCEPTED"), "{t}");
+    assert!(t.contains("version floor:    1"), "the floor must advance:\n{t}");
+    assert!(!t.contains("fingerprintable"), "v1 leaves the provisional partition:\n{t}");
+
+    // Idempotent re-ingest of the identical envelope.
+    let out = run_cli(&config, &["manifest", "ingest", v1, "--passphrase-stdin"], PASSPHRASE);
+    let t = text(&out);
+    assert!(out.status.success(), "idempotent re-ingest must be Ok:\n{t}");
+    assert!(t.contains("already current"), "{t}");
+
+    // A MODELED-signed v2: validly formed, wrong root — the pinned binary
+    // must refuse it verbatim (the modeled secret is public in the source).
+    let m2 = SignedManifest::compose(
+        2,
+        Params::testnet_provisional(),
+        ClaimDelayPosture::Moderate,
+        [(0, 6), (6, 36), (12, 72)],
+        6,
+        3,
+    )
+    .unwrap();
+    let env2 = sign_manifest(&m2, &modeled_operator_seckey()).unwrap();
+    let modeled_path = dir.path().join("modeled-v2.manifest");
+    std::fs::write(&modeled_path, &env2).unwrap();
+    let out = run_cli(
+        &config,
+        &["manifest", "ingest", modeled_path.to_str().unwrap(), "--passphrase-stdin"],
+        PASSPHRASE,
+    );
+    let t = text(&out);
+    assert!(!out.status.success(), "a modeled-root manifest must be refused:\n{t}");
+    assert!(t.contains("signature does not verify"), "verbatim refusal:\n{t}");
+    assert!(t.contains("still on v1"), "{t}");
+
+    // A wrong-sized file is refused BEFORE it is read into memory.
+    let junk = dir.path().join("junk.manifest");
+    std::fs::write(&junk, vec![0u8; 4096]).unwrap();
+    let out = run_cli(
+        &config,
+        &["manifest", "ingest", junk.to_str().unwrap(), "--passphrase-stdin"],
+        PASSPHRASE,
+    );
+    let t = text(&out);
+    assert!(!out.status.success());
+    assert!(t.contains("expected exactly 169 bytes"), "{t}");
+
+    // `status` reflects the new signed identity.
+    let out = run_cli(&config, &["status", "--passphrase-stdin"], PASSPHRASE);
+    let t = text(&out);
+    assert!(out.status.success(), "{t}");
+    assert!(t.contains("manifest: v1"), "{t}");
+}

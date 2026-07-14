@@ -54,7 +54,10 @@ const FMT: u8 = 3; // v3: +8 bytes cpfp_reserve_sats (v2 added anchor, setup_fee
 /// wallet (cross-network replay). The prototype is testnet-only.
 const NETWORK_TESTNET: u8 = 0;
 const BODY_LEN: usize = 1 + 1 + 4 + 68 + 1 + 24 + 4 + 2; // 105
-const ENVELOPE_LEN: usize = BODY_LEN + 64;
+/// Exact distribution-envelope length `[body || 64-byte BIP340 sig]`. Public
+/// so the CLI ingest path can refuse a wrong-sized file BEFORE reading it
+/// into memory (the envelope is fixed-length by construction).
+pub const ENVELOPE_LEN: usize = BODY_LEN + 64;
 
 /// The pinned manifest-signing key seam. In production this is the network
 /// operator's (or threshold aggregate) x-only key, compiled into the wallet —
@@ -83,6 +86,21 @@ impl ManifestTrustRoot for ModeledTrustRoot {
         let kp = Keypair::from_seckey_slice(&secp, &modeled_operator_seckey())
             .expect("modeled operator key is a valid scalar");
         kp.x_only_public_key().0.serialize()
+    }
+}
+
+/// Build-time pinned trust root (Task 18, DECISION 3): wraps the REAL
+/// operator x-only key compiled into a binary as a constant. Deliberately NOT
+/// loadable from config — a `swapkey.toml` pin would reduce the whole
+/// signed-manifest trust path to config-file security (any local writer of a
+/// plaintext file could repoint the root, then feed manifests). The bytes are
+/// not validated here; a non-key value fails every `verify_manifest` with
+/// "invalid trust-root key" (fail closed, nothing ingests).
+pub struct PinnedTrustRoot(pub [u8; 32]);
+
+impl ManifestTrustRoot for PinnedTrustRoot {
+    fn operator_xonly(&self) -> [u8; 32] {
+        self.0
     }
 }
 
@@ -406,6 +424,19 @@ pub fn verify_manifest(
     Ok(m)
 }
 
+/// Parse an envelope's BODY for display, WITHOUT any signature check — the
+/// ops-tooling `inspect` verb (the manifest is network-public; showing its
+/// fields makes no trust decision, and `compose` already lets anyone build an
+/// unsigned `SignedManifest`). Total: malformed bytes and invariant-violating
+/// params are Err. The WALLET never calls this — its only ingest paths remain
+/// signature-verified (`verify_manifest` / `ManifestStore::ingest`).
+pub fn inspect_envelope(envelope: &[u8]) -> Result<SignedManifest> {
+    if envelope.len() != ENVELOPE_LEN {
+        return Err(Error::Validation("manifest: wrong envelope length"));
+    }
+    SignedManifest::from_body(&envelope[..BODY_LEN])
+}
+
 /// How `ManifestStore::open` arrived at its current manifest.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ManifestOpenReport {
@@ -530,6 +561,13 @@ impl ManifestStore {
     /// syncing a real manifest first is the private choice.
     pub fn is_provisional(&self) -> bool {
         self.current.version() == 0
+    }
+
+    /// The persisted strictly-monotonic version floor (highest version ever
+    /// accepted; survives tamper-quarantine of the manifest file). Surfaced
+    /// so the operator can see WHY an ingest was version-gated.
+    pub fn floor(&self) -> u32 {
+        self.floor
     }
 
     /// Ingest a distribution envelope. Verifies signature + invariants, then

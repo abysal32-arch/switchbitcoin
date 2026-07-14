@@ -1,0 +1,46 @@
+# Swap Key signed-manifest authoring input — VERSION 1 (Task 18, DECISION 4).
+#
+# v1 re-issues the UNCHANGED compiled provisional baseline
+# (Params::testnet_provisional() + the provisional posture/delay table) as the
+# FIRST signed manifest: zero behavior change, but ingesting it migrates a
+# wallet off the fingerprintable version-0 provisional anonymity partition and
+# exercises every trust-path gate for real. Tuned params ship later as v2+.
+#
+# Signed 2026-07-14 with the pre-alpha operator key (x-only pubkey
+# fbb01df4f947cf69e8a24e4e907c60e8c903eb199e6dd949a2fabe5a5ea2191e — the
+# PINNED_OPERATOR_XONLY constant in swapkey-cli). Envelope: v1.manifest.
+#
+# Format: the same hand-parsed TOML subset as swapkey.toml — every value is a
+# quoted string, every key below is REQUIRED, unknown keys are errors.
+# Usage:   swapkey-manifest sign v1-params.toml --key <operator.key> --out v1.manifest
+# Check:   swapkey-manifest compose-check v1-params.toml   (no key needed)
+
+version = "1"
+posture = "moderate"      # minimal | moderate | aggressive (v3.14 open dial)
+quorum_q = "3"            # discovery quorum (carried for the post-review build)
+
+[params]
+tier_d_sats = "1000000"             # 0.01 tBTC — the exactly-equal swapped output
+delta_fee_sats = "5000"             # = setup_fee + 2*anchor + settlement_fee
+anchor_sats = "240"                 # P2A dust floor (Core 28+)
+setup_fee_sats = "1200"             # Setup measured 124 vB -> ~9.7 sat/vB baked
+cpfp_reserve_sats = "25000"         # the advertised congestion-backstop reserve
+delta_early = "144"                 # SL refund maturity (~24 h)
+margin = "72"                       # delta_late = delta_early + margin (~12 h)
+delta_buffer = "24"                 # SH confirm-by buffer (~4 h)
+claim_confirm_allowance = "6"       # blocks budgeted for the SL claim to confirm
+cofunding_window = "12"             # both Setups within this many blocks
+onboarding_delay_lo_hours = "24"    # withdrawal<->encumbrance decorrelation
+onboarding_delay_hi_hours = "72"
+
+[delays]
+# ⚠ CRYPTOGRAPHER REVIEW ITEM #5: these bounds are calibrated to the LOOSE
+# honest-SH window (see wallet::manifest). Tightening them is an owner/
+# cryptographer posture decision — v1 deliberately re-issues today's bounds.
+minimal_min = "0"
+minimal_max = "6"
+moderate_min = "6"
+moderate_max = "36"
+aggressive_min = "12"
+aggressive_max = "72"
+cofunding_jitter_max = "6"          # per-party; two-sided must fit the window

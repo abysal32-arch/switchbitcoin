@@ -120,8 +120,8 @@ pub use driver::{DriveStatus, SwapDriver};
 pub use funding_driver::{FundingDriver, FundingTick, HandoffError};
 pub use recovery_driver::{RecoveryDriver, RecoveryTick};
 pub use manifest::{
-    ClaimDelayPosture, ManifestOpenReport, ManifestStore, ManifestTrustRoot, ModeledTrustRoot,
-    SignedManifest,
+    inspect_envelope, ClaimDelayPosture, ManifestOpenReport, ManifestStore, ManifestTrustRoot,
+    ModeledTrustRoot, PinnedTrustRoot, SignedManifest,
 };
 pub use config::{
     ConfigError, Network, NodeRpcConfig, PeerConfig, RpcAuth, Secret, WalletConfig, CONFIG_FILE,

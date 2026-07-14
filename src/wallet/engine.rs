@@ -33,7 +33,9 @@ use crate::settlement::state_machine::{ExchangeInputs, Funded, Possessing, Role}
 use crate::wallet::claim_scheduler::{ClaimHold, ClaimScheduler, ScheduledClaim};
 use crate::wallet::keys::KeySource;
 use crate::wallet::ledger::Ledger;
-use crate::wallet::manifest::{ClaimDelayPosture, ManifestStore, ManifestTrustRoot};
+use crate::wallet::manifest::{
+    ClaimDelayPosture, ManifestOpenReport, ManifestStore, ManifestTrustRoot,
+};
 use crate::wallet::store::{EnclaveKeyProvider, RecoveryAction, SwapPhase, SwapRecord, SwapStore};
 use crate::{Error, Result};
 use bitcoin::OutPoint;
@@ -154,6 +156,11 @@ pub struct SwapEngine {
     store: SwapStore,
     ledger: Ledger,
     manifest: ManifestStore,
+    /// How the manifest store arrived at its current manifest at open. The
+    /// abnormal variants (fallback / rollback / transient) are operator
+    /// ALARMS the runner must surface — parameters changed underneath the
+    /// user (Task 18; previously this report was silently dropped here).
+    manifest_report: ManifestOpenReport,
     keys: Box<dyn KeySource>,
     /// Operator override for the SL claim-delay posture. `None` = use the
     /// manifest's active posture. An override only SELECTS among the manifest's
@@ -182,7 +189,7 @@ impl SwapEngine {
     ) -> Result<(SwapEngine, Vec<RecoveryAction>)> {
         let (store, actions) = SwapStore::open(dir, enclave)?;
         let mut ledger = Ledger::open(dir, enclave)?;
-        let (manifest, _report) = ManifestStore::open(dir, manifest_root)?;
+        let (manifest, manifest_report) = ManifestStore::open(dir, manifest_root)?;
 
         // Reconcile leases against the swaps that are still live: any coin
         // leased to a swap that no longer exists (crashed before its
@@ -192,11 +199,32 @@ impl SwapEngine {
         // swap already spent on chain must become Spent, not re-exposed Unspent).
         ledger.reconcile_leases(&live_lessees(&store)?)?;
 
-        Ok((SwapEngine { store, ledger, manifest, keys, claim_posture: None }, actions))
+        Ok((
+            SwapEngine { store, ledger, manifest, manifest_report, keys, claim_posture: None },
+            actions,
+        ))
     }
 
     pub fn manifest(&self) -> &ManifestStore {
         &self.manifest
+    }
+
+    /// How the manifest store opened (loaded / fresh / fallback / rollback /
+    /// transient). The abnormal variants are ALARMS, not log lines — surface
+    /// them wherever the store-open `RecoveryAction`s are surfaced.
+    pub fn manifest_open_report(&self) -> &ManifestOpenReport {
+        &self.manifest_report
+    }
+
+    /// Mutable manifest-store handle — the operator INGEST path (Task 18:
+    /// `swapkey-cli manifest ingest`). Every gate lives in
+    /// [`ManifestStore::ingest`] itself (signature, invariants, monotonic
+    /// version vs current AND floor), so this exposes no bypass. Mid-swap
+    /// params safety: the store's single-instance lock means no OTHER process
+    /// can be mid-swap on this data dir, and a live record carries its own
+    /// params copy (`record_funding` bookends) regardless.
+    pub fn manifest_mut(&mut self) -> &mut ManifestStore {
+        &mut self.manifest
     }
 
     /// Set (or clear, with `None`) the operator's SL claim-delay posture

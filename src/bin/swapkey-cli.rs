@@ -27,6 +27,13 @@
 //!   restore   unpack a bundle into a fresh data dir (verify-then-rename
 //!             atomic) and verify the wallet opens; --rescan raises the
 //!             key-index floor when the bundle may be stale.
+//!   watch     standalone watchtower (second-device dead-device refund guard).
+//!   serve     localhost JSON API for SwapKey-Wallet.html (loopback, no auth).
+//!   manifest  show/ingest the signed-params manifest. Verification is
+//!             against the BUILD-TIME pinned operator key
+//!             (`PINNED_OPERATOR_XONLY`); authoring/signing lives in the
+//!             separate `swapkey-manifest` ops tool — this binary has no
+//!             operator-key input path.
 //!
 //! Logging: plain lines to stderr, no secrets — the mnemonic is printed ONCE
 //! (deliberately, to the terminal, for backup) by `init`; passphrases are
@@ -44,7 +51,9 @@ use swapkey::chain::{AuthoritativeChainView, ChainView};
 use swapkey::settlement::state_machine::PeerSession;
 use swapkey::wallet::config::{Network, WalletConfig, CONFIG_FILE};
 use swapkey::wallet::keys::KeyPurpose;
-use swapkey::wallet::manifest::ClaimDelayPosture;
+use swapkey::wallet::manifest::{
+    ClaimDelayPosture, ManifestOpenReport, PinnedTrustRoot, ENVELOPE_LEN,
+};
 use swapkey::wallet::ledger::{acknowledge_phase0, SystemClock, PHASE0_WARNING};
 use swapkey::wallet::runner::{
     self, apply_recovery_tick, backstop_step, hex32, negotiate_swap, refund_babysit_step,
@@ -60,6 +69,31 @@ use swapkey::wallet::SwapApp;
 /// funding spk back to its key index; the ledger's counter is monotonic, so
 /// real indices are small).
 const KEY_SCAN_LIMIT: u32 = 10_000;
+
+/// The BUILD-TIME manifest trust root (Task 18, DECISION 3): the REAL
+/// pre-alpha operator x-only public key, hex
+/// `fbb01df4f947cf69e8a24e4e907c60e8c903eb199e6dd949a2fabe5a5ea2191e`.
+/// Generated 2026-07-14 by `swapkey-manifest keygen`; the sealed SECRET half
+/// lives outside the repo (`operator-key\`, never committed) — this constant
+/// is the public verification key only. Every `Wallet` open in this binary —
+/// init, status, address, onboard, swap, recover, WATCH, serve, backup's
+/// restore verification, manifest — pins it via [`Wallet::open_with_root`];
+/// the prototype `ModeledTrustRoot` (whose secret is printed in the library
+/// source) remains tests/library-only. DELIBERATELY not a config key: a
+/// `swapkey.toml` pin would reduce the signed-manifest trust path to
+/// config-file security (any local file writer could repoint the root, then
+/// feed hostile-but-`validate()`-clean params). Key loss/rotation = re-pin +
+/// rebuild + redistribute (docs/params-governance.md).
+const PINNED_OPERATOR_XONLY: [u8; 32] = [
+    0xfb, 0xb0, 0x1d, 0xf4, 0xf9, 0x47, 0xcf, 0x69, 0xe8, 0xa2, 0x4e, 0x4e, 0x90, 0x7c, 0x60,
+    0xe8, 0xc9, 0x03, 0xeb, 0x19, 0x9e, 0x6d, 0xd9, 0x49, 0xa2, 0xfa, 0xbe, 0x5a, 0x5e, 0xa2,
+    0x19, 0x1e,
+];
+
+/// The pinned root, boxed for [`Wallet::open_with_root`].
+fn pinned_root() -> Box<PinnedTrustRoot> {
+    Box::new(PinnedTrustRoot(PINNED_OPERATOR_XONLY))
+}
 
 /// The wall-clock the LEASE-eligibility reads use, by network. REGTEST ONLY:
 /// reads fast-forward +73h so the onboarding decorrelation delay's WALL
@@ -140,6 +174,7 @@ fn run(args: &[String]) -> CliResult {
         "serve" => cmd_serve(&flags),
         "backup" => cmd_backup(&flags),
         "restore" => cmd_restore(&flags),
+        "manifest" => cmd_manifest(&flags),
         "help" | "--help" | "-h" => {
             print!("{HELP}");
             Ok(())
@@ -225,6 +260,17 @@ COMMANDS
             --rescan <floor>    raise the key-index floor after opening — use
                                 when the bundle may be OLDER than the last
                                 address this wallet ever issued
+  manifest <show|ingest <file>>  The signed-params trust path (operator
+            manifests are authored/signed by the SEPARATE swapkey-manifest
+            tool; this wallet only verifies + ingests against its BUILD-TIME
+            pinned operator key — the pin is deliberately not configurable).
+            show                current version, id, params, and whether this
+                                wallet still runs the fingerprintable v0
+                                compiled baseline
+            ingest <file>       verify + apply a signed manifest envelope;
+                                refusals (bad signature, non-increasing
+                                version, invariant violation) are printed
+                                verbatim
   serve     Localhost JSON API for SwapKey-Wallet.html (LOOPBACK ONLY, no
             auth — any local process can drive the wallet; pre-alpha).
             --port <n>          bind 127.0.0.1:<n> (default 3316)
@@ -419,15 +465,44 @@ fn load_config(flags: &Flags) -> Result<WalletConfig, UsageError> {
     Ok(WalletConfig::load(&flags.config_path())?)
 }
 
-/// Open an ESTABLISHED wallet (everything but `init` expects `Ready`).
+/// Open an ESTABLISHED wallet (everything but `init` expects `Ready`),
+/// always under the BUILD-TIME pinned trust root, and surface the manifest
+/// open report's abnormal variants as ALARMS before anything else runs.
 fn open_ready(flags: &Flags) -> Result<Wallet, UsageError> {
     let config = load_config(flags)?;
     let passphrase = read_passphrase(flags, false)?;
-    match Wallet::open(config, &passphrase)? {
-        OpenedWallet::Ready(w) => Ok(*w),
+    match Wallet::open_with_root(config, &passphrase, pinned_root())? {
+        OpenedWallet::Ready(w) => {
+            log_manifest_alarm(&w);
+            Ok(*w)
+        }
         OpenedWallet::FirstRun(_) => {
             Err("wallet onboarding is incomplete — run `swapkey-cli init` first".into())
         }
+    }
+}
+
+/// The manifest-store open report's abnormal variants are operator ALARMS
+/// (the wallet's params changed underneath the user — it fell back to the
+/// compiled baseline, or a rollback was quarantined). Loaded/Fresh are the
+/// quiet normal cases.
+fn log_manifest_alarm(wallet: &Wallet) {
+    match wallet.manifest_open_report() {
+        ManifestOpenReport::ProvisionalFresh | ManifestOpenReport::Loaded { .. } => {}
+        report @ ManifestOpenReport::ProvisionalFallback { .. } => log(&format!(
+            "ALARM (manifest open): {report:?} — the stored manifest failed verification and \
+             was quarantined; running the compiled baseline. Re-ingest the current signed \
+             manifest (`manifest ingest <file>`)"
+        )),
+        report @ ManifestOpenReport::RollbackDetected { .. } => log(&format!(
+            "ALARM (manifest open): {report:?} — a validly-signed but OLD manifest file was \
+             restored over a newer one (rollback) and quarantined; running the compiled \
+             baseline. Re-ingest the current signed manifest"
+        )),
+        report @ ManifestOpenReport::ProvisionalTransient { .. } => log(&format!(
+            "ALARM (manifest open): {report:?} — the stored manifest could not be read this \
+             session (transient I/O); running the compiled baseline FOR THIS SESSION only"
+        )),
     }
 }
 
@@ -518,9 +593,10 @@ fn cmd_init(flags: &Flags) -> CliResult {
         log("      coin ledger, swap records, and key index too.");
     }
 
-    let mut first_run = match Wallet::open(config, &passphrase)? {
+    let mut first_run = match Wallet::open_with_root(config, &passphrase, pinned_root())? {
         OpenedWallet::Ready(w) => {
             log("wallet already initialized");
+            log_manifest_alarm(&w);
             print_status(&w);
             return Ok(());
         }
@@ -671,6 +747,19 @@ fn print_status(wallet: &Wallet) {
         params.escrow_amount_sats(),
         params.pre_encumbrance_sats()
     );
+    let manifest = wallet.engine().manifest();
+    if manifest.is_provisional() {
+        println!(
+            "manifest: v0 compiled baseline (PROVISIONAL — a fingerprintable anonymity \
+             partition; see `manifest show`)"
+        );
+    } else {
+        println!(
+            "manifest: v{} (id {})",
+            manifest.current().version(),
+            hex32(&manifest.current().id())
+        );
+    }
 
     let ledger = wallet.engine().ledger();
     let coins = ledger.coins();
@@ -1367,7 +1456,7 @@ fn cmd_restore(flags: &Flags) -> CliResult {
     // Verification open — the acceptance gate: a restored dir must open
     // cleanly, and any store-open alarms must reach the operator NOW.
     let passphrase = read_passphrase(flags, false)?;
-    let mut wallet = match Wallet::open(config, &passphrase) {
+    let mut wallet = match Wallet::open_with_root(config, &passphrase, pinned_root()) {
         Ok(OpenedWallet::Ready(w)) => *w,
         Ok(OpenedWallet::FirstRun(_)) => {
             return Err(
@@ -1382,6 +1471,7 @@ fn cmd_restore(flags: &Flags) -> CliResult {
             .into())
         }
     };
+    log_manifest_alarm(&wallet);
     for action in wallet.open_actions() {
         log(&format!("ALARM (store open): {action:?}"));
     }
@@ -1401,6 +1491,114 @@ fn cmd_restore(flags: &Flags) -> CliResult {
     print_status(&wallet);
     log("restore complete — run `swapkey-cli recover` to re-enter any in-flight swap");
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// manifest — the wallet-side (secret-free) half of the Task-18 trust path.
+// Authoring/signing lives in the SEPARATE swapkey-manifest tool; this wallet
+// binary has no operator-key input path by construction (DECISION 1) and
+// verifies only against its build-time pinned root (DECISION 3). Ingest is
+// CLI-only — deliberately no `serve` endpoint (DECISION 6).
+// ---------------------------------------------------------------------------
+
+fn cmd_manifest(flags: &Flags) -> CliResult {
+    match flags.positional.first().map(String::as_str) {
+        Some("show") => {
+            if flags.positional.len() != 1 {
+                return Err("manifest show takes no further arguments".into());
+            }
+            let wallet = open_ready(flags)?;
+            print_manifest_state(&wallet);
+            Ok(())
+        }
+        Some("ingest") => {
+            let file = match flags.positional.as_slice() {
+                [_, file] => PathBuf::from(file),
+                _ => return Err("manifest ingest takes exactly one argument: the envelope file".into()),
+            };
+            // Exact-length gate BEFORE the read: the envelope is fixed-size
+            // by construction, so anything else is refused without pulling
+            // an arbitrarily large file into memory.
+            let meta = std::fs::metadata(&file)
+                .map_err(|e| format!("manifest file {} unreadable: {e}", file.display()))?;
+            if meta.len() != ENVELOPE_LEN as u64 {
+                return Err(format!(
+                    "not a manifest envelope: expected exactly {ENVELOPE_LEN} bytes, found {}",
+                    meta.len()
+                )
+                .into());
+            }
+            let envelope = std::fs::read(&file)?;
+
+            let mut wallet = open_ready(flags)?;
+            let before = wallet.engine().manifest().current().clone();
+            // The store enforces every gate (BIP340 vs the pinned root, the
+            // ordering invariant, the strictly-monotonic version vs current
+            // AND the persisted floor); refusals surface VERBATIM below.
+            let root = PinnedTrustRoot(PINNED_OPERATOR_XONLY);
+            match wallet.engine_mut().manifest_mut().ingest(&envelope, &root) {
+                Ok(m) if *m == before => {
+                    log(&format!(
+                        "manifest v{} is already current — idempotent re-ingest, no change",
+                        m.version()
+                    ));
+                    Ok(())
+                }
+                Ok(m) => {
+                    log(&format!(
+                        "manifest v{} ACCEPTED (was v{}) — persisted; every future open runs it",
+                        m.version(),
+                        before.version()
+                    ));
+                    print_manifest_state(&wallet);
+                    Ok(())
+                }
+                Err(e) => Err(format!(
+                    "manifest REFUSED: {e} (wallet still on v{}, version floor {})",
+                    wallet.engine().manifest().current().version(),
+                    wallet.engine().manifest().floor()
+                )
+                .into()),
+            }
+        }
+        _ => Err("manifest needs a verb: `manifest show` or `manifest ingest <file>`".into()),
+    }
+}
+
+/// Print the wallet's current signed-params state (the `manifest show` body,
+/// also shown after a successful ingest).
+fn print_manifest_state(wallet: &Wallet) {
+    let store = wallet.engine().manifest();
+    let m = store.current();
+    let p = m.params();
+    println!("manifest version: {}", m.version());
+    println!("id:               {}", hex32(&m.id()));
+    println!("version floor:    {} (persisted; ingest requires a strictly higher version)", store.floor());
+    println!("params:");
+    println!("  tier_d_sats:             {}", p.tier_d_sats);
+    println!("  delta_fee_sats:          {}", p.delta_fee_sats);
+    println!("  anchor_sats:             {}", p.anchor_sats);
+    println!("  setup_fee_sats:          {}", p.setup_fee_sats);
+    println!("  cpfp_reserve_sats:       {}", p.cpfp_reserve_sats);
+    println!("  delta_early:             {}", p.delta_early);
+    println!("  margin:                  {}", p.margin);
+    println!("  delta_buffer:            {}", p.delta_buffer);
+    println!("  claim_confirm_allowance: {}", p.claim_confirm_allowance);
+    println!("  cofunding_window:        {}", p.cofunding_window);
+    println!(
+        "  onboarding_delay_hours:  {}..{}",
+        p.onboarding_delay_hours.0, p.onboarding_delay_hours.1
+    );
+    println!("active posture:   {:?}", m.active_posture());
+    println!("cofunding jitter: {}", m.cofunding_jitter_max());
+    println!("quorum q:         {}", m.quorum_q());
+    if store.is_provisional() {
+        println!(
+            "WARNING: running the version-0 COMPILED BASELINE — v0 wallets form their own \
+             small, fingerprintable anonymity partition. Ingest the operator's current \
+             signed manifest before swapping: swapkey-cli manifest ingest <file>"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1480,6 +1678,13 @@ fn cmd_serve(flags: &Flags) -> CliResult {
     let data_dir = wallet.config().data_dir.clone();
     let mut alarms: Vec<String> =
         wallet.open_actions().iter().map(|a| format!("store open: {a:?}")).collect();
+    // The abnormal manifest-open variants are ALARMS the /status surface must
+    // carry too (stderr alone never reaches the HTML UI): params changed
+    // underneath the user — fallback, rollback, or a transient read failure.
+    match wallet.manifest_open_report() {
+        ManifestOpenReport::ProvisionalFresh | ManifestOpenReport::Loaded { .. } => {}
+        report => alarms.push(format!("manifest open: {report:?}")),
+    }
     let mut reconcile_ok = false;
     if let Some(chain) = &chain {
         reconcile_ok = startup_with_alarms(&mut wallet, chain, &opts)?;
