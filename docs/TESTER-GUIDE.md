@@ -97,7 +97,41 @@ the next one. Highlights and traps:
   taker runs `swap --take <ticket>`. Both sides stay running until
   `SWAP COMPLETED` or a refund resolution.
 
-## 5. The local UI (optional)
+## 5. Connectivity (NAT & reachability)
+
+A swap needs a live TCP link between the two wallets. On one machine (loopback)
+or one LAN this just works. Across the internet — two homes, two offices — the
+**maker** (`swap --make`, or `serve` + `/swap/offer`) runs a listener the
+**taker** must reach, and home routers block inbound connections by default.
+
+* **The ticket must advertise a REACHABLE `host:port`.** `--make 0.0.0.0:9735`
+  binds every interface but the printed ticket cannot carry a dialable
+  address — you'll see a `WARNING: --make advertises a non-dialable host` line.
+  Put the address your partner can actually reach in the `host:port` you pass.
+* **Make the maker reachable — pick ONE:**
+  * **A shared LAN/VPN (simplest).** A mesh VPN (e.g. Tailscale/WireGuard) or
+    both machines on the same Wi-Fi gives each a directly-dialable address —
+    use that VPN/LAN IP in `--make`. No router config.
+  * **Port-forward.** Forward the maker's listen port (TCP) on the router to the
+    maker machine and advertise the maker's PUBLIC IP:port. Only the maker needs
+    this; the taker dials out.
+* **The taker retries a cold dial.** `--take` / `--connect` (and the UI's
+  take/connect) redial a refused/timed-out/unreachable peer a few times
+  (`--connect-retries`, default 4, ~2 s apart), so the taker can start a moment
+  before the maker's listener is up. A retry only ever re-dials the FIRST
+  connection — **nothing is leased or funded until both sides are connected and
+  negotiating**, so a failed dial is free: fix the address and run again.
+* **What a mid-swap drop means.** Once BOTH escrows fund, a dropped link cannot
+  lose funds: the swap routes to its pre-armed refund and your coins come back
+  at the CSV timelock (~24–36 h on testnet; banner item 2). A drop BEFORE
+  funding just ends the attempt with nothing locked — retry.
+* **Reading the failure:** `connection refused` → the maker isn't listening yet
+  (retry, or start the maker first). `timed out` / `no taker reached …` → the
+  address isn't reachable from the other side (NAT/firewall — use a VPN or
+  port-forward). `handshake: peer runs different signed params` is NOT a
+  connectivity problem — see section 7 (manifests).
+
+## 6. The local UI (optional)
 
 ```
 swapkey-cli serve
@@ -108,7 +142,7 @@ talks to `http://127.0.0.1:3316` — loopback only, **no auth** (limitation
 banner applies). Onboarding, tickets, and live swap state all work from the
 page; everything the UI does is also in the CLI.
 
-## 6. Signed parameter manifests
+## 7. Signed parameter manifests
 
 Settlement parameters arrive on a signed, versioned manifest — never from
 your config file. Two commands matter to a tester:
@@ -122,7 +156,7 @@ your config file. Two commands matter to a tester:
   mismatch)` — so when the operator publishes a new manifest, ingest it
   promptly (everyone in a test round runs the same version).
 
-## 7. Backup, restore, and the second-device watchtower
+## 8. Backup, restore, and the second-device watchtower
 
 This is the best fund-safety demo you can run:
 
@@ -160,7 +194,7 @@ Traps the guide must warn you about:
 * `watch --once` does one pass and exits — cron/Task-Scheduler friendly.
   `watch` exits 0 when there's nothing guardable or every exit confirmed.
 
-## 8. Troubleshooting (keyed to the real strings)
+## 9. Troubleshooting (keyed to the real strings)
 
 | You see | It means / do this |
 |---|---|
@@ -181,7 +215,8 @@ Traps the guide must warn you about:
 | `manifest REFUSED: … signature does not verify` | The file isn't signed by the pinned operator root (corrupt download or wrong file). Re-fetch the round's manifest. |
 | `manifest REFUSED: … version must strictly increase` | You already run this (or a newer) version — probably fine; `manifest show` to confirm. |
 | `ALARM (manifest open): ProvisionalFallback/RollbackDetected…` | The stored manifest was tampered/rolled back and quarantined; the wallet fell back to the compiled baseline. Re-ingest the current manifest and REPORT IT. |
-| `no taker presented the ticket before the accept timeout` / `ticket rendezvous failed` | Partner never dialed, dialed the wrong ticket, or your `--make` host isn't reachable from their network. Re-check the advertised `host:port` and firewall. |
+| `no taker reached … before the accept timeout` / `ticket rendezvous failed` | (Maker) Partner never dialed, dialed the wrong ticket, or your `--make` host isn't reachable from their network. Re-check the advertised `host:port` and firewall — section 5 (Connectivity). |
+| `could not reach the peer at …` / `dial … failed` | (Taker) The maker isn't listening yet, or its `host:port` isn't reachable from you (NAT/firewall). `--connect-retries` already redials a few times; if it still fails, fix reachability — section 5 (Connectivity). |
 | `chain reconcile failed — fix the node/data dir before swapping` | The node is unreachable/out of sync. Fix `[node]`/bitcoind first; refusing to swap in that state is deliberate. |
 | `ALARM — RefundStalledBelowFeeFloor: …` | Congestion + no (usable) reserve for the fee bump. If it names `NO leasable reserve exists on this watchtower device`, onboard a deposit there. The refund still fires; only confirmation waits. |
 | `reserve CPFP bumps are gated off` | Startup reconcile failed on the watch device — bumps disabled, refund fires unaffected. Fix the node connection to re-arm bumps. |
@@ -192,7 +227,7 @@ Traps the guide must warn you about:
 | `ALARM: … quarantine` / `unreadable swap record` | A sealed record failed authentication. ALWAYS report this one with `diag` output. |
 | `error: unknown flag …` / `use --flag value, not --flag=value` | Typo protection — flags are strict on purpose. `swapkey-cli help`. |
 
-## 9. Reporting bugs
+## 10. Reporting bugs
 
 1. Run `swapkey-cli diag` and copy the WHOLE block. It is redacted by
    construction — no seed, mnemonic, passphrase, or RPC secrets — and names

@@ -1519,6 +1519,139 @@ fn negotiate_swap_requires_an_onboarded_coin() {
 }
 
 // ============================================================================
+// Task 24: the failure-phase drop matrix. A link can die at each phase boundary;
+// the invariant is pre-funding → free/healed, post-funding → forward-or-refund.
+// The full matrix, and where each cell is proven:
+//   * DIAL drop            → transport.rs (`connect_*` tests, dial retry)
+//   * hello MISMATCH       → negotiate_swap_rejects_a_network_mismatch
+//   * PRE-lease link drop  → a_pre_lease_link_drop_is_a_free_failure (below)
+//   * the LEASE boundary   → negotiate_swap_requires_an_onboarded_coin
+//   * POST-lease/pre-fund  → drop_during_offer_leaves_a_healable_orphan_lease (below)
+//   * POST-funding + drop  → swap_step_funded_abort_babysits_to_refunded
+//   * during BABYSIT       → swap_step_funded_abort_babysits_to_refunded (Wait→
+//                            BroadcastRefund→Refunded), two_concurrent_swaps_…
+// Only the two pre-funding cells were uncovered; these fill them.
+// ============================================================================
+
+/// A peer that ACCEPTS our first frame (the hello send) then hangs up before
+/// replying — the "link dies after hello, before the lease" phase. Every
+/// `recv` fails, so `negotiate_swap` aborts at its hello RECEIVE, strictly
+/// before `lease_pre_encumbrance`.
+struct HangUpAfterHelloRecv;
+impl Transport for HangUpAfterHelloRecv {
+    fn send(&mut self, _bytes: &[u8]) -> Result<()> {
+        Ok(())
+    }
+    fn recv(&mut self) -> Result<Vec<u8>> {
+        Err(Error::Abort("peer hung up"))
+    }
+}
+
+#[test]
+fn a_pre_lease_link_drop_is_a_free_failure() {
+    // PRE-lease free-failure zone: a wallet that COULD fund leases nothing and
+    // persists nothing when the link drops during the hello exchange.
+    let params = Params::testnet_provisional();
+    let chain = SimChain::new(100);
+    let dir = tempfile::tempdir().unwrap();
+    let pre = onboard_unleased(dir.path(), &params, 0xDA); // a fundable coin
+    let mut engine = open_engine(dir.path());
+    let mut io = HangUpAfterHelloRecv;
+
+    let r = negotiate_swap(
+        &mut io,
+        &mut engine,
+        &chain,
+        &FixedClock(u64::MAX),
+        Network::Regtest,
+        dir.path(),
+        Scalar::random(&mut rand::rng()),
+    );
+    assert!(
+        matches!(r, Err(Error::Abort(_))),
+        "a pre-lease drop must abort cleanly (never a lease or a success)"
+    );
+    // FREE FAILURE: nothing leased and the fundable coin is still Unspent — the
+    // drop landed before the lease boundary, so the next attempt reuses it.
+    assert!(
+        engine.ledger().coins().iter().all(|c| c.state != CoinState::Leased),
+        "a pre-lease drop must leave NO leased coin"
+    );
+    assert_eq!(engine.ledger().find(&pre).unwrap().state, CoinState::Unspent);
+}
+
+#[test]
+fn drop_during_offer_leaves_a_healable_orphan_lease() {
+    // POST-lease, PRE-funding: the peer completes the hello exchange (so OUR
+    // side leases its coin) then drops before the offer — after the lease
+    // boundary but before any Setup broadcast, so there is a lease but NO store
+    // record. negotiate must Err, exactly one lease is orphaned, and the
+    // chain-aware heal releases it (serve's in-process reconcile with an EMPTY
+    // keep-set; the one-shot `swap` gets the same release from the next open).
+    let params = Params::testnet_provisional();
+    let base = 500_000u32;
+    let chain = SimChain::new(base);
+    let dir_a = tempfile::tempdir().unwrap(); // under test: has a coin
+    let dir_p = tempfile::tempdir().unwrap(); // peer: no coin
+    let pre_a = onboard_unleased(dir_a.path(), &params, 0xDA);
+    chain.fund_with_amount(pre_a, base, params.pre_encumbrance_sats());
+    {
+        // A real, initialized-but-coinless peer: it sends its hello, receives
+        // ours, then fails at ITS OWN lease and drops — leaving us
+        // mid-negotiation with our coin already leased.
+        let ack = acknowledge_phase0(PHASE0_WARNING).unwrap();
+        Ledger::create(dir_p.path(), &ModeledEnclave, ack).unwrap();
+    }
+    let (mut io_a, mut io_p) = duplex();
+    let hp = {
+        let (dir, chain) = (dir_p.path().to_path_buf(), chain.clone());
+        std::thread::spawn(move || {
+            let mut engine = open_engine(&dir);
+            let _ = negotiate_swap(
+                &mut io_p,
+                &mut engine,
+                &chain,
+                &FixedClock(u64::MAX),
+                Network::Regtest,
+                &dir,
+                Scalar::random(&mut rand::rng()),
+            );
+        })
+    };
+    let mut engine = open_engine(dir_a.path());
+    let r = negotiate_swap(
+        &mut io_a,
+        &mut engine,
+        &chain,
+        &FixedClock(u64::MAX),
+        Network::Regtest,
+        dir_a.path(),
+        Scalar::random(&mut rand::rng()),
+    );
+    hp.join().unwrap();
+    assert!(r.is_err(), "a drop during the offer must fail our negotiate");
+
+    // Exactly one ORPHAN lease (the funding coin), no store record yet.
+    let leased: Vec<OutPoint> = engine
+        .ledger()
+        .coins()
+        .iter()
+        .filter(|c| c.state == CoinState::Leased)
+        .map(|c| c.outpoint)
+        .collect();
+    assert_eq!(leased, vec![pre_a], "exactly one orphaned lease (the funding coin)");
+
+    // The heal releases it — the failed attempt's own sid is NEVER kept, so an
+    // empty keep-set (serve's shape) frees the orphan back to Unspent.
+    engine.reconcile_leases_with_chain_keeping(&chain, &[]).unwrap();
+    assert_eq!(
+        engine.ledger().find(&pre_a).unwrap().state,
+        CoinState::Unspent,
+        "the orphan lease must heal back to Unspent (free after all)"
+    );
+}
+
+// ============================================================================
 // Task 15: swap ticket end-to-end — maker mints a ticket carrying its REAL
 // ephemeral address, taker decodes+validates+dials it, both run the nonce
 // rendezvous, then the UNCHANGED negotiate_swap runs over a loopback

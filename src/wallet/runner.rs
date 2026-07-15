@@ -32,6 +32,26 @@
 //! pre-armed refund rides in the store record; the completion is co-signed in
 //! Phase A and pays a wallet-derived `SwapDestination` key), so losing the
 //! session scalar after the swap strands nothing.
+//!
+//! # The free-failure zone — where a pre-swap failure costs nothing (Task 24)
+//! Everything up to and NOT including the pre-encumbrance LEASE is free: the
+//! dial, the ticket nonce rendezvous, and the `hello` exchange (version /
+//! network / params-digest / session-pubkey) all run before any coin is leased,
+//! any record is written, or the abort-hygiene tracker is touched — so a drop,
+//! refusal, mismatch, or hang anywhere in that window aborts cleanly and leaves
+//! the wallet exactly as it was. That is precisely why a transient DIAL failure
+//! can be redialed (`TcpTransport::connect_retrying`) with no bookkeeping, and
+//! why a bounded dial retry can never tally as a griefing strike.
+//!
+//! The zone ENDS at the `lease_pre_encumbrance` call inside [`negotiate_swap`]:
+//! from that point one coin is `Leased` under the session id, and a later
+//! failure is no longer free — it leaves an ORPHAN lease (no store record yet;
+//! the record only lands with the Setup broadcast) that the next
+//! `SwapEngine::open` reconcile (one-shot `swap`) or the in-process
+//! `reconcile_leases_with_chain_keeping` (serve) releases. After the Setup
+//! broadcast the swap is FUNDED and forward-or-refund owns every exit. INV-2
+//! stands across the whole zone: a failure past the lease is never resumed by
+//! reconnecting — a retry is a fresh swap.
 
 use std::path::Path;
 

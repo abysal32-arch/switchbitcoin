@@ -61,7 +61,10 @@ use swapkey::wallet::runner::{
 };
 use swapkey::wallet::runtime::{FirstRunError, OpenedWallet, Wallet};
 use swapkey::wallet::ticket::{maker_rendezvous, taker_rendezvous, Ticket};
-use swapkey::wallet::transport::TcpTransport;
+use swapkey::wallet::transport::{
+    negotiation_io_timeout, TcpTransport, DEFAULT_CONNECT_RETRIES, DIAL_RETRY_BACKOFF,
+    RENDEZVOUS_LEASH,
+};
 use swapkey::wallet::SoftwareKeyStore;
 use swapkey::wallet::SwapApp;
 
@@ -251,6 +254,10 @@ COMMANDS
             --poll-secs <n>     chain poll cadence (default 5; the peer i/o
                                 deadline scales with it)
             --accept-timeout-secs <n>  --listen wait budget (default 600)
+            --connect-retries <n>  redial a refused/timed-out/unreachable peer
+                                on --connect/--take before giving up (default 4,
+                                ~2s apart); only the FIRST connect retries —
+                                nothing is leased until both sides negotiate
             --assume-congested  manual congestion fallback when the node gives
                                 no estimate: treat a relayed refund as below the
                                 fee floor (fires the silent refund CPFP)
@@ -311,7 +318,8 @@ COMMANDS
   serve     Localhost JSON API for SwapKey-Wallet.html (LOOPBACK ONLY, no
             auth — any local process can drive the wallet; pre-alpha).
             --port <n>          bind 127.0.0.1:<n> (default 3316)
-            --poll-secs / --feerate / --assume-congested as for swap
+            --poll-secs / --feerate / --assume-congested / --connect-retries
+                                as for swap
             --claim-posture <fast|balanced|private>  as for swap (default: the
                                 signed manifest's active posture)
             --max-swaps <n>     concurrent-swap cap (default 4); a swap past
@@ -360,6 +368,7 @@ const VALUE_FLAGS: &[&str] = &[
     "--jitter",
     "--poll-secs",
     "--accept-timeout-secs",
+    "--connect-retries",
     "--port",
     "--claim-posture",
     "--max-swaps",
@@ -445,6 +454,34 @@ fn parse_claim_posture(v: &str) -> Result<ClaimDelayPosture, UsageError> {
 
 fn log(msg: &str) {
     eprintln!("[swapkey] {msg}");
+}
+
+/// A dial-failure message that names the likely cause and points at the guide's
+/// connectivity section (Task 24). Testers hit refused/unreachable far more
+/// often than any protocol error, and a bare transport abort sends them looking
+/// in the wrong place.
+fn dial_failed_hint(addr: &str, e: swapkey::Error) -> UsageError {
+    format!(
+        "could not reach the peer at {addr}: {e}. Likely the maker isn't \
+         listening yet, or its host:port isn't reachable from here (home \
+         NAT/firewall). The maker must advertise a REACHABLE address — \
+         port-forward the listen port, or put both partners on one LAN/VPN. \
+         See docs/TESTER-GUIDE.md, the \"Connectivity\" section."
+    )
+    .into()
+}
+
+/// The maker-side twin: an accept window elapsed with no taker. Usually the
+/// taker never dialed, dialed the wrong ticket, or — most common on home
+/// networks — could not REACH the advertised address.
+fn no_taker_hint(advertised: &str) -> UsageError {
+    format!(
+        "no taker reached {advertised} before the accept timeout. Check the \
+         taker actually dialed, and that your advertised host:port is reachable \
+         from THEIR network (a home connection usually needs a port-forward or a \
+         shared LAN/VPN). See docs/TESTER-GUIDE.md, the \"Connectivity\" section."
+    )
+    .into()
 }
 
 fn prompt_line(msg: &str) -> Result<String, UsageError> {
@@ -997,6 +1034,7 @@ fn cmd_swap(flags: &Flags) -> CliResult {
     let poll_secs: u64 = flags.num("poll-secs", 5)?;
     let poll = Duration::from_secs(poll_secs);
     let accept_timeout = Duration::from_secs(flags.num("accept-timeout-secs", 600)?);
+    let connect_retries: u32 = flags.num("connect-retries", DEFAULT_CONNECT_RETRIES)?;
 
     let mut wallet = open_ready(flags)?;
     // Operator claim-delay posture override (else the signed manifest's active
@@ -1052,12 +1090,13 @@ fn cmd_swap(flags: &Flags) -> CliResult {
         loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
-                return Err("no taker presented the ticket before the accept timeout".into());
+                return Err(no_taker_hint(&make_addr));
             }
-            let mut t = TcpTransport::accept_timeout(&listener, remaining)?;
+            let mut t = TcpTransport::accept_timeout(&listener, remaining)
+                .map_err(|_| no_taker_hint(&make_addr))?;
             // Short leash for the rendezvous so a silent dialer can't hang us.
             match t
-                .set_io_timeout(Some(Duration::from_secs(10)))
+                .set_io_timeout(Some(RENDEZVOUS_LEASH))
                 .and_then(|()| maker_rendezvous(&mut t, &ticket.nonce))
             {
                 Ok(()) => {
@@ -1074,9 +1113,14 @@ fn cmd_swap(flags: &Flags) -> CliResult {
         // BEFORE dialing — a mismatch is a clean refusal, not a hung socket.
         let ticket = Ticket::decode(take_str.trim())?;
         ticket.validate(network, wallet.params())?;
-        log(&format!("dialing swap-ticket peer at {}", ticket.addr()));
-        let mut t = TcpTransport::connect(ticket.addr())?;
-        t.set_io_timeout(Some(Duration::from_secs(10)))?;
+        let addr = ticket.addr();
+        log(&format!("dialing swap-ticket peer at {addr}"));
+        let mut t =
+            TcpTransport::connect_retrying(&addr, connect_retries, DIAL_RETRY_BACKOFF, &mut |m| {
+                log(&m)
+            })
+            .map_err(|e| dial_failed_hint(&addr, e))?;
+        t.set_io_timeout(Some(RENDEZVOUS_LEASH))?;
         taker_rendezvous(&mut t, &ticket.nonce)?;
         log("ticket rendezvous ok — negotiating");
         t
@@ -1101,13 +1145,20 @@ fn cmd_swap(flags: &Flags) -> CliResult {
         match (listen, connect) {
             (_, Some(addr)) => {
                 log(&format!("connecting to peer {addr}"));
-                TcpTransport::connect(addr.as_str())?
+                TcpTransport::connect_retrying(
+                    addr.as_str(),
+                    connect_retries,
+                    DIAL_RETRY_BACKOFF,
+                    &mut |m| log(&m),
+                )
+                .map_err(|e| dial_failed_hint(&addr, e))?
             }
             (Some(addr), None) => {
                 let listener = std::net::TcpListener::bind(addr.as_str())
                     .map_err(|e| format!("bind {addr}: {e}"))?;
                 log(&format!("listening on {addr} (waiting up to {}s)", accept_timeout.as_secs()));
-                TcpTransport::accept_timeout(&listener, accept_timeout)?
+                TcpTransport::accept_timeout(&listener, accept_timeout)
+                    .map_err(|_| no_taker_hint(&addr))?
             }
             (None, None) => {
                 return Err(
@@ -1122,7 +1173,7 @@ fn cmd_swap(flags: &Flags) -> CliResult {
     // scale with it (a fixed budget under a large --poll-secs would abort
     // healthy funded swaps to refund; Fable review). This ALSO restores the
     // normal budget after any short ticket-rendezvous leash above.
-    let io_timeout = Duration::from_secs(120.max(poll_secs.saturating_mul(3)));
+    let io_timeout = negotiation_io_timeout(poll);
     transport.set_io_timeout(Some(io_timeout))?;
 
     // Ephemeral session key (module docs in wallet::runner).
@@ -1887,6 +1938,7 @@ fn cmd_serve(flags: &Flags) -> CliResult {
     if max_swaps == 0 {
         return Err("--max-swaps must be at least 1".into());
     }
+    let connect_retries: u32 = flags.num("connect-retries", DEFAULT_CONNECT_RETRIES)?;
 
     let mut wallet = open_ready(flags)?;
     // Operator claim-delay posture override (else the signed manifest's active
@@ -1949,7 +2001,7 @@ fn cmd_serve(flags: &Flags) -> CliResult {
 
     serve_worker(
         &mut wallet, chain.as_ref(), network, &data_dir, &state, rx, &opts, poll,
-        block_x_delta, jitter, reconcile_ok, alarms, max_swaps,
+        block_x_delta, jitter, connect_retries, reconcile_ok, alarms, max_swaps,
     )
 }
 
@@ -1987,6 +2039,7 @@ fn serve_worker(
     poll: Duration,
     block_x_delta: u32,
     jitter: u32,
+    connect_retries: u32,
     reconcile_ok: bool,
     alarms: Vec<String>,
     max_swaps: usize,
@@ -2039,7 +2092,8 @@ fn serve_worker(
                     // route/worker count race) and dispatch into a NEW slot.
                     if let Some(slot) = dispatch_swap(
                         cmd, wallet, chain, network, data_dir, state, poll, block_x_delta,
-                        jitter, reconcile_ok, max_swaps, &slots, &mut pending_seq, &mut sink,
+                        jitter, connect_retries, reconcile_ok, max_swaps, &slots,
+                        &mut pending_seq, &mut sink,
                     ) {
                         slots.push(slot);
                     }
@@ -2180,6 +2234,7 @@ fn dispatch_swap(
     poll: Duration,
     block_x_delta: u32,
     jitter: u32,
+    connect_retries: u32,
     reconcile_ok: bool,
     max_swaps: usize,
     slots: &[Slot],
@@ -2209,13 +2264,21 @@ fn dispatch_swap(
     let next = match cmd {
         ApiCmd::SwapBegin { listen, connect } => {
             if let Some(addr) = connect {
-                match TcpTransport::connect(addr.as_str()) {
+                match TcpTransport::connect_retrying(
+                    addr.as_str(),
+                    connect_retries,
+                    DIAL_RETRY_BACKOFF,
+                    sink,
+                ) {
                     Ok(t) => begin_swap(
                         wallet, chain, network, data_dir, t, poll, block_x_delta, jitter,
                         state, &mut active, &live, sink,
                     ),
                     Err(e) => {
-                        sink(format!("connect {addr} failed: {e}"));
+                        sink(format!(
+                            "dial {addr} failed: {e} — is the maker listening and its \
+                             host:port reachable? (NAT/port-forward: TESTER-GUIDE Connectivity)"
+                        ));
                         Live::Idle
                     }
                 }
@@ -2270,8 +2333,8 @@ fn dispatch_swap(
             }
         }
         ApiCmd::SwapTake { ticket } => take_ticket(
-            wallet, chain, network, data_dir, &ticket, poll, block_x_delta, jitter, state,
-            &mut active, &live, sink,
+            wallet, chain, network, data_dir, &ticket, poll, block_x_delta, jitter,
+            connect_retries, state, &mut active, &live, sink,
         ),
         ApiCmd::Onboard { .. } => Live::Idle, // routed elsewhere; unreachable
     };
@@ -2359,6 +2422,7 @@ fn take_ticket(
     poll: Duration,
     block_x_delta: u32,
     jitter: u32,
+    connect_retries: u32,
     state: &SharedState,
     active: &mut Option<String>,
     live: &[[u8; 32]],
@@ -2375,16 +2439,21 @@ fn take_ticket(
         sink(format!("swap take refused: {e}"));
         return Live::Idle;
     }
-    let mut t = match TcpTransport::connect(ticket.addr()) {
+    let addr = ticket.addr();
+    let mut t = match TcpTransport::connect_retrying(&addr, connect_retries, DIAL_RETRY_BACKOFF, sink)
+    {
         Ok(t) => t,
         Err(e) => {
-            sink(format!("dial {} failed: {e}", ticket.addr()));
+            sink(format!(
+                "dial {addr} failed: {e} — is the maker listening and reachable? \
+                 (NAT/port-forward: TESTER-GUIDE Connectivity)"
+            ));
             return Live::Idle;
         }
     };
     // Short leash for the rendezvous so a silent maker can't hang us; begin_swap
     // restores the normal poll-scaled budget.
-    if let Err(e) = t.set_io_timeout(Some(Duration::from_secs(10))) {
+    if let Err(e) = t.set_io_timeout(Some(RENDEZVOUS_LEASH)) {
         sink(format!("transport setup failed: {e}"));
         return Live::Idle;
     }
@@ -2420,7 +2489,7 @@ fn begin_swap(
     // This slot's view key while the sid is still unknown (unique per slot —
     // two negotiating slots must not share one "pending" view entry).
     let pending_key = active.clone().unwrap_or_else(|| "pending".to_string());
-    let io_timeout = Duration::from_secs(120.max(poll.as_secs().saturating_mul(3)));
+    let io_timeout = negotiation_io_timeout(poll);
     if let Err(e) = transport.set_io_timeout(Some(io_timeout)) {
         sink(format!("transport setup failed: {e}"));
         return Live::Idle;
@@ -2504,7 +2573,7 @@ fn step_live(
                     // we keep accepting until the deadline — a scan must never
                     // burn the offer.
                     Some(nonce) => {
-                        if let Err(e) = t.set_io_timeout(Some(Duration::from_secs(10))) {
+                        if let Err(e) = t.set_io_timeout(Some(RENDEZVOUS_LEASH)) {
                             sink(format!("transport setup failed ({e}); still offering"));
                             return Live::Accepting { listener, deadline, expected_nonce };
                         }
