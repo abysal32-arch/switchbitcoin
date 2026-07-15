@@ -793,6 +793,7 @@ fn cmd_reseal(flags: &Flags) -> CliResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use swapkey::wallet::manifest::{modeled_operator_seckey, ManifestStore, ModeledTrustRoot};
 
     /// Low work factor for the seal-format tests; the CLI layer always uses
@@ -1088,5 +1089,51 @@ cofunding_jitter_max = "6"
         assert!(unseal_operator_key(&path, "old").is_err(), "old passphrase must stop working");
         let re = unseal_operator_key(&path, "new").unwrap();
         assert_eq!(xonly_of(&re).unwrap(), xonly_of(&seckey).unwrap(), "same keypair");
+    }
+
+    // -- Task 23: hostile-input property sweep of the params-TOML parser ------
+
+    proptest! {
+        /// Arbitrary authoring text: the params-TOML parser is TOTAL — every
+        /// string maps to Ok|Err, never a panic (the section/key/quote grammar
+        /// is hand-rolled, so this is its fuzz contract).
+        #[test]
+        fn params_toml_parse_is_total(text in ".{0,600}") {
+            let _ = parse_params_toml(&text);
+        }
+
+        /// The same, one hop up: composing from an arbitrary file never panics
+        /// (parse → per-key numeric conversion → the wallet's own invariants).
+        #[test]
+        fn compose_from_file_is_total(text in ".{0,600}") {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("params.toml");
+            std::fs::write(&p, &text).unwrap();
+            let _ = compose_from_file(&p);
+        }
+
+        /// A secret placed ONLY in VALUE position never appears in a parse
+        /// error (the "names keys + line numbers, never values" discipline the
+        /// wallet config parser established — a leaked value can be a secret).
+        /// The sentinel is alphanumeric so it cannot terminate a quote or pose
+        /// as structure, and every template keeps it strictly a value.
+        #[test]
+        fn params_toml_errors_never_echo_a_value(
+            sentinel in "[a-zA-Z0-9]{4,40}",
+            template in 0usize..5,
+        ) {
+            let text = match template {
+                0 => format!("foo = \"{sentinel}\"\n"),              // unknown key
+                1 => format!("quorum_q = \"3\"\nquorum_q = \"{sentinel}\"\n"), // duplicate key
+                2 => format!("version = \"{sentinel}\n"),            // unterminated string
+                3 => format!("version = \"{sentinel}\" junk\n"),     // trailing chars
+                _ => format!("version = {sentinel}\n"),              // unquoted value
+            };
+            let err = parse_params_toml(&text).expect_err("each template must error");
+            prop_assert!(
+                !err.0.contains(&sentinel),
+                "error echoed the value {:?}: {}", sentinel, err.0
+            );
+        }
     }
 }

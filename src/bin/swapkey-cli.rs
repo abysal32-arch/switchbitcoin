@@ -2726,6 +2726,7 @@ fn serve_onboard(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     /// Task-20 shippability: THIS build's pin must be a valid x-only key and
     /// must NOT be the publicly-known modeled/test root. If this fails, the
@@ -2738,5 +2739,80 @@ mod tests {
             "unshippable pin: {:?}",
             test_root_reason()
         );
+    }
+
+    // -- Task 23: hostile-input sweep of the argv parser + the parse_* helpers.
+    // The CLI is the one surface a tester drives BY HAND, so a fat-fingered
+    // flag must be a clean usage error, never a panic. These functions are the
+    // whole tester-facing argv attack surface (Flags::parse gates everything).
+
+    fn argv(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn flags_parse_rejects_malformed_argv_cleanly() {
+        // A value flag with no following value.
+        assert!(Flags::parse(&argv(&["--config"])).is_err());
+        // The `--flag=value` form is refused (we take `--flag value`).
+        assert!(Flags::parse(&argv(&["--config=x"])).is_err());
+        // Unknown / misspelled flag: hard error, never silently ignored (a
+        // typo'd --dry-run must not run a live swap).
+        assert!(Flags::parse(&argv(&["--dry-runn"])).is_err());
+        assert!(Flags::parse(&argv(&["--unknown"])).is_err());
+        // A value flag given twice.
+        assert!(Flags::parse(&argv(&["--config", "a", "--config", "b"])).is_err());
+        // A well-formed mix parses: positional + value flag + known switch.
+        // (UsageError is not Debug, so match rather than unwrap.)
+        match Flags::parse(&argv(&["pos", "--listen", "1.2.3.4:9", "--dry-run"])) {
+            Ok(f) => {
+                assert_eq!(f.positional, vec!["pos".to_string()]);
+                assert_eq!(f.value("listen"), Some("1.2.3.4:9"));
+                assert!(f.switch("dry-run"));
+                assert!(!f.switch("assume-congested"));
+            }
+            Err(_) => panic!("a well-formed argv must parse"),
+        }
+    }
+
+    #[test]
+    fn parse_helpers_reject_malformed_input_cleanly() {
+        // outpoint
+        assert!(parse_outpoint("no-colon").is_err());
+        assert!(parse_outpoint("nothex:0").is_err());
+        assert!(parse_outpoint(":").is_err());
+        assert!(parse_outpoint(&format!("{}:x", "ab".repeat(32))).is_err()); // bad vout
+        assert!(parse_outpoint(&format!("{}:0", "ab".repeat(32))).is_ok());
+        // host:port (the LAST colon splits, so IPv4/hostnames work)
+        assert!(split_host_port("no-port").is_err());
+        assert!(split_host_port("h:99999").is_err()); // > u16
+        assert!(split_host_port("h:-1").is_err());
+        assert!(
+            matches!(split_host_port("1.2.3.4:9735"), Ok((ref h, 9735)) if h == "1.2.3.4"),
+            "a valid host:port must split"
+        );
+        // claim posture
+        assert!(parse_claim_posture("balanced").is_ok());
+        assert!(parse_claim_posture("YOLO").is_err());
+        assert!(parse_claim_posture("").is_err());
+    }
+
+    proptest! {
+        /// Arbitrary argv strings: Flags::parse is TOTAL (Ok|Err, never a
+        /// panic) — the front door every subcommand goes through.
+        #[test]
+        fn flags_parse_is_total_on_arbitrary_argv(
+            args in proptest::collection::vec(".*", 0..8),
+        ) {
+            let _ = Flags::parse(&args);
+        }
+
+        /// Arbitrary strings into each argument parser: total.
+        #[test]
+        fn parse_helpers_are_total(s in ".*") {
+            let _ = parse_outpoint(&s);
+            let _ = split_host_port(&s);
+            let _ = parse_claim_posture(&s);
+        }
     }
 }
