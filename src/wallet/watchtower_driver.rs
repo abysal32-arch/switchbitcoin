@@ -730,6 +730,55 @@ mod tests {
         );
     }
 
+    /// Task 22: the refund fire gate RE-DERIVES maturity from the CURRENT chain
+    /// funding height, so a reorg is safe in BOTH directions. A reorg that
+    /// un-confirms the escrow at maturity holds the fire (Idle — never fires
+    /// against a vanished confirmation), and a re-confirmation LATER pushes
+    /// maturity forward to match (still immature at the old height), then fires
+    /// at the real, re-derived maturity. A reorg may DELAY the exit, never fire
+    /// it early.
+    #[test]
+    fn reorg_unconfirm_holds_the_fire_then_reconfirm_reshifts_maturity() {
+        let escrow = op(3);
+        let csv = 144u16;
+        let funding = 700_000u32;
+        let maturity = funding + csv as u32; // 700_144
+        let chain = SimChain::new(funding);
+        chain.fund(escrow, funding);
+        let refund =
+            PreArmedRefund::from_signed_tx(spend_of(escrow, 990_000, Some(csv)), maturity).unwrap();
+        let receipt = confirm_watchtower_handoff(&refund, refund.fingerprint()).unwrap();
+        let driver = WatchtowerDriver::arm(refund, escrow, &receipt).unwrap();
+
+        // Mine to maturity: unspent + matured → would fire.
+        while chain.tip_height() < maturity {
+            chain.mine();
+        }
+        // …but a reorg orphans the funding block at that instant: with no
+        // authoritative funding height the fire gate HOLDS.
+        chain.unconfirm_funding(escrow);
+        assert_eq!(
+            driver.tick(&chain, false).unwrap(),
+            WatchtowerTick::Idle,
+            "un-confirmed funding: hold, never fire against a vanished confirmation"
+        );
+
+        // The funding re-confirms 2 blocks LATER than it first did: the real
+        // maturity is now funding+2+csv = 700_146, so at tip 700_144 it is once
+        // more immature — the anchor followed the chain, it was not left stale.
+        chain.reconfirm_funding_at(escrow, funding + 2);
+        assert_eq!(
+            driver.tick(&chain, false).unwrap(),
+            WatchtowerTick::Idle,
+            "re-derived maturity moved forward with the re-confirmation"
+        );
+        // At the real re-derived maturity it fires.
+        while chain.tip_height() < funding + 2 + csv as u32 {
+            chain.mine();
+        }
+        assert_eq!(driver.tick(&chain, false).unwrap(), WatchtowerTick::FiredRefund);
+    }
+
     /// F3 counter-case: a COUNTERPARTY completion in the mempool must NEVER be
     /// bumped, even under congestion — we never CPFP against a possible
     /// completion (that would fight our own paid leg).

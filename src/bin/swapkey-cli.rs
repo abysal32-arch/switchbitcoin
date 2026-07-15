@@ -1195,6 +1195,17 @@ fn cmd_swap(flags: &Flags) -> CliResult {
             }
             Err(e) => return Err(e.into()),
         }
+        // Task 22: on testnet4 a reorg is routine (regtest never reorged under
+        // us). The drivers HOLD conservatively through one — but a silent hold
+        // looks like a hang, so surface it loudly. Pure observation; the poll
+        // above owns every decision.
+        if iter.is_multiple_of(6) {
+            if let Ok(Some(rec)) = wallet.engine().store().get(&sid) {
+                if let Some(sig) = swapkey::wallet::observe_reorg(&rec, &chain) {
+                    log(&sig.describe(&sid));
+                }
+            }
+        }
         if let Err(e) = backstop_step(&app, wallet.engine_mut(), &chain, &opts, &mut sink) {
             log(&format!("backstop pass failed (retrying next poll): {e}"));
         }

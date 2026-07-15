@@ -106,6 +106,7 @@ pub mod ledger;
 pub mod manifest;
 pub mod orchestrator;
 pub mod recovery_driver;
+pub mod reorg;
 pub mod runner;
 pub mod store;
 pub mod ticket;
@@ -119,6 +120,7 @@ pub use backstop_driver::{
 pub use driver::{DriveStatus, SwapDriver};
 pub use funding_driver::{FundingDriver, FundingTick, HandoffError};
 pub use recovery_driver::{RecoveryDriver, RecoveryTick};
+pub use reorg::{observe as observe_reorg, EscrowSide, ReorgSignal};
 pub use manifest::{
     inspect_envelope, ClaimDelayPosture, ManifestOpenReport, ManifestStore, ManifestTrustRoot,
     ModeledTrustRoot, PinnedTrustRoot, SignedManifest,

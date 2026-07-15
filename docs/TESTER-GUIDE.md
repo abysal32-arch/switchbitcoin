@@ -28,6 +28,10 @@ tells you exactly how to report what breaks.
   posture working — leave the wallet running.
 * **Onboarding delays are real on testnet**: newly onboarded coins become
   swappable only after a randomized 24–72 h decorrelation delay.
+* **testnet4 REORGS are routine** — multi-block reorgs happen there (regtest
+  never reorged). If a `reorg detected: … HOLDING …` line appears mid-swap,
+  the wallet is deliberately pausing until the orphaned confirmation settles.
+  A reorg can only ever DELAY an exit, never fire one early. Leave it running.
 
 ## 2. Install
 
@@ -163,6 +167,8 @@ Traps the guide must warn you about:
 | `swept escrow carries the wrong refund CSV (extract-and-race guard); refund` | The ~50% role/CSV convention mismatch (banner item 2). The swap closes through refunds. Retry a fresh swap. |
 | `swap routed to the refund exit: …` then `refund path resolved` | Normal refund closure. Funds return at CSV maturity; leave the wallet running (or `recover` later). |
 | `holding the SL claim until height N` | Privacy hold, not a hang. Keep running; on regtest, keep mining. |
+| `reorg detected: … funding for … un-confirmed; HOLDING …` | A testnet4 reorg orphaned a confirmation your live swap depends on. The wallet holds until it re-confirms — the safety system working (a reorg can only delay an exit, never fire one early). Keep the wallet running; report only if it never clears. |
+| `reorg detected: swept-escrow funding … re-confirmed at height N (was M)` | A reorg re-confirmed a funding at a new height. Chain-derived deadlines (the refund CSV) re-derive from the current chain automatically. Informational — keep running; include the line if you file a bug. |
 | `another process holds this swap store (single-instance)` | Two processes on one data dir (often `serve` + `swap`, or `watch` on the primary dir). One wallet process per dir. |
 | `wallet onboarding is incomplete — run swapkey-cli init first` | `init` never finished (mnemonic retype/Phase-0). Re-run `init`. |
 | `keystore: wrong passphrase or corrupted file` | Wrong passphrase (retype; NFC quirks are normalized) — or real file damage: restore `keystore.bin` from backup / `init --restore` from the mnemonic. |

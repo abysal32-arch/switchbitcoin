@@ -840,6 +840,76 @@ fn terminal_records_are_revalidated_against_reorg() {
     }
 }
 
+/// Task 22: the SAME re-validation driven by an ACTUAL reorg on ONE chain (the
+/// new `SimChain` reorg primitives) rather than a fresh already-reverted
+/// fixture — the faithful testnet4 model. A confirmed completion reads
+/// `Settled`; `unconfirm_spend` returns it to the mempool (its block orphaned)
+/// → recovery re-drives (rebroadcast the persisted signature), never a stale
+/// `Settled`; re-mining re-confirms it → `Settled` again, no panic across the
+/// round-trip.
+#[test]
+fn completed_record_survives_an_actual_reorg_round_trip() {
+    let params = Params::testnet_provisional();
+    let s_height = 810_000u32;
+    let unit = params.escrow_amount_sats();
+
+    let a = keypair();
+    let b = keypair();
+    let internal = swapkey::settlement::state_machine::canonical_internal_key(a.pk, b.pk).unwrap();
+    let escrow = Escrow::new(&internal, &a.pk, params.delta_early).unwrap();
+    let dest = escrow.funding_script_pubkey().clone();
+    let our_escrow = OutPoint::new(txid_from(0x54), 0);
+    let their_escrow = OutPoint::new(txid_from(0x55), 0);
+    let refund = PreArmedRefund::arm(
+        &escrow, our_escrow, unit, &a.sk, dest, params.tier_d_sats, params.anchor_sats, s_height,
+    )
+    .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _) = SwapStore::open(dir.path(), &ModeledEnclave).unwrap();
+    let rec = SwapRecord {
+        swap_session_id: [0x64u8; 32],
+        role: Role::SecretHolder,
+        phase: SwapPhase::Completed,
+        params: params.clone(),
+        s_height,
+        sweep_escrow_height: s_height,
+        our_escrow_outpoint: Some(our_escrow),
+        their_escrow_outpoint: Some(their_escrow),
+        pre_armed_refund: Some(refund),
+        completion_tx: Some(vec![0xcdu8; 64]),
+        setup_tx: None,
+        possession_record: None,
+    };
+
+    let chain = SimChain::new(s_height);
+    chain.fund(their_escrow, s_height);
+    // Our completion (key-path witness == the persisted sig) sweeps + confirms.
+    chain.broadcast(&spend_with_witness(their_escrow, unit - 500, Some([0xcdu8; 64]))).unwrap();
+    chain.mine();
+    assert_eq!(
+        RecoveryDriver::reenter_one(&store, &rec, &chain).unwrap(),
+        RecoveryTick::Settled
+    );
+
+    // An ACTUAL reorg orphans the completion's block: it returns to the mempool.
+    chain.unconfirm_spend(their_escrow);
+    match RecoveryDriver::reenter_one(&store, &rec, &chain).unwrap() {
+        RecoveryTick::Rebroadcast { final_sig, confirmed: false } => {
+            assert_eq!(final_sig, [0xcdu8; 64])
+        }
+        other => panic!("a reorg-reverted Completed must rebroadcast, got {other:?}"),
+    }
+
+    // Re-mine: the completion re-confirms → Settled again (no panic, no stale
+    // terminal across the reorg round-trip).
+    chain.mine();
+    assert_eq!(
+        RecoveryDriver::reenter_one(&store, &rec, &chain).unwrap(),
+        RecoveryTick::Settled
+    );
+}
+
 /// Spend-attribution cluster (Feature-3 audit, HIGH): a confirmed FOREIGN
 /// spend of the swept escrow — the counterparty's own refund of the escrow we
 /// were sweeping — must never be read as OUR completion. `reenter_completing`

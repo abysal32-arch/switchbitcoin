@@ -189,6 +189,13 @@ struct Inner {
     height: u32,
     /// funding outpoint -> (confirmation height, output amount in sats)
     funded: HashMap<OutPoint, (u32, u64)>,
+    /// Funding outpoints that have UN-CONFIRMED (a reorg orphaned their block):
+    /// the amount is retained so a re-confirmation can restore the outpoint at a
+    /// NEW height. While here, `funding_height`/`funding_amount`/`funding_spk`
+    /// all read as "not confirmed" (the reorg-safe conservative direction — a
+    /// vanished confirmation must never keep reading confirmed). See the reorg
+    /// primitives (`unconfirm_funding`/`reconfirm_funding_at`/`rewind_to`).
+    funding_mempool: HashMap<OutPoint, u64>,
     /// escrow outpoint -> (spending txid, confirmed height | None = mempool, fee)
     spends: HashMap<OutPoint, (Txid, Option<u32>, u64)>,
     /// Broadcast transactions, so a CONFIRMED tx's outputs become spendable
@@ -403,6 +410,7 @@ impl SimChain {
         SimChain(Arc::new(Mutex::new(Inner {
             height: genesis_height,
             funded: HashMap::new(),
+            funding_mempool: HashMap::new(),
             spends: HashMap::new(),
             txs: HashMap::new(),
             congestion_min_fee: 0,
@@ -465,13 +473,16 @@ impl SimChain {
             }
         }
         // Register the outputs of confirmed txs as fundable outpoints (a Setup's
-        // escrow output, a completion's D output, etc.).
+        // escrow output, a completion's D output, etc.). A tx re-confirming
+        // AFTER a reorg (its spend entry went back to mempool and now confirms
+        // again) re-registers its outputs at the NEW height and clears any
+        // funding-mempool shadow left by `rewind_to`/`unconfirm_funding`.
         for txid in newly_confirmed {
             if let Some(tx) = g.txs.get(&txid).cloned() {
                 for (vout, out) in tx.output.iter().enumerate() {
-                    g.funded
-                        .entry(OutPoint::new(txid, vout as u32))
-                        .or_insert((h, out.value.to_sat()));
+                    let op = OutPoint::new(txid, vout as u32);
+                    g.funding_mempool.remove(&op);
+                    g.funded.entry(op).or_insert((h, out.value.to_sat()));
                 }
             }
         }
@@ -491,6 +502,97 @@ impl SimChain {
         if let Some((txid, None, _fee)) = g.spends.get(&outpoint).copied() {
             g.remove_mempool_tx(&txid);
         }
+    }
+
+    // ===== Reorg primitives (Task 22) ======================================
+    //
+    // Regtest never reorged under us; testnet4 does routinely (multi-block
+    // reorgs + spy/spam waves). These model exactly what a reorg does to the
+    // facts every height-anchored deadline reads: a "confirmed" funding can
+    // vanish, a confirmed spend can return to the mempool, the tip can move
+    // BACKWARDS, and the SAME outpoint can re-confirm at a DIFFERENT height
+    // (the dangerous case — a silently-shifted anchor). The real
+    // `BitcoinCoreChainView` already surfaces these truths (block-hash binding +
+    // per-query revalidation, module docs); these primitives let the driver
+    // audit (`docs/reorg-audit.md`) prove forward-or-refund holds against them.
+
+    /// Un-confirm a funding output — its block was orphaned and the funding tx
+    /// is back in the mempool. `funding_height`/`funding_amount`/`funding_spk`
+    /// now read "not confirmed" (the conservative direction: a vanished
+    /// confirmation must never keep reading confirmed). The amount is retained
+    /// so [`reconfirm_funding_at`](Self::reconfirm_funding_at) can restore it at
+    /// a new height. No-op on an outpoint that is not confirmed-funded.
+    pub fn unconfirm_funding(&self, outpoint: OutPoint) {
+        let mut g = self.0.lock().unwrap();
+        if let Some((_h, amount)) = g.funded.remove(&outpoint) {
+            g.funding_mempool.insert(outpoint, amount);
+        }
+    }
+
+    /// Re-confirm a previously un-confirmed (or already-confirmed) funding
+    /// output at `height` — the SAME outpoint re-entering the chain at a new
+    /// height, which is the anchor-shift hazard every cached height must be
+    /// audited against. The retained amount is restored; the tip advances to
+    /// `height` if it lagged. No-op if the outpoint was never funded.
+    pub fn reconfirm_funding_at(&self, outpoint: OutPoint, height: u32) {
+        let mut g = self.0.lock().unwrap();
+        let amount = g
+            .funding_mempool
+            .remove(&outpoint)
+            .or_else(|| g.funded.get(&outpoint).map(|(_, a)| *a));
+        if let Some(amount) = amount {
+            g.funded.insert(outpoint, (height, amount));
+            if height > g.height {
+                g.height = height;
+            }
+        }
+    }
+
+    /// Un-confirm a spend of `outpoint` — its block was orphaned and the
+    /// spending tx returns to the mempool (`InMempool`). A subsequent
+    /// [`mine`](Self::mine) re-confirms it at the NEW height. No-op if the
+    /// outpoint is unspent or the spend is already unconfirmed.
+    pub fn unconfirm_spend(&self, outpoint: OutPoint) {
+        let mut g = self.0.lock().unwrap();
+        if let Some(entry) = g.spends.get_mut(&outpoint) {
+            entry.1 = None;
+        }
+    }
+
+    /// Rewind the tip to `new_tip`, orphaning every block above it: confirmed
+    /// spends confirmed above `new_tip` return to the mempool, and fundings
+    /// confirmed above `new_tip` un-confirm (retaining their amounts for
+    /// re-confirmation). A later [`mine`](Self::mine) re-confirms the
+    /// returned-to-mempool spends at the new heights — possibly DIFFERENT from
+    /// the orphaned ones, which is the whole point. No-op unless `new_tip` is
+    /// strictly below the current tip.
+    pub fn rewind_to(&self, new_tip: u32) {
+        let mut g = self.0.lock().unwrap();
+        if new_tip >= g.height {
+            return;
+        }
+        g.height = new_tip;
+        for (_op, (_txid, conf, _fee)) in g.spends.iter_mut() {
+            if matches!(conf, Some(h) if *h > new_tip) {
+                *conf = None;
+            }
+        }
+        let orphaned: Vec<(OutPoint, u64)> = g
+            .funded
+            .iter()
+            .filter(|(_op, (h, _amt))| *h > new_tip)
+            .map(|(op, (_h, amt))| (*op, *amt))
+            .collect();
+        for (op, amt) in orphaned {
+            g.funded.remove(&op);
+            g.funding_mempool.insert(op, amt);
+        }
+    }
+
+    /// Rewind the tip by `blocks` (convenience over [`rewind_to`](Self::rewind_to)).
+    pub fn rewind(&self, blocks: u32) {
+        let new_tip = self.0.lock().unwrap().height.saturating_sub(blocks);
+        self.rewind_to(new_tip);
     }
 
     /// Submit a 1P1C package (`submitpackage` / opportunistic package relay):
@@ -1514,5 +1616,121 @@ mod tests {
         let mut fixed = tx.clone();
         fixed.output[1].value = Amount::from_sat(DUST_P2A_SATS);
         assert!(check_tx(&fixed, 5_000, &ctx, 0, None).is_ok());
+    }
+
+    // ===== Reorg primitives (Task 22) =======================================
+
+    /// A funding that un-confirms reads NOT confirmed across every funding-read
+    /// method (height/amount/spk) — never a stale "still confirmed".
+    #[test]
+    fn unconfirm_funding_reads_not_confirmed_then_reconfirm_restores() {
+        let chain = SimChain::new(100);
+        chain.fund_with_spk(op(0), 100, 50_000, p2tr_spk(0x30));
+        assert_eq!(chain.funding_height(op(0)), Some(100));
+        assert_eq!(chain.funding_amount(op(0)), Some(50_000));
+        assert!(chain.funding_spk(op(0)).is_some());
+
+        // Reorg orphans the funding block.
+        chain.unconfirm_funding(op(0));
+        assert_eq!(chain.funding_height(op(0)), None, "vanished funding must read unconfirmed");
+        assert_eq!(chain.funding_amount(op(0)), None);
+        assert_eq!(chain.funding_spk(op(0)), None, "no spk while unconfirmed");
+
+        // Re-confirm at a DIFFERENT height (the anchor-shift hazard): the amount
+        // and spk return, now anchored at the new height.
+        chain.reconfirm_funding_at(op(0), 97);
+        assert_eq!(chain.funding_height(op(0)), Some(97));
+        assert_eq!(chain.funding_amount(op(0)), Some(50_000));
+        assert!(chain.funding_spk(op(0)).is_some());
+    }
+
+    /// A relative-timelock (CSV) spend of an escrow whose funding has
+    /// UN-CONFIRMED is refused: a reorg can never let an exit through a vanished
+    /// confirmation (the conservative direction — delay, never accelerate).
+    #[test]
+    fn csv_spend_against_unconfirmed_funding_is_refused() {
+        let chain = SimChain::new(200);
+        chain.fund(op(1), 100);
+        let refund = spend_tx(op(1), Sequence::from_height(10));
+        // Matured against the confirmed funding (100 elapsed): accepted.
+        assert!(chain.broadcast(&refund).is_ok());
+        // A fresh chain where the same funding has un-confirmed: refused.
+        let chain2 = SimChain::new(200);
+        chain2.fund(op(1), 100);
+        chain2.unconfirm_funding(op(1));
+        assert!(
+            chain2.broadcast(&spend_tx(op(1), Sequence::from_height(10))).is_err(),
+            "no exit may confirm through a vanished funding"
+        );
+    }
+
+    /// `unconfirm_spend` returns a confirmed spend to the mempool; a later
+    /// `mine` re-confirms it at the NEW tip height.
+    #[test]
+    fn unconfirm_spend_returns_to_mempool_then_reconfirms() {
+        let chain = SimChain::new(100);
+        chain.fund(op(0), 100);
+        chain.broadcast(&spend_tx(op(0), Sequence::ENABLE_RBF_NO_LOCKTIME)).unwrap();
+        chain.mine(); // confirms at 101
+        assert!(matches!(chain.spend_status(op(0)), SpendStatus::Confirmed(101)));
+
+        chain.unconfirm_spend(op(0));
+        assert!(matches!(chain.spend_status(op(0)), SpendStatus::InMempool), "back to mempool");
+        chain.advance(5); // time passes; the spend re-confirms LATER
+        chain.mine();
+        assert!(
+            matches!(chain.spend_status(op(0)), SpendStatus::Confirmed(107)),
+            "re-confirms at the new height, not the orphaned one"
+        );
+    }
+
+    /// `rewind_to` moves the tip BACKWARDS, orphaning both the spend (→ mempool)
+    /// and the setup-output funding it created (→ unconfirmed); re-mining
+    /// re-confirms the spend and re-registers its outputs at the new height,
+    /// clearing the funding-mempool shadow.
+    #[test]
+    fn rewind_orphans_spend_and_its_outputs_then_remine_reconfirms() {
+        let chain = SimChain::new(100);
+        chain.fund_with_amount(op(0), 100, 1_000_000);
+        // A Setup-shaped spend whose output becomes a fresh fundable escrow.
+        let setup = spend_tx_out(op(0), 990_000);
+        let setup_txid: Txid = {
+            let t: Transaction = bitcoin::consensus::encode::deserialize(&setup).unwrap();
+            t.compute_txid()
+        };
+        chain.broadcast(&setup).unwrap();
+        chain.mine(); // tip 101; setup confirmed; its output funded at 101
+        let escrow_out = OutPoint::new(setup_txid, 0);
+        assert_eq!(chain.funding_height(escrow_out), Some(101));
+        chain.mine(); // tip 102
+        chain.mine(); // tip 103
+
+        // A 3-block reorg back to the funding block.
+        chain.rewind_to(100);
+        assert_eq!(chain.tip_height(), 100, "tip moved backwards");
+        assert!(matches!(chain.spend_status(op(0)), SpendStatus::InMempool), "setup back in mempool");
+        assert_eq!(chain.funding_height(escrow_out), None, "orphaned setup output un-funds");
+
+        // Re-mine: the setup re-confirms and re-registers its output at the new tip.
+        chain.mine(); // tip 101 again
+        assert!(matches!(chain.spend_status(op(0)), SpendStatus::Confirmed(101)));
+        assert_eq!(chain.funding_height(escrow_out), Some(101));
+        assert_eq!(chain.funding_amount(escrow_out), Some(990_000), "amount survives the round-trip");
+    }
+
+    /// `rewind_to` keeps everything at or below the new tip confirmed (the block
+    /// AT the fork point is not orphaned) and is a no-op when asked to "rewind"
+    /// forward.
+    #[test]
+    fn rewind_keeps_the_fork_block_and_ignores_forward_requests() {
+        let chain = SimChain::new(100);
+        chain.fund(op(0), 100);
+        chain.broadcast(&spend_tx(op(0), Sequence::ENABLE_RBF_NO_LOCKTIME)).unwrap();
+        chain.mine(); // spend confirmed at 101
+        chain.rewind_to(101); // exactly the spend's block: kept
+        assert!(matches!(chain.spend_status(op(0)), SpendStatus::Confirmed(101)));
+        chain.rewind_to(200); // "rewind" forward: no-op
+        assert_eq!(chain.tip_height(), 101);
+        assert_eq!(chain.funding_height(op(0)), Some(100), "fork-point funding stays confirmed");
     }
 }

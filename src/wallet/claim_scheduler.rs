@@ -384,6 +384,68 @@ mod tests {
         );
     }
 
+    /// Task 22: a reorg that orphans OUR confirmed claim returns it to the
+    /// mempool — the scheduler must not report a stale `Won`; it Waits for the
+    /// re-confirmation, and reports `Won` only once the claim is confirmed
+    /// again. No terminal is trusted across a possible reorg.
+    #[test]
+    fn reorg_reverting_our_confirmed_claim_is_not_a_stale_won() {
+        let e_sh = op(3);
+        let chain = SimChain::new(500);
+        chain.fund_with_amount(e_sh, 500, 1_000_000);
+        let schedule = synthetic_schedule(400);
+        let ours = spend_of(e_sh, 990_000);
+        let our_txid = chain.broadcast(&ours).unwrap();
+        chain.mine();
+        assert_eq!(
+            ClaimScheduler::next_broadcast(&chain, e_sh, &schedule, Some(our_txid)),
+            ClaimBroadcast::Won
+        );
+        // A reorg orphans our claim's block: back to the mempool.
+        chain.unconfirm_spend(e_sh);
+        assert_eq!(
+            ClaimScheduler::next_broadcast(&chain, e_sh, &schedule, Some(our_txid)),
+            ClaimBroadcast::Wait,
+            "our claim back in the mempool: wait for re-confirmation, never a stale Won"
+        );
+        // It re-confirms: Won again.
+        chain.mine();
+        assert_eq!(
+            ClaimScheduler::next_broadcast(&chain, e_sh, &schedule, Some(our_txid)),
+            ClaimBroadcast::Won
+        );
+    }
+
+    /// Task 22: if a reorg reverts our winning claim and lets SH's late refund
+    /// (a foreign, higher-fee tx) confirm on the re-mine instead, the scheduler
+    /// reports `Lost` — the true outcome — never a stale `Won` from the
+    /// orphaned block.
+    #[test]
+    fn reorg_letting_a_foreign_refund_win_reports_lost_not_stale_won() {
+        let e_sh = op(4);
+        let chain = SimChain::new(500);
+        chain.fund_with_amount(e_sh, 500, 1_000_000);
+        let schedule = synthetic_schedule(400);
+        let ours = spend_of(e_sh, 990_000); // fee 10_000
+        let our_txid = chain.broadcast(&ours).unwrap();
+        chain.mine();
+        assert_eq!(
+            ClaimScheduler::next_broadcast(&chain, e_sh, &schedule, Some(our_txid)),
+            ClaimBroadcast::Won
+        );
+        // Reorg: our claim returns to the mempool, and SH's higher-fee refund
+        // RBF-evicts it, then confirms on the re-mine.
+        chain.unconfirm_spend(e_sh);
+        let foreign = spend_of(e_sh, 980_000); // fee 20_000 > ours → replaces
+        chain.broadcast(&foreign).unwrap();
+        chain.mine();
+        assert_eq!(
+            ClaimScheduler::next_broadcast(&chain, e_sh, &schedule, Some(our_txid)),
+            ClaimBroadcast::Lost,
+            "a foreign refund winning the re-mine is a distinct Lost, never a stale Won"
+        );
+    }
+
     fn manifest(posture: ClaimDelayPosture) -> SignedManifest {
         SignedManifest::compose(
             1,

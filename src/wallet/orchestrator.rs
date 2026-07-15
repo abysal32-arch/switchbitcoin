@@ -502,6 +502,42 @@ mod tests {
         );
     }
 
+    /// Task 22: the proceed-to-sign gate is AGREEMENT-REQUIRED on the CURRENT
+    /// chain, so a reorg that un-confirms an escrow after a `Proceed` withdraws
+    /// the go-signal — the coordinator Waits rather than signing against a
+    /// vanished confirmation. When the escrow re-confirms (even at a different
+    /// height, still inside the window) it proceeds again with the re-derived S.
+    #[test]
+    fn reorg_unconfirming_an_escrow_withdraws_the_proceed_gate() {
+        let c = coord();
+        let chain = SimChain::new(1_000);
+        chain.fund_with_amount(op(1), 1_000, unit());
+        chain.fund_with_amount(op(2), 1_000, unit());
+        assert!(matches!(
+            c.next_funding_action(&chain, FundingOrder::First, op(1), op(2), true, true, 5_000)
+                .unwrap(),
+            FundingAction::Proceed { s_height: 1_000, .. }
+        ));
+
+        // A reorg un-confirms the counterparty escrow: no Proceed on a vanished
+        // confirmation — Wait (never abort an honestly-funded swap on a reorg).
+        chain.unconfirm_funding(op(2));
+        assert_eq!(
+            c.next_funding_action(&chain, FundingOrder::First, op(1), op(2), true, true, 5_000)
+                .unwrap(),
+            FundingAction::Wait
+        );
+
+        // It re-confirms one block later (inside the co-funding window): the
+        // gate re-opens with S re-derived from the CURRENT heights.
+        chain.reconfirm_funding_at(op(2), 1_001);
+        assert_eq!(
+            c.next_funding_action(&chain, FundingOrder::First, op(1), op(2), true, true, 5_000)
+                .unwrap(),
+            FundingAction::Proceed { our_height: 1_000, their_height: 1_001, s_height: 1_001 }
+        );
+    }
+
     // ----- AbortDriver -----
 
     fn refund(maturity: u32) -> PreArmedRefund {
