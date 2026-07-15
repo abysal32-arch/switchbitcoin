@@ -96,6 +96,11 @@ fn status_snapshot_reflects_the_seeded_engine() {
         "\"offer_ticket\":\"skt1exampleticket\"",
         "\"max_swaps\":4",
         "\"version\":\"",
+        // Task 28: the manifest trust state the UI shouts. The seeded engine
+        // runs the compiled provisional baseline → v0, provisional=true.
+        "\"manifest\":{\"version\":0,\"id\":\"",
+        "\"provisional\":true",
+        "\"floor\":",
     ] {
         assert!(json.contains(needle), "missing {needle} in {json}");
     }

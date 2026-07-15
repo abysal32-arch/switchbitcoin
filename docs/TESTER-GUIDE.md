@@ -142,6 +142,28 @@ talks to `http://127.0.0.1:3316` — loopback only, **no auth** (limitation
 banner applies). Onboarding, tickets, and live swap state all work from the
 page; everything the UI does is also in the CLI.
 
+When a backend is connected the page shows a **live status strip** that makes
+the states testers most often misread legible — so you can tell a *normal*
+state from a real problem before filing a bug:
+
+* a permanent **PRE-ALPHA · TESTNET ONLY · NO REAL FUNDS** banner with the
+  build version;
+* **manifest** version + id, and a LOUD warning when you're on the v0
+  provisional baseline (the fingerprintable partition — ingest a signed
+  manifest);
+* **refund reality** — a swap that routes to refund is explained, not shown as
+  a bare "failed": ~half of swaps refund *by design* in this pre-alpha (a
+  role↔CSV safety refusal); your funds return automatically at the CSV timeout,
+  retry with another unit;
+* a **claim hold** (`holding-claim`) rendered as a privacy hold until a named
+  block — a deliberate delay, **not** a stuck swap;
+* **alarms** shown prominently (not just in the trace), and the
+  **active / max** swap count (new swaps 409 at the cap);
+* the phase-0 provenance warning before your first onboard.
+
+The page renders `/status` verbatim — it never invents state. If a surface
+looks wrong, `swapkey-cli status` / `manifest show` say the same thing.
+
 ## 7. Signed parameter manifests
 
 Settlement parameters arrive on a signed, versioned manifest — never from

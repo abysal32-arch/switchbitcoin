@@ -447,6 +447,19 @@ pub fn status_snapshot(
     // names, never positions).
     let version = json_string(BUILD_VERSION);
 
+    // Manifest trust state (Task 28) — APPENDED so the UI can render the active
+    // signed-params version + id and shout the v0 provisional partition (a
+    // fingerprintable anonymity set) LOUDLY. Mirrors `manifest show`; the wallet
+    // never invents this — it is read straight off the ingested/floored store.
+    let manifest = engine.manifest();
+    let manifest_json = format!(
+        "{{\"version\":{},\"id\":{},\"provisional\":{},\"floor\":{}}}",
+        manifest.current().version(),
+        json_string(&hex32(&manifest.current().id())),
+        manifest.is_provisional(),
+        manifest.floor(),
+    );
+
     format!(
         "{{\"ready\":true,\"network\":{},\"tip\":{},\"node_online\":{},\
          \"spendable_sats\":{spendable_sats},\"reserve_leasable\":{},\
@@ -455,7 +468,7 @@ pub fn status_snapshot(
          \"swap\":{},\"busy\":{},\"alarms\":{alarms_json},\
          \"phase0_warning\":{},\"claim_posture_applied\":true,\"claim_posture\":{},\
          \"offer_ticket\":{},\"active_swaps\":{active_json},\"max_swaps\":{max_swaps},\
-         \"version\":{version}}}",
+         \"version\":{version},\"manifest\":{manifest_json}}}",
         json_string(network.as_str()),
         tip_height.map(|h| h.to_string()).unwrap_or_else(|| "null".into()),
         node_online,
