@@ -374,6 +374,7 @@ pub fn status_snapshot(
     alarms: &[String],
     offer_ticket: Option<&str>,
     max_swaps: usize,
+    fee_estimate: Option<u64>,
 ) -> String {
     let ledger = engine.ledger();
     let mut coins = String::from("[");
@@ -447,6 +448,11 @@ pub fn status_snapshot(
     // names, never positions).
     let version = json_string(BUILD_VERSION);
 
+    // Fee weather (Task 26) — APPENDED at the tail like every other field.
+    // Warn-and-proceed advisory; `fee_estimate` is the caller's live
+    // `estimated_feerate_sat_vb()` (None when the node has no data).
+    let fee_weather = crate::wallet::fee_weather::FeeWeather::assess(params, fee_estimate).json();
+
     format!(
         "{{\"ready\":true,\"network\":{},\"tip\":{},\"node_online\":{},\
          \"spendable_sats\":{spendable_sats},\"reserve_leasable\":{},\
@@ -455,7 +461,7 @@ pub fn status_snapshot(
          \"swap\":{},\"busy\":{},\"alarms\":{alarms_json},\
          \"phase0_warning\":{},\"claim_posture_applied\":true,\"claim_posture\":{},\
          \"offer_ticket\":{},\"active_swaps\":{active_json},\"max_swaps\":{max_swaps},\
-         \"version\":{version}}}",
+         \"version\":{version},\"fee_weather\":{fee_weather}}}",
         json_string(network.as_str()),
         tip_height.map(|h| h.to_string()).unwrap_or_else(|| "null".into()),
         node_online,

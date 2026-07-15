@@ -75,6 +75,7 @@ fn status_snapshot_reflects_the_seeded_engine() {
         &["disk almost full".into()],
         Some("skt1exampleticket"),
         4,
+        Some(30), // adverse fee weather: 30 > baked settlement(23) and Setup(9)
     );
     for needle in [
         "\"ready\":true",
@@ -96,6 +97,14 @@ fn status_snapshot_reflects_the_seeded_engine() {
         "\"offer_ticket\":\"skt1exampleticket\"",
         "\"max_swaps\":4",
         "\"version\":\"",
+        // Fee weather (Task 26), APPENDED after version — field + every sub-key.
+        "\"fee_weather\":{\"estimate_sat_vb\":30",
+        "\"setup_baked_sat_vb\":9",
+        "\"settlement_baked_sat_vb\":23",
+        "\"over_setup\":true",
+        "\"over_settlement\":true",
+        "\"adverse\":true",
+        "\"bump_burn_sats\":",
     ] {
         assert!(json.contains(needle), "missing {needle} in {json}");
     }
@@ -110,12 +119,19 @@ fn status_snapshot_reflects_the_seeded_engine() {
     // The Phase-0 display contract: the warning copy rides in the snapshot.
     assert!(json.contains("\"phase0_warning\":"));
     // No-node shape: tip null, offline, no offer outstanding, no live swaps.
-    let offline =
-        status_snapshot(&engine, &params, Network::Regtest, None, false, &[], None, &[], None, 4);
+    let offline = status_snapshot(
+        &engine, &params, Network::Regtest, None, false, &[], None, &[], None, 4, None,
+    );
     assert!(offline.contains("\"tip\":null") && offline.contains("\"node_online\":false"));
     assert!(offline.contains("\"swap\":null") && offline.contains("\"busy\":null"));
     assert!(offline.contains("\"offer_ticket\":null"), "{offline}");
     assert!(offline.contains("\"active_swaps\":[]"), "{offline}");
+    // No live estimate → fee weather present but null/quiet (never adverse).
+    assert!(
+        offline.contains("\"fee_weather\":{\"estimate_sat_vb\":null")
+            && offline.contains("\"adverse\":false"),
+        "{offline}"
+    );
 }
 
 #[test]
@@ -128,7 +144,7 @@ fn status_snapshot_lists_every_live_swap() {
         SwapView { sid: "cd".repeat(32), phase: "babysit-refund".into(), outcome: None },
     ];
     let json = status_snapshot(
-        &engine, &params, Network::Regtest, Some(1), true, &active, None, &[], None, 4,
+        &engine, &params, Network::Regtest, Some(1), true, &active, None, &[], None, 4, None,
     );
     // Both views ride in active_swaps; the legacy single `swap` field carries
     // the FIRST.

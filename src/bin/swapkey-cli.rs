@@ -1053,6 +1053,17 @@ fn cmd_swap(flags: &Flags) -> CliResult {
         return Err("chain reconcile failed — fix the node/data dir before swapping".into());
     }
 
+    // Fee-weather preflight (Task 26): read the live estimate and WARN-AND-
+    // PROCEED if congestion outruns the baked Setup/settlement feerates. NO gate
+    // (the reserve-CPFP backstop bridges the gap after the fact) — this is only
+    // a heads-up before funding into bad weather, so a stranded Setup does not
+    // read to a tester as a mystery hang.
+    {
+        use swapkey::wallet::fee_weather::FeeWeather;
+        let fw = FeeWeather::assess(wallet.params(), chain.estimated_feerate_sat_vb());
+        log(&fw.log_line());
+    }
+
     // Peer transport. EXPLICIT FLAGS OUTRANK THE CONFIG ENTIRELY: an operator
     // typing --listen must never be silently dialed out by a leftover [peer]
     // connect value (Fable review). Exactly ONE addressing mode is allowed;
@@ -2190,6 +2201,7 @@ fn serve_worker(
                 &alarms,
                 offer_ticket.as_deref(),
                 max_swaps,
+                chain.and_then(|c| c.estimated_feerate_sat_vb()),
             );
         }
 
@@ -2255,6 +2267,12 @@ fn dispatch_swap(
             return None;
         }
     };
+    // Fee-weather preflight (Task 26): the same warn-and-proceed heads-up as
+    // the CLI `swap`, surfaced in the serve trace before any lease. NOT a gate.
+    {
+        use swapkey::wallet::fee_weather::FeeWeather;
+        sink(FeeWeather::assess(wallet.params(), chain.estimated_feerate_sat_vb()).log_line());
+    }
     // Sibling live sids: a failed dispatch heals orphaned leases, and the
     // heal must keep every sibling's lease — including the record-less
     // negotiate→Setup-broadcast window (see reconcile_leases_with_chain_keeping).

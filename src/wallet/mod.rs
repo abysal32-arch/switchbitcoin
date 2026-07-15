@@ -97,6 +97,7 @@ pub mod backstop_driver;
 pub mod claim_scheduler;
 pub mod driver;
 pub mod engine;
+pub mod fee_weather;
 pub mod funding_driver;
 pub mod keys;
 pub mod keystore;
