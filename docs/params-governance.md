@@ -140,6 +140,33 @@ version 1 (DECISION 4): zero behavior change, but ingesting it moves a wallet
 off the v0 partition and exercises every trust-path gate for real. Tuned
 params (Task 14's live-testnet follow-up) ship later as v2+.
 
+## Next-round reserve advice (Task 26 → v2 recommendation)
+
+Task 26's fee calibration sanity-checks the congestion backstop against live
+testnet4 fees. Conclusion for the v2 round: **leave `cpfp_reserve_sats`
+unchanged at 25,000.**
+
+What the reserve has to satisfy. The refund exit is CPFP: a low-fee refund
+parent (143 vB, carrying only the baked `settlement_fee_sats` = 3,320 sats ≈
+23 sat/vB) plus a child funded from the reserve (~120 vB) — a 263 vB package.
+Spending the full reserve as child fee lifts the package to
+`(3,320 + 25,000) / 263 ≈ 108 sat/vB`, a mainnet-congestion-grade bump.
+`MAX_BUMP_FEE_SATS` = 200,000 sits far above the reserve, so that cap is a
+runaway guard, never the reserve's limiter.
+
+Live testnet4 headroom (measured 2026-07-16, leg-2 preflight):
+`estimatesmartfee 2 CONSERVATIVE` returned no estimate; `6 ECONOMICAL` = 1.5
+sat/vB; `mempoolminfee` = 1.0 sat/vB; mempool ~1.5 KB. Ambient testnet4
+feerate is ~1–2 sat/vB, so 25,000 buys ~50–100× headroom over what the network
+actually demands. No reserve shortfall is reachable on testnet in the pre-alpha
+window, so the reserve stays put; revisiting it belongs to a mainnet build,
+which is out of scope behind the cryptographer review.
+
+(The three settlement vsize constants — Setup 124 / Completion 124 / Refund
+143 vB — are calibrated separately against the leg-2 artifact once the live
+swap lands. That is Task 26 step 1, not a signed-param change: any deviation
+updates the TEST baselines + comments, never the compiled params.)
+
 ## Key management (honest pre-alpha story)
 
 ONE operator key, generated 2026-07-14; x-only pubkey
