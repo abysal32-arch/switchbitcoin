@@ -25,6 +25,8 @@ use crate::tx::backstop::required_child_fee;
 
 /// Measured Setup vsize (vB): one taproot key-path input, P2TR escrow output +
 /// P2A anchor. Setup fee `setup_fee_sats` / this = the baked Setup feerate.
+/// LIVE-CONFIRMED exact on testnet4 (both Setups of the task-25 leg-2 swap,
+/// 2026-07-16); Completion likewise exact; Refund pends the task-25 drill.
 pub const SETUP_VSIZE_VB: u64 = 124;
 /// Measured Completion vsize (vB). Kept for calibration symmetry; the Refund is
 /// the weakest link, so the settlement floor keys off `REFUND_VSIZE_VB`.
