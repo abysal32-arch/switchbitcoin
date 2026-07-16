@@ -150,8 +150,10 @@ your config file. Two commands matter to a tester:
 * `swapkey-cli manifest show` — what you're running. A fresh wallet says
   version 0 with a WARNING: v0 wallets are a small, fingerprintable
   anonymity partition. Fix it by ingesting the current round's manifest:
-* `swapkey-cli manifest ingest <file>` — e.g. the `docs/manifests/v1.manifest`
-  shipped in the package. Two wallets on different manifests refuse each
+* `swapkey-cli manifest ingest <file>` — e.g. the `docs/manifests/v2.manifest`
+  shipped in the package (v1 was signed by the retired first operator key —
+  since the 2026-07-16 key rotation it refuses with `signature does not
+  verify`, by design). Two wallets on different manifests refuse each
   other with `handshake: peer runs different signed params (manifest
   mismatch)` — so when the operator publishes a new manifest, ingest it
   promptly (everyone in a test round runs the same version).

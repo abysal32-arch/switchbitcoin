@@ -183,20 +183,35 @@ cryptographer-review item regardless).
 
 ## Key management (honest pre-alpha story)
 
-ONE operator key, generated 2026-07-14; x-only pubkey
-`fbb01df4f947cf69e8a24e4e907c60e8c903eb199e6dd949a2fabe5a5ea2191e` (pinned in
-`swapkey-cli`, published in `operator.pub` and here). No rotation protocol,
-no threshold signing, no HSM — those are post-pre-alpha. What exists now:
+ONE operator key at a time; no threshold signing, no HSM — those are
+post-pre-alpha. The CURRENT key (the second): generated 2026-07-16, x-only
+pubkey `fedd62229b6c8a194d6d174d68ad0ce303623cbd49df4b968b9b06ea9e6ec7fe`
+(pinned in `swapkey-cli`, published in `operator-key-v2\operator.pub` and
+here).
+
+**The key-loss rotation has now run FOR REAL (2026-07-16).** The first key
+(`fbb01df4…a2191e`, generated 2026-07-14, signer of v1) had its reseal
+passphrase lost the day after resealing. Recovery followed this section's
+procedure exactly: `keygen` a fresh key → re-pin `PINNED_OPERATOR_XONLY` →
+rebuild → re-issue params as v2 under the new key. Observed consequences,
+all as designed: v1.manifest stops verifying under the new pin (it stays in
+`docs/manifests/` as history); a wallet holding v1 falls back to the
+identical compiled baseline at open (quarantine ALARM, floor KEPT) until it
+ingests the new-key v2; anti-rollback holds across the transition because
+the persisted floors never reset. Lesson institutionalized: the operator
+passphrase now lives in the owner's password manager at keygen time, not
+in human memory. What exists now:
 
 * The secret is sealed at rest (passphrase KEK, production PBKDF2 work
-  factor) in `operator-key\` outside the repo; `reseal` changes the
-  passphrase without changing the keypair (no re-pin, no re-issue).
+  factor) in `operator-key-v2\` outside the repo (`operator-key\` holds the
+  retired first key); `reseal` changes the passphrase without changing the
+  keypair (no re-pin, no re-issue).
 * **Key loss** (file or passphrase): no further manifests can be signed.
   Recovery = `keygen` a new key, re-pin the new pubkey, rebuild and
   redistribute wallet binaries. Wallets' persisted version FLOORS survive the
   transition, so anti-rollback holds across a re-pin (an old-root manifest
   simply stops verifying; the floor still refuses old versions if the old
-  root is ever re-pinned).
+  root is ever re-pinned). Exercised for real 2026-07-16 — see above.
 * **Key compromise**: an attacker can sign manifests, but only within
   `validate()`'s bounds (the ordering invariant is asserted signature-blind),
   and only moving versions FORWARD. The damage envelope is bounded-but-real
