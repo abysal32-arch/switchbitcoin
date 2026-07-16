@@ -813,6 +813,54 @@ fn cmd_status(flags: &Flags) -> CliResult {
     Ok(())
 }
 
+/// Maturity annotation for a pre-encumbrance coin's `status` line — the
+/// onboarding delay is otherwise invisible (found live in the task-25 leg-2
+/// rehearsal: an immature unit reads `PreEncumbrance/Unspent` with nothing
+/// saying WHY a swap refuses). `status` runs node-free, so the HEIGHT anchor
+/// is NAMED but not checked against a tip; the wall half is compared against
+/// the same clock that anchored it. The swap re-verifies BOTH anchors at
+/// lease time regardless — this line is advisory, not the gate.
+/// `diag` deliberately does NOT carry this: a maturity timestamp pasted into
+/// a public bug report leaks the coin's decorrelation draw.
+fn maturity_suffix(c: &swapkey::wallet::ledger::CoinRecord, now_unix: u64) -> Option<String> {
+    use swapkey::wallet::ledger::{CoinClass, CoinState};
+    if c.class != CoinClass::PreEncumbrance || c.state != CoinState::Unspent {
+        return None;
+    }
+    // None while PendingConfirm (the delay anchors at split confirmation);
+    // that state is already visible on the line itself.
+    let at = c.eligibility_unix()?;
+    if at == 0 && c.eligible_height == 0 {
+        return None;
+    }
+    Some(if now_unix < at {
+        format!("  [onboarding delay: matures ~{} & height ≥ {}]", format_utc(at), c.eligible_height)
+    } else {
+        format!(
+            "  [onboarding delay elapsed ~{}; leasable once the tip reaches {}]",
+            format_utc(at),
+            c.eligible_height
+        )
+    })
+}
+
+/// `YYYY-MM-DD HH:MMZ` from a unix timestamp, std-only (no chrono dep).
+/// Days→civil via Howard Hinnant's `civil_from_days` algorithm.
+fn format_utc(unix: u64) -> String {
+    let days = (unix / 86_400) as i64;
+    let secs = unix % 86_400;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}Z", secs / 3600, (secs % 3600) / 60)
+}
+
 fn print_status(wallet: &Wallet) {
     let config = wallet.config();
     let params = wallet.params();
@@ -843,11 +891,17 @@ fn print_status(wallet: &Wallet) {
     if coins.is_empty() {
         println!("coins:    none — get an address (`address`) and onboard a deposit");
     } else {
+        let now = swapkey::wallet::ledger::WalletClock::now_unix(&SystemClock);
         println!("coins ({}):", coins.len());
         for c in coins {
             println!(
-                "  {:>12} sats  {:?}/{:?}  {}:{}",
-                c.amount_sats, c.class, c.state, c.outpoint.txid, c.outpoint.vout
+                "  {:>12} sats  {:?}/{:?}  {}:{}{}",
+                c.amount_sats,
+                c.class,
+                c.state,
+                c.outpoint.txid,
+                c.outpoint.vout,
+                maturity_suffix(c, now).unwrap_or_default()
             );
         }
     }
@@ -2808,6 +2862,73 @@ mod tests {
             "unshippable pin: {:?}",
             test_root_reason()
         );
+    }
+
+    // -- Task-25 live finding: the status maturity annotation. The onboarding
+    // delay must be visible on `status` (immature units otherwise read as
+    // ready and the swap's clean refusal gets filed as a bug).
+
+    fn coin(class: ledger::CoinClass, state: ledger::CoinState, at: u64, h: u32) -> ledger::CoinRecord {
+        ledger::CoinRecord {
+            outpoint: bitcoin::OutPoint::null(),
+            amount_sats: 1_005_000,
+            class,
+            state,
+            key_purpose: swapkey::wallet::keys::KeyPurpose::PreEncumbrance,
+            key_index: 0,
+            created_height: 0,
+            delay_or_eligible_unix: at,
+            eligible_height: h,
+            deposit_linked: false,
+            parent: None,
+            lessee: None,
+            split_tx: None,
+            split_attempts: Vec::new(),
+        }
+    }
+
+    use swapkey::wallet::ledger;
+
+    #[test]
+    fn maturity_suffix_immature_names_both_anchors() {
+        let c = coin(ledger::CoinClass::PreEncumbrance, ledger::CoinState::Unspent, 1_784_169_302, 144_470);
+        let s = maturity_suffix(&c, 1_784_000_000).expect("annotated");
+        assert!(s.contains("matures ~2026-07-16 02:35Z"), "got: {s}");
+        assert!(s.contains("height ≥ 144470"), "got: {s}");
+    }
+
+    #[test]
+    fn maturity_suffix_elapsed_points_at_height_gate() {
+        let c = coin(ledger::CoinClass::PreEncumbrance, ledger::CoinState::Unspent, 1_784_169_302, 144_470);
+        let s = maturity_suffix(&c, 1_784_169_302).expect("annotated");
+        assert!(s.contains("delay elapsed"), "got: {s}");
+        assert!(s.contains("tip reaches 144470"), "got: {s}");
+    }
+
+    #[test]
+    fn maturity_suffix_silent_where_it_must_be() {
+        // PendingConfirm: the delay is a DURATION, not an absolute — no line.
+        let pending =
+            coin(ledger::CoinClass::PreEncumbrance, ledger::CoinState::PendingConfirm, 90_000, 0);
+        assert!(maturity_suffix(&pending, 1_784_000_000).is_none());
+        // Non-pre-encumbrance classes never carry the annotation.
+        let reserve = coin(ledger::CoinClass::Reserve, ledger::CoinState::Unspent, 0, 0);
+        assert!(maturity_suffix(&reserve, 1_784_000_000).is_none());
+        // Leased/Spent pre-encumbrance: the state already tells the story.
+        let leased = coin(ledger::CoinClass::PreEncumbrance, ledger::CoinState::Leased, 1, 1);
+        assert!(maturity_suffix(&leased, 1_784_000_000).is_none());
+        // Defensive: a zero-anchored unspent unit stays unannotated.
+        let zeroed = coin(ledger::CoinClass::PreEncumbrance, ledger::CoinState::Unspent, 0, 0);
+        assert!(maturity_suffix(&zeroed, 1_784_000_000).is_none());
+    }
+
+    #[test]
+    fn format_utc_known_values() {
+        // Cross-checked against `date -u` during the live leg-2 session.
+        assert_eq!(format_utc(1_784_169_302), "2026-07-16 02:35Z");
+        assert_eq!(format_utc(0), "1970-01-01 00:00Z");
+        // Leap-day sanity.
+        assert_eq!(format_utc(1_709_164_800), "2024-02-29 00:00Z");
     }
 
     // -- Task 23: hostile-input sweep of the argv parser + the parse_* helpers.
