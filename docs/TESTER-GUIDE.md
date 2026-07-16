@@ -26,8 +26,11 @@ tells you exactly how to report what breaks.
 * **Claim-delay privacy holds are real**: after a swap settles you may see
   `holding the SL claim until height N` for many blocks. That is the privacy
   posture working — leave the wallet running.
-* **Onboarding delays are real on testnet**: newly onboarded coins become
-  swappable only after a randomized 24–72 h decorrelation delay.
+* **Onboarding delays are real on testnet**: each newly onboarded coin
+  becomes swappable only after its OWN randomized 24–72 h decorrelation
+  delay (drawn per coin, so two units rarely mature together). `status`
+  shows no countdown; a swap attempted early refuses cleanly and leaves the
+  coin untouched, so it is safe to just retry until it goes through.
 * **testnet4 REORGS are routine** — multi-block reorgs happen there (regtest
   never reorged). If a `reorg detected: … HOLDING …` line appears mid-swap,
   the wallet is deliberately pausing until the orphaned confirmation settles.
@@ -90,8 +93,12 @@ the next one. Highlights and traps:
   section to swapkey.toml`.
 * Faucet amount: at least **0.011 tBTC** (one 0.01 swap unit + fees + the
   CPFP reserve the split carves). Wait for a confirmation before `onboard`.
-* After `onboard` confirms, coins mature over 24–72 h (`status` shows coin
-  states; `coins: none — get an address…` means you skipped a step).
+* After `onboard` confirms, each coin matures after its own randomized
+  24–72 h delay. Throughout, `status` shows the unit as
+  `PreEncumbrance/Unspent` — it does NOT show maturity or an eligibility
+  countdown, so the way to learn a unit is ready is simply to attempt a
+  `swap`; a premature attempt refuses cleanly and costs nothing (see
+  Troubleshooting). (`coins: none — get an address…` means you skipped a step.)
 * Swapping needs a partner and the **ticket flow** (one line of text):
   maker runs `swap --make <host:port>`, sends the printed `skt1…` line;
   taker runs `swap --take <ticket>`. Both sides stay running until
@@ -232,7 +239,8 @@ Traps the guide must warn you about:
 | `this command needs a node: add a [node] section to swapkey.toml` | Fill `[node]` in the config (section 3). |
 | `deposit not found or not confirmed — wait for a confirmation` | The faucet tx hasn't confirmed, or the `<txid:vout>` is wrong (vout is the output INDEX paying your address). |
 | `deposit does not pay any address of this wallet` | Wrong txid/vout, or coins sent to some other wallet's address. |
-| `coins become leasable after their decorrelation delay (24-72h wall clock)` | The onboarding privacy delay (banner). Wait; `status` shows states. |
+| `coins become leasable after their decorrelation delay (24-72h wall clock)` | The onboarding privacy delay (banner). Each unit's maturity is a separate random draw; `status` keeps showing `PreEncumbrance/Unspent` with no countdown. Retry the `swap` periodically — an early attempt refuses cleanly. |
+| `timelock/deadline invariant violated: pre-encumbrance coins exist but are still in their onboarding delay` | The unit hasn't finished its randomized 24–72 h onboarding delay. NOT a bug and nothing is stuck (no lease, no broadcast, `status` still `PreEncumbrance/Unspent`) — wait and re-run `swap`. Units mature independently, so a spare may be ready before the first. |
 | `handshake: peer runs different signed params (manifest mismatch)` | You and your partner are on different manifest versions/params. Both run `manifest show`, ingest the current manifest, retry. |
 | `manifest REFUSED: … signature does not verify` | The file isn't signed by the pinned operator root (corrupt download or wrong file). Re-fetch the round's manifest. |
 | `manifest REFUSED: … version must strictly increase` | You already run this (or a newer) version — probably fine; `manifest show` to confirm. |
