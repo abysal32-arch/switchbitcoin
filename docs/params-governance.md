@@ -167,6 +167,20 @@ which is out of scope behind the cryptographer review.
 swap lands. That is Task 26 step 1, not a signed-param change: any deviation
 updates the TEST baselines + comments, never the compiled params.)
 
+**Second v2 recommendation — testing-period onboarding delay (owner
+decision, Joe, 2026-07-16):** during the testnet testing rounds,
+`onboarding_delay_hours` drops 24–72 → **1–2** so timing gates stop stalling
+test cycles (the leg-2 rehearsal lost ~2 days to maturity waits). The value
+stays >0 and randomized per coin, so the mechanics under test — per-coin
+draws, dual wall+height anchoring, the `status` maturity annotation, the
+premature-swap refusal — all remain exercised, just on an hour scale.
+Rationale for the lever: there is deliberately NO bypass flag in code
+(eligibility anchors are write-once; params are not config) — the signed
+manifest IS the tuning path, and this is its first real use. Already-written
+anchors are unaffected by ingest (write-once); the production-scale delay
+must be restored in the first post-testing round (mainnet-era value is a
+cryptographer-review item regardless).
+
 ## Key management (honest pre-alpha story)
 
 ONE operator key, generated 2026-07-14; x-only pubkey
