@@ -78,7 +78,9 @@ mkdir -p "$OUT/docs"
 cp "$CLI" "$MANIFEST_TOOL" "$OUT/"
 cp docs/TESTER-GUIDE.md docs/BUG-REPORT-TEMPLATE.md docs/params-governance.md "$OUT/docs/"
 mkdir -p "$OUT/docs/manifests"
-cp docs/manifests/v1.manifest docs/manifests/v1-params.toml "$OUT/docs/manifests/"
+# Ship the CURRENT round's manifest only — v1 (retired first operator key,
+# no longer verifies since the 2026-07-16 rotation) stays in the repo as history.
+cp docs/manifests/v2.manifest docs/manifests/v2-params.toml "$OUT/docs/manifests/"
 # The local HTML UI lives one level above the crate in this workspace; ship
 # it when present (serve works without it — the UI is optional).
 if [ -f "../SwapKey-Wallet.html" ]; then

@@ -1,0 +1,57 @@
+# Swap Key signed-manifest authoring input — VERSION 2 (Task 27, the first
+# REAL governance round).
+#
+# v2 carries ONE parameter change from v1, an owner decision (Joe,
+# 2026-07-16, recorded in params-governance.md): the onboarding decorrelation
+# delay drops from 24–72 h to **1–2 h for the testnet TESTING PERIOD**, so
+# timing gates stop stalling test cycles (the task-25 rehearsal lost ~2 days
+# to maturity waits). The delay stays >0 and randomized per coin, so every
+# mechanic it gates — per-coin draws, dual wall+height anchoring, the
+# `status` maturity annotation, the premature-swap refusal — remains
+# exercised, on an hour scale. The production-scale delay is restored in the
+# first post-testing round. All fee/timelock params are UNCHANGED (task 26's
+# calibration: live leg-2 values matched the baked baselines exactly).
+#
+# `onboarding_delay_hours` is a Params field → digest-relevant → a v1 peer
+# refuses a v2 peer at the hello (the DECISION-5 staggered state this round
+# drills live). Already-anchored coins keep their written delays (write-once).
+#
+# Signed 2026-07-16 with the SECOND operator key (x-only pubkey
+# fedd62229b6c8a194d6d174d68ad0ce303623cbd49df4b968b9b06ea9e6ec7fe =
+# PINNED_OPERATOR_XONLY since the same-day re-pin): the first key's reseal
+# passphrase was lost and the documented key-loss rotation ran for real —
+# keygen → re-pin → rebuild (params-governance.md "Key management"). v1
+# (signed by the retired key) no longer verifies under the new pin; wallets
+# fall back to the identical compiled baseline until they ingest this v2.
+# Envelope: v2.manifest.
+#
+# Usage:   swapkey-manifest sign v2-params.toml --key <operator.key> --out v2.manifest
+# Check:   swapkey-manifest compose-check v2-params.toml   (no key needed)
+
+version = "2"
+posture = "moderate"      # unchanged (⚠ review item #5: never tighten unilaterally)
+quorum_q = "3"            # unchanged
+
+[params]
+tier_d_sats = "1000000"             # unchanged — 0.01 tBTC equal output
+delta_fee_sats = "5000"             # unchanged (live-confirmed exact, leg 2)
+anchor_sats = "240"                 # unchanged
+setup_fee_sats = "1200"             # unchanged (live-confirmed exact, leg 2)
+cpfp_reserve_sats = "25000"         # unchanged (task 26 step 3: keep at 25k)
+delta_early = "144"                 # unchanged
+margin = "72"                       # unchanged
+delta_buffer = "24"                 # unchanged
+claim_confirm_allowance = "6"       # unchanged
+cofunding_window = "12"             # unchanged
+onboarding_delay_lo_hours = "1"     # TESTING PERIOD (was 24) — see header
+onboarding_delay_hi_hours = "2"     # TESTING PERIOD (was 72) — restore post-testing
+
+[delays]
+# ⚠ CRYPTOGRAPHER REVIEW ITEM #5: bounds re-issued verbatim, same as v1.
+minimal_min = "0"
+minimal_max = "6"
+moderate_min = "6"
+moderate_max = "36"
+aggressive_min = "12"
+aggressive_max = "72"
+cofunding_jitter_max = "6"

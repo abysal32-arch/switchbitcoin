@@ -1242,6 +1242,11 @@ fn drive_sl_swap_to_first_hold() -> HeldSwap {
 /// floor never strands a pre-signed tx whose fee can't be renegotiated. vsize
 /// is network-independent, so this regtest-shaped measurement is the testnet
 /// number (cross-checked on-chain by the Task 14 testnet run).
+///
+/// Task-26 step-1 calibration (2026-07-16): the first LIVE testnet4 swap
+/// (task 25 leg 2) mined Setup 124 vB/1_200 sats ×2 and Completion
+/// 124 vB/3_320 sats ×2 — EXACTLY these baselines; no expected-value drift
+/// to absorb. Refund's live datapoint lands with the task-25 refund drill.
 #[test]
 fn task14_baked_fees_clear_the_relay_floor_with_margin() {
     let held = drive_sl_swap_to_first_hold();

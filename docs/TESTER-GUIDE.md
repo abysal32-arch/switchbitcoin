@@ -180,8 +180,10 @@ your config file. Two commands matter to a tester:
 * `swapkey-cli manifest show` — what you're running. A fresh wallet says
   version 0 with a WARNING: v0 wallets are a small, fingerprintable
   anonymity partition. Fix it by ingesting the current round's manifest:
-* `swapkey-cli manifest ingest <file>` — e.g. the `docs/manifests/v1.manifest`
-  shipped in the package. Two wallets on different manifests refuse each
+* `swapkey-cli manifest ingest <file>` — e.g. the `docs/manifests/v2.manifest`
+  shipped in the package (v1 was signed by the retired first operator key —
+  since the 2026-07-16 key rotation it refuses with `signature does not
+  verify`, by design). Two wallets on different manifests refuse each
   other with `handshake: peer runs different signed params (manifest
   mismatch)` — so when the operator publishes a new manifest, ingest it
   promptly (everyone in a test round runs the same version).
@@ -249,6 +251,7 @@ Traps the guide must warn you about:
 | `no taker reached … before the accept timeout` / `ticket rendezvous failed` | (Maker) Partner never dialed, dialed the wrong ticket, or your `--make` host isn't reachable from their network. Re-check the advertised `host:port` and firewall — section 5 (Connectivity). |
 | `could not reach the peer at …` / `dial … failed` | (Taker) The maker isn't listening yet, or its `host:port` isn't reachable from you (NAT/firewall). `--connect-retries` already redials a few times; if it still fails, fix reachability — section 5 (Connectivity). |
 | `chain reconcile failed — fix the node/data dir before swapping` | The node is unreachable/out of sync. Fix `[node]`/bitcoind first; refusing to swap in that state is deliberate. |
+| `FEE WEATHER WARNING: live N sat/vB exceeds baked …` | When your swap started, the live network feerate was above the baked Setup/settlement fees. NOT a hang and NOT an error — the swap proceeds; if a Setup or settlement then stalls, the reserve-CPFP backstop fee-bumps it automatically (the line names roughly how many reserve sats a bump could burn). The quiet variants `fee weather OK: …` and `fee weather: no live estimate …` need no action. |
 | `ALARM — RefundStalledBelowFeeFloor: …` | Congestion + no (usable) reserve for the fee bump. If it names `NO leasable reserve exists on this watchtower device`, onboard a deposit there. The refund still fires; only confirmation waits. |
 | `reserve CPFP bumps are gated off` | Startup reconcile failed on the watch device — bumps disabled, refund fires unaffected. Fix the node connection to re-arm bumps. |
 | `bump child already in flight on the anchor` | A fee bump is already pending (maybe from the other device). Not an error; wait. |

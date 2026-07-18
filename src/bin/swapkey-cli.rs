@@ -75,10 +75,14 @@ const KEY_SCAN_LIMIT: u32 = 10_000;
 
 /// The BUILD-TIME manifest trust root (Task 18, DECISION 3): the REAL
 /// pre-alpha operator x-only public key, hex
-/// `fbb01df4f947cf69e8a24e4e907c60e8c903eb199e6dd949a2fabe5a5ea2191e`.
-/// Generated 2026-07-14 by `swapkey-manifest keygen`; the sealed SECRET half
-/// lives outside the repo (`operator-key\`, never committed) — this constant
-/// is the public verification key only. Every `Wallet` open in this binary —
+/// `fedd62229b6c8a194d6d174d68ad0ce303623cbd49df4b968b9b06ea9e6ec7fe`.
+/// Generated 2026-07-16 by `swapkey-manifest keygen` — the SECOND operator
+/// key: the first (fbb01df4…, 2026-07-14) had its reseal passphrase lost and
+/// was retired via the documented key-loss rotation
+/// (docs/params-governance.md "Key management"), exercising that recovery
+/// path for real. The sealed SECRET half lives outside the repo
+/// (`operator-key-v2\`, never committed) — this constant is the public
+/// verification key only. Every `Wallet` open in this binary —
 /// init, status, address, onboard, swap, recover, WATCH, serve, backup's
 /// restore verification, manifest — pins it via [`Wallet::open_with_root`];
 /// the prototype `ModeledTrustRoot` (whose secret is printed in the library
@@ -88,9 +92,9 @@ const KEY_SCAN_LIMIT: u32 = 10_000;
 /// feed hostile-but-`validate()`-clean params). Key loss/rotation = re-pin +
 /// rebuild + redistribute (docs/params-governance.md).
 const PINNED_OPERATOR_XONLY: [u8; 32] = [
-    0xfb, 0xb0, 0x1d, 0xf4, 0xf9, 0x47, 0xcf, 0x69, 0xe8, 0xa2, 0x4e, 0x4e, 0x90, 0x7c, 0x60,
-    0xe8, 0xc9, 0x03, 0xeb, 0x19, 0x9e, 0x6d, 0xd9, 0x49, 0xa2, 0xfa, 0xbe, 0x5a, 0x5e, 0xa2,
-    0x19, 0x1e,
+    0xfe, 0xdd, 0x62, 0x22, 0x9b, 0x6c, 0x8a, 0x19, 0x4d, 0x6d, 0x17, 0x4d, 0x68, 0xad, 0x0c,
+    0xe3, 0x03, 0x62, 0x3c, 0xbd, 0x49, 0xdf, 0x4b, 0x96, 0x8b, 0x9b, 0x06, 0xea, 0x9e, 0x6e,
+    0xc7, 0xfe,
 ];
 
 /// The pinned root, boxed for [`Wallet::open_with_root`].
@@ -1105,6 +1109,17 @@ fn cmd_swap(flags: &Flags) -> CliResult {
     // on the reconcile succeeding (the Task-E caller contract).
     if !startup_with_alarms(&mut wallet, &chain, &opts)? {
         return Err("chain reconcile failed — fix the node/data dir before swapping".into());
+    }
+
+    // Fee-weather preflight (Task 26): read the live estimate and WARN-AND-
+    // PROCEED if congestion outruns the baked Setup/settlement feerates. NO gate
+    // (the reserve-CPFP backstop bridges the gap after the fact) — this is only
+    // a heads-up before funding into bad weather, so a stranded Setup does not
+    // read to a tester as a mystery hang.
+    {
+        use swapkey::wallet::fee_weather::FeeWeather;
+        let fw = FeeWeather::assess(wallet.params(), chain.estimated_feerate_sat_vb());
+        log(&fw.log_line());
     }
 
     // Peer transport. EXPLICIT FLAGS OUTRANK THE CONFIG ENTIRELY: an operator
@@ -2244,6 +2259,7 @@ fn serve_worker(
                 &alarms,
                 offer_ticket.as_deref(),
                 max_swaps,
+                chain.and_then(|c| c.estimated_feerate_sat_vb()),
             );
         }
 
@@ -2309,6 +2325,12 @@ fn dispatch_swap(
             return None;
         }
     };
+    // Fee-weather preflight (Task 26): the same warn-and-proceed heads-up as
+    // the CLI `swap`, surfaced in the serve trace before any lease. NOT a gate.
+    {
+        use swapkey::wallet::fee_weather::FeeWeather;
+        sink(FeeWeather::assess(wallet.params(), chain.estimated_feerate_sat_vb()).log_line());
+    }
     // Sibling live sids: a failed dispatch heals orphaned leases, and the
     // heal must keep every sibling's lease — including the record-less
     // negotiate→Setup-broadcast window (see reconcile_leases_with_chain_keeping).

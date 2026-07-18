@@ -303,11 +303,14 @@ fn backup_restore_and_mnemonic_rescan_round_trip_via_the_cli() {
     assert!(!out.status.success(), "--rescan without --restore must be refused");
 }
 
-/// The Task-18 trust path at the SHIPPED binary's surface: this build pins
-/// the REAL pre-alpha operator key, so the committed v1 manifest (signed by
-/// the real key via swapkey-manifest) ingests, re-ingest is an idempotent
-/// no-op, and a MODELED-root-signed manifest — the key printed in the library
-/// source — is refused. Ingest is CLI-only (DECISION 6).
+/// The Task-18 trust path at the SHIPPED binary's surface, post-rotation:
+/// this build pins the SECOND real operator key (the 2026-07-16 key-loss
+/// rotation), so the committed v1 manifest — signed by the RETIRED first
+/// key — now REFUSES on signature with the floor untouched, the committed
+/// v2 manifest (signed by the current key via swapkey-manifest) ingests,
+/// re-ingest is an idempotent no-op, and a MODELED-root-signed manifest —
+/// the key printed in the library source — is refused. Ingest is CLI-only
+/// (DECISION 6).
 #[test]
 fn pinned_root_manifest_ingest_via_the_cli() {
     use swapkey::settlement::params::Params;
@@ -339,26 +342,38 @@ fn pinned_root_manifest_ingest_via_the_cli() {
     assert!(t.contains("manifest version: 0"), "{t}");
     assert!(t.contains("fingerprintable anonymity"), "the v0 partition warning:\n{t}");
 
-    // The COMMITTED v1 artifact (docs/manifests/v1.manifest, signed by the
-    // real operator key) must ingest against this binary's pin.
+    // The COMMITTED v1 artifact (docs/manifests/v1.manifest) was signed by
+    // the RETIRED first operator key: since the 2026-07-16 key-loss rotation
+    // it must REFUSE on signature against this binary's pin, floor untouched
+    // (the documented rotation consequence, asserted live).
     let v1 = concat!(env!("CARGO_MANIFEST_DIR"), "/docs/manifests/v1.manifest");
     let out = run_cli(&config, &["manifest", "ingest", v1, "--passphrase-stdin"], PASSPHRASE);
     let t = text(&out);
-    assert!(out.status.success(), "the committed v1 manifest must ingest:\n{t}");
-    assert!(t.contains("manifest v1 ACCEPTED"), "{t}");
-    assert!(t.contains("version floor:    1"), "the floor must advance:\n{t}");
-    assert!(!t.contains("fingerprintable"), "v1 leaves the provisional partition:\n{t}");
+    assert!(!out.status.success(), "the retired-key v1 manifest must refuse:\n{t}");
+    assert!(t.contains("signature does not verify"), "verbatim refusal:\n{t}");
+    assert!(t.contains("still on v0"), "the floor must be untouched:\n{t}");
+
+    // The COMMITTED v2 artifact (docs/manifests/v2.manifest, signed by the
+    // current operator key) must ingest against this binary's pin.
+    let v2 = concat!(env!("CARGO_MANIFEST_DIR"), "/docs/manifests/v2.manifest");
+    let out = run_cli(&config, &["manifest", "ingest", v2, "--passphrase-stdin"], PASSPHRASE);
+    let t = text(&out);
+    assert!(out.status.success(), "the committed v2 manifest must ingest:\n{t}");
+    assert!(t.contains("manifest v2 ACCEPTED"), "{t}");
+    assert!(t.contains("version floor:    2"), "the floor must advance:\n{t}");
+    assert!(!t.contains("fingerprintable"), "v2 leaves the provisional partition:\n{t}");
 
     // Idempotent re-ingest of the identical envelope.
-    let out = run_cli(&config, &["manifest", "ingest", v1, "--passphrase-stdin"], PASSPHRASE);
+    let out = run_cli(&config, &["manifest", "ingest", v2, "--passphrase-stdin"], PASSPHRASE);
     let t = text(&out);
     assert!(out.status.success(), "idempotent re-ingest must be Ok:\n{t}");
     assert!(t.contains("already current"), "{t}");
 
-    // A MODELED-signed v2: validly formed, wrong root — the pinned binary
+    // A MODELED-signed v3 (forward of the floor, so the signature is the
+    // only refusal reason): validly formed, wrong root — the pinned binary
     // must refuse it verbatim (the modeled secret is public in the source).
-    let m2 = SignedManifest::compose(
-        2,
+    let m3 = SignedManifest::compose(
+        3,
         Params::testnet_provisional(),
         ClaimDelayPosture::Moderate,
         [(0, 6), (6, 36), (12, 72)],
@@ -366,9 +381,9 @@ fn pinned_root_manifest_ingest_via_the_cli() {
         3,
     )
     .unwrap();
-    let env2 = sign_manifest(&m2, &modeled_operator_seckey()).unwrap();
-    let modeled_path = dir.path().join("modeled-v2.manifest");
-    std::fs::write(&modeled_path, &env2).unwrap();
+    let env3 = sign_manifest(&m3, &modeled_operator_seckey()).unwrap();
+    let modeled_path = dir.path().join("modeled-v3.manifest");
+    std::fs::write(&modeled_path, &env3).unwrap();
     let out = run_cli(
         &config,
         &["manifest", "ingest", modeled_path.to_str().unwrap(), "--passphrase-stdin"],
@@ -377,7 +392,7 @@ fn pinned_root_manifest_ingest_via_the_cli() {
     let t = text(&out);
     assert!(!out.status.success(), "a modeled-root manifest must be refused:\n{t}");
     assert!(t.contains("signature does not verify"), "verbatim refusal:\n{t}");
-    assert!(t.contains("still on v1"), "{t}");
+    assert!(t.contains("still on v2"), "{t}");
 
     // A wrong-sized file is refused BEFORE it is read into memory.
     let junk = dir.path().join("junk.manifest");
@@ -395,7 +410,7 @@ fn pinned_root_manifest_ingest_via_the_cli() {
     let out = run_cli(&config, &["status", "--passphrase-stdin"], PASSPHRASE);
     let t = text(&out);
     assert!(out.status.success(), "{t}");
-    assert!(t.contains("manifest: v1"), "{t}");
+    assert!(t.contains("manifest: v2"), "{t}");
 }
 
 /// Task 20: `version` and `quickstart` are pre-alpha-branded provenance/
@@ -416,7 +431,7 @@ fn version_quickstart_and_diag_are_branded_and_secretless() {
     assert!(t.contains("PRE-ALPHA"), "{t}");
     assert!(t.contains("NO REAL FUNDS"), "{t}");
     assert!(
-        t.contains("pinned manifest trust root: fbb01df4f947cf69e8a24e4e907c60e8c903eb199e6dd949a2fabe5a5ea2191e"),
+        t.contains("pinned manifest trust root: fedd62229b6c8a194d6d174d68ad0ce303623cbd49df4b968b9b06ea9e6ec7fe"),
         "the REAL pinned root:\n{t}"
     );
     assert!(!t.contains("UNSHIPPABLE"), "a shippable build must not warn:\n{t}");

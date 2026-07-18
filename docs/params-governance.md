@@ -140,22 +140,80 @@ version 1 (DECISION 4): zero behavior change, but ingesting it moves a wallet
 off the v0 partition and exercises every trust-path gate for real. Tuned
 params (Task 14's live-testnet follow-up) ship later as v2+.
 
+## Next-round reserve advice (Task 26 → v2 recommendation)
+
+Task 26's fee calibration sanity-checks the congestion backstop against live
+testnet4 fees. Conclusion for the v2 round: **leave `cpfp_reserve_sats`
+unchanged at 25,000.**
+
+What the reserve has to satisfy. The refund exit is CPFP: a low-fee refund
+parent (143 vB, carrying only the baked `settlement_fee_sats` = 3,320 sats ≈
+23 sat/vB) plus a child funded from the reserve (~120 vB) — a 263 vB package.
+Spending the full reserve as child fee lifts the package to
+`(3,320 + 25,000) / 263 ≈ 108 sat/vB`, a mainnet-congestion-grade bump.
+`MAX_BUMP_FEE_SATS` = 200,000 sits far above the reserve, so that cap is a
+runaway guard, never the reserve's limiter.
+
+Live testnet4 headroom (measured 2026-07-16, leg-2 preflight):
+`estimatesmartfee 2 CONSERVATIVE` returned no estimate; `6 ECONOMICAL` = 1.5
+sat/vB; `mempoolminfee` = 1.0 sat/vB; mempool ~1.5 KB. Ambient testnet4
+feerate is ~1–2 sat/vB, so 25,000 buys ~50–100× headroom over what the network
+actually demands. No reserve shortfall is reachable on testnet in the pre-alpha
+window, so the reserve stays put; revisiting it belongs to a mainnet build,
+which is out of scope behind the cryptographer review.
+
+(The three settlement vsize constants — Setup 124 / Completion 124 / Refund
+143 vB — are ALL live-confirmed EXACT on testnet4: Setups and completions in
+the leg-2 swap (artifact §2, 2026-07-16), the refund in the dead-device
+drill (artifact §7, txid `0ed88a3e…9cd7bbe2`, 143 vB / 3,320 sats,
+2026-07-18). Zero drift from the signed fixtures — Task 26 step 1 closed
+with no test-baseline change and no signed-param change.)
+
+**Second v2 recommendation — testing-period onboarding delay (owner
+decision, Joe, 2026-07-16):** during the testnet testing rounds,
+`onboarding_delay_hours` drops 24–72 → **1–2** so timing gates stop stalling
+test cycles (the leg-2 rehearsal lost ~2 days to maturity waits). The value
+stays >0 and randomized per coin, so the mechanics under test — per-coin
+draws, dual wall+height anchoring, the `status` maturity annotation, the
+premature-swap refusal — all remain exercised, just on an hour scale.
+Rationale for the lever: there is deliberately NO bypass flag in code
+(eligibility anchors are write-once; params are not config) — the signed
+manifest IS the tuning path, and this is its first real use. Already-written
+anchors are unaffected by ingest (write-once); the production-scale delay
+must be restored in the first post-testing round (mainnet-era value is a
+cryptographer-review item regardless).
+
 ## Key management (honest pre-alpha story)
 
-ONE operator key, generated 2026-07-14; x-only pubkey
-`fbb01df4f947cf69e8a24e4e907c60e8c903eb199e6dd949a2fabe5a5ea2191e` (pinned in
-`swapkey-cli`, published in `operator.pub` and here). No rotation protocol,
-no threshold signing, no HSM — those are post-pre-alpha. What exists now:
+ONE operator key at a time; no threshold signing, no HSM — those are
+post-pre-alpha. The CURRENT key (the second): generated 2026-07-16, x-only
+pubkey `fedd62229b6c8a194d6d174d68ad0ce303623cbd49df4b968b9b06ea9e6ec7fe`
+(pinned in `swapkey-cli`, published in `operator-key-v2\operator.pub` and
+here).
+
+**The key-loss rotation has now run FOR REAL (2026-07-16).** The first key
+(`fbb01df4…a2191e`, generated 2026-07-14, signer of v1) had its reseal
+passphrase lost the day after resealing. Recovery followed this section's
+procedure exactly: `keygen` a fresh key → re-pin `PINNED_OPERATOR_XONLY` →
+rebuild → re-issue params as v2 under the new key. Observed consequences,
+all as designed: v1.manifest stops verifying under the new pin (it stays in
+`docs/manifests/` as history); a wallet holding v1 falls back to the
+identical compiled baseline at open (quarantine ALARM, floor KEPT) until it
+ingests the new-key v2; anti-rollback holds across the transition because
+the persisted floors never reset. Lesson institutionalized: the operator
+passphrase now lives in the owner's password manager at keygen time, not
+in human memory. What exists now:
 
 * The secret is sealed at rest (passphrase KEK, production PBKDF2 work
-  factor) in `operator-key\` outside the repo; `reseal` changes the
-  passphrase without changing the keypair (no re-pin, no re-issue).
+  factor) in `operator-key-v2\` outside the repo (`operator-key\` holds the
+  retired first key); `reseal` changes the passphrase without changing the
+  keypair (no re-pin, no re-issue).
 * **Key loss** (file or passphrase): no further manifests can be signed.
   Recovery = `keygen` a new key, re-pin the new pubkey, rebuild and
   redistribute wallet binaries. Wallets' persisted version FLOORS survive the
   transition, so anti-rollback holds across a re-pin (an old-root manifest
   simply stops verifying; the floor still refuses old versions if the old
-  root is ever re-pinned).
+  root is ever re-pinned). Exercised for real 2026-07-16 — see above.
 * **Key compromise**: an attacker can sign manifests, but only within
   `validate()`'s bounds (the ordering invariant is asserted signature-blind),
   and only moving versions FORWARD. The damage envelope is bounded-but-real
