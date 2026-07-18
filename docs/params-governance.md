@@ -245,3 +245,52 @@ remains the documented enclave-counter limit.
   and the floor was KEPT. Re-ingest the current manifest.
 * `handshake: peer runs different signed params (manifest mismatch)` — the
   two wallets are on different manifest content; sync versions and retry.
+* `validation failed: ticket's signed params differ from this wallet's
+  manifest` — same condition caught EARLIER: the ticket embeds the maker's
+  params digest, so the taker refuses before dialing at all (observed live,
+  round 1→2 staggered drill).
+
+## Round log
+
+The per-round record — date, what shipped, what the drills proved. This
+section is the template every future round appends to.
+
+### Round 1 → 2 (2026-07-18) — the first REAL parameter round
+
+* **v2** (id `cdda51a90e6d719b05e747666102483d1f7c799ae762b9d962bdddc4b011300e`,
+  signed 2026-07-16 by the SECOND operator key `fedd6222…` after the
+  documented key-loss rotation): ONE change — `onboarding_delay_hours`
+  24–72 → **1–2 (testing period)**, per the owner decision recorded above.
+  Everything else re-issued verbatim; the compiled baseline is deliberately
+  UNCHANGED (24–72), so v0-fallback wallets keep the conservative draw.
+* **Rotation fallout observed live**: on first open under the new pin, BOTH
+  fleet wallets quarantined their stored v1 (retired-key signature) with
+  `ALARM (manifest open): ProvisionalFallback` and ran the identical
+  compiled baseline with the floor KEPT at 1 — the documented fallback path,
+  seen in the wild before the round began.
+* **Ingest + converge**: v2 ACCEPTED into A, then B (`manifest v2 ACCEPTED
+  (was v0) — persisted`); floor 1→2 on both; `manifest show` agrees
+  fleet-wide on the id and the `1..2` delay.
+* **Staggered-rollout drill (the DECISION-5 scenario, live)**: with A on v2
+  and B still on the baseline, the A↔B attempt refused BEFORE ANY
+  CONNECTION — the taker's ticket validation said `validation failed:
+  ticket's signed params differ from this wallet's manifest — update one
+  side so both run the same signed parameters`. The ticket embeds the
+  maker's params digest, so a split fleet cannot even dial; the wire-level
+  `handshake:` gate remains the second line for connect-style flows. Zero
+  state created; the refusal is free.
+* **Operator-error drills** (every arm refused; the wallet stayed on
+  v2/floor 2 throughout):
+  * v1 re-ingest (downgrade, under rotation): `signature does not verify` —
+    the SIGNATURE gate fires first (retired key), Ordering never consulted.
+  * corrupted copy, payload byte flipped: `delay bound must stay strictly
+    inside the worst-case claim window` — the BOUNDS gate tripped first.
+    Validation-order observation: payload parse/bounds precede the
+    signature check on this path; every arm still refuses cleanly. Noted
+    for the external review packet; not changed unilaterally.
+  * corrupted copy, signature byte flipped: `signature does not verify`.
+  * version-swap (same version "2", different content, validly signed):
+    `manifest version must strictly increase (downgrade/replay refused)` —
+    the live Ordering demo.
+* Evidence: `docs/artifacts/manifest-v2-round-2026-07-18.md`; raw stdout in
+  `tasks/task-27-manifest-v2-round/round-logs/` (outside the repo).
