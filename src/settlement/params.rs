@@ -79,7 +79,9 @@ impl Params {
     /// `docs/artifacts/testnet4-leg2-2026-07-16.md`): both Setups mined at
     /// exactly 124 vB / 1_200 sats, both completions at exactly 124 vB /
     /// 3_320 sats — zero drift from the fixture measurement, values KEEP.
-    /// Refund 143 vB awaits its live datapoint from the task-25 refund drill. All three clear bitcoind's
+    /// Refund 143 vB confirmed live 2026-07-18 (testnet4 dead-device refund drill,
+    /// txid 0ed88a3e380998a47d3a99ddde44fbdb2d2187d4ba5a70f665d82e009cd7bbe2:
+    /// exactly 143 vB / 3_320 sats, artifact §7). All three clear bitcoind's
     /// stock 1 sat/vB relay floor with 9–26x margin, so the numbers KEEP.
     /// When live congestion outruns a baked feerate (estimate above ~9 sat/vB
     /// strands a Setup, above ~23 an exit), the DYNAMIC backstop (Task 14:

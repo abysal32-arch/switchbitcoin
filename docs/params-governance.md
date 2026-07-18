@@ -163,9 +163,11 @@ window, so the reserve stays put; revisiting it belongs to a mainnet build,
 which is out of scope behind the cryptographer review.
 
 (The three settlement vsize constants — Setup 124 / Completion 124 / Refund
-143 vB — are calibrated separately against the leg-2 artifact once the live
-swap lands. That is Task 26 step 1, not a signed-param change: any deviation
-updates the TEST baselines + comments, never the compiled params.)
+143 vB — are ALL live-confirmed EXACT on testnet4: Setups and completions in
+the leg-2 swap (artifact §2, 2026-07-16), the refund in the dead-device
+drill (artifact §7, txid `0ed88a3e…9cd7bbe2`, 143 vB / 3,320 sats,
+2026-07-18). Zero drift from the signed fixtures — Task 26 step 1 closed
+with no test-baseline change and no signed-param change.)
 
 **Second v2 recommendation — testing-period onboarding delay (owner
 decision, Joe, 2026-07-16):** during the testnet testing rounds,
