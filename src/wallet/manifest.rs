@@ -91,7 +91,7 @@ impl ManifestTrustRoot for ModeledTrustRoot {
 
 /// Build-time pinned trust root (Task 18, DECISION 3): wraps the REAL
 /// operator x-only key compiled into a binary as a constant. Deliberately NOT
-/// loadable from config — a `swapkey.toml` pin would reduce the whole
+/// loadable from config — a `switchbitcoin.toml` pin would reduce the whole
 /// signed-manifest trust path to config-file security (any local writer of a
 /// plaintext file could repoint the root, then feed manifests). The bytes are
 /// not validated here; a non-key value fails every `verify_manifest` with

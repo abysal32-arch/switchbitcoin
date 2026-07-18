@@ -1,4 +1,4 @@
-//! Runner glue (Task 08): everything the `swapkey-cli` binary needs between
+//! Runner glue (Task 08): everything the `switchbitcoin-cli` binary needs between
 //! the built wallet seams and an actual terminal session — the two-party
 //! PRE-SWAP NEGOTIATION handshake that assembles a [`SwapContext`], and the
 //! TICK→BROADCAST mapping that turns [`SwapApp`]/[`RecoveryDriver`] decisions

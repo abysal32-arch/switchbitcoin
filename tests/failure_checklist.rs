@@ -15,22 +15,22 @@
 //! proven in `tests/taproot_swap.rs` (bitcoin-side schnorr verify).
 
 use bitcoin::{OutPoint, Txid};
-use swapkey::chain::{ChainView, DualSourceChainView, SimChain, Source, SpendStatus};
-use swapkey::crypto::adaptor::{AdaptorPoint, AdaptorSecret};
-use swapkey::crypto::{ValidatedFinalSig, ValidatedPartial, ValidatedPoint, ValidatedPubNonce};
-use swapkey::settlement::params::Params;
-use swapkey::settlement::refund::{confirm_watchtower_handoff, PreArmedRefund, Watchtower};
-use swapkey::settlement::state_machine::{
+use switchbitcoin::chain::{ChainView, DualSourceChainView, SimChain, Source, SpendStatus};
+use switchbitcoin::crypto::adaptor::{AdaptorPoint, AdaptorSecret};
+use switchbitcoin::crypto::{ValidatedFinalSig, ValidatedPartial, ValidatedPoint, ValidatedPubNonce};
+use switchbitcoin::settlement::params::Params;
+use switchbitcoin::settlement::refund::{confirm_watchtower_handoff, PreArmedRefund, Watchtower};
+use switchbitcoin::settlement::state_machine::{
     ExchangeInputs, Funding, PeerSession, Possessing, Role, Transport,
 };
-use swapkey::signing::{commit_and_reveal, SigningSession, SingleSignerLease};
-use swapkey::tx::escrow::Escrow;
-use swapkey::tx::setup::build_setup;
-use swapkey::tx::txbuild::{build_completion, finalize_key_spend, SpendTx};
-use swapkey::wire::{
+use switchbitcoin::signing::{commit_and_reveal, SigningSession, SingleSignerLease};
+use switchbitcoin::tx::escrow::Escrow;
+use switchbitcoin::tx::setup::build_setup;
+use switchbitcoin::tx::txbuild::{build_completion, finalize_key_spend, SpendTx};
+use switchbitcoin::wire::{
     open_message, parse_message, seal_message, serialize_message, Message, WIRE_VERSION,
 };
-use swapkey::{Error, Result};
+use switchbitcoin::{Error, Result};
 use secp::{Point, Scalar};
 use std::sync::mpsc;
 
@@ -38,7 +38,7 @@ fn test_key_ctx() -> (musig2::KeyAggContext, Scalar) {
     let mut rng = rand::rng();
     let sk = Scalar::random(&mut rng);
     let other = Scalar::random(&mut rng);
-    let ctx = swapkey::settlement::state_machine::canonical_key_agg(sk * secp::G, other * secp::G)
+    let ctx = switchbitcoin::settlement::state_machine::canonical_key_agg(sk * secp::G, other * secp::G)
         .expect("valid keys");
     (ctx, sk)
 }
@@ -75,7 +75,7 @@ fn keypair() -> Party {
 }
 
 fn aggregate_internal(a: Point, b: Point) -> Point {
-    swapkey::settlement::state_machine::canonical_internal_key(a, b).expect("keys")
+    switchbitcoin::settlement::state_machine::canonical_internal_key(a, b).expect("keys")
 }
 
 fn txid_from(seed: u8) -> Txid {
@@ -190,7 +190,7 @@ fn run_onchain_exchange() -> Swap {
             lease_dir: Some(lease_sl.path().to_path_buf()),
             possession_store: Some((
                 store.path().to_path_buf(),
-                swapkey::crypto::storage::platform_secure_key(),
+                switchbitcoin::crypto::storage::platform_secure_key(),
             )),
             taproot_root_comp_sh: Some(root_sh),
             taproot_root_comp_sl: Some(root_sl),
@@ -398,13 +398,13 @@ fn refund_completion_race_resolves_deterministically() {
     // Even though the early CSV may have matured, SL must NOT refund: the
     // completion is winning. refund::run returns Abort ("take the swap").
     swap.chain.advance(swap.params.delta_early); // early refund now mature by time
-    let decision = swapkey::settlement::refund::run(&sl_refund, &swap.chain, swap.op_comp_sh);
+    let decision = switchbitcoin::settlement::refund::run(&sl_refund, &swap.chain, swap.op_comp_sh);
     assert!(matches!(decision, Err(Error::Abort(_))), "SL refunded against a winning completion");
 
     // Confirm the completion; the decision is unchanged and no refund exists.
     swap.chain.mine();
     assert!(matches!(swap.chain.spend_status(swap.op_comp_sh), SpendStatus::Confirmed(_)));
-    let decision = swapkey::settlement::refund::run(&sl_refund, &swap.chain, swap.op_comp_sh);
+    let decision = switchbitcoin::settlement::refund::run(&sl_refund, &swap.chain, swap.op_comp_sh);
     assert!(matches!(decision, Err(Error::Abort(_))));
 
     // Deterministic reconciliation: the escrow is spent by exactly the
@@ -646,10 +646,10 @@ fn partial_funding_funded_side_reclaims() {
     .expect("arm SL refund");
 
     // Before maturity: refund is not yet broadcastable.
-    assert!(swapkey::settlement::refund::run(&refund, &chain, op).is_err());
+    assert!(switchbitcoin::settlement::refund::run(&refund, &chain, op).is_err());
     // After the early CSV: no completion exists (Absent), so the refund fires.
     chain.advance(params.delta_early);
-    swapkey::settlement::refund::run(&refund, &chain, op).expect("refund broadcasts");
+    switchbitcoin::settlement::refund::run(&refund, &chain, op).expect("refund broadcasts");
     chain.mine();
     assert!(matches!(chain.spend_status(op), SpendStatus::Confirmed(_)));
     // Nothing broadcastable against it: a DIFFERENT tx (e.g. a would-be
@@ -678,8 +678,8 @@ fn partial_funding_funded_side_reclaims() {
 // bump path end to end, not a lowered-floor stand-in.
 #[test]
 fn congestion_backstop_behaves() {
-    use swapkey::tx::backstop::{build_cpfp_bump, finalize_cpfp_bump, ANCHOR_VOUT};
-    use swapkey::tx::setup::pre_encumbrance_spk;
+    use switchbitcoin::tx::backstop::{build_cpfp_bump, finalize_cpfp_bump, ANCHOR_VOUT};
+    use switchbitcoin::tx::setup::pre_encumbrance_spk;
 
     let params = Params::testnet_provisional();
     let sh = keypair();
@@ -769,7 +769,7 @@ fn congestion_backstop_behaves() {
     chain.advance(delta_late); // CSV matured
     assert!(
         matches!(
-            swapkey::settlement::refund::run(&refund, &chain, op_b),
+            switchbitcoin::settlement::refund::run(&refund, &chain, op_b),
             Err(Error::Deadline(_))
         ),
         "the baked-fee refund must surface the stall, not vanish"
@@ -880,7 +880,7 @@ fn exchange_rejects_wrong_taproot_output_key() {
         lease_dir: Some(lease.path().to_path_buf()),
         possession_store: Some((
             store.path().to_path_buf(),
-            swapkey::crypto::storage::platform_secure_key(),
+            switchbitcoin::crypto::storage::platform_secure_key(),
         )),
         taproot_root_comp_sh: Some(escrow_sh.merkle_root()),
         taproot_root_comp_sl: Some(escrow_sl.merkle_root()),
@@ -899,7 +899,7 @@ fn exchange_rejects_wrong_taproot_output_key() {
 // Wagner-Drijvers attempt), the victim MUST abort before signing.
 #[test]
 fn equivocated_nonce_reveal_is_rejected() {
-    use swapkey::crypto::ValidatedPubNonce;
+    use switchbitcoin::crypto::ValidatedPubNonce;
     use std::sync::mpsc;
 
     // A transport that passes the commitment through but SUBSTITUTES a different
@@ -994,7 +994,7 @@ fn equivocated_nonce_reveal_is_rejected() {
         lease_dir: Some(lease_v.path().to_path_buf()),
         possession_store: Some((
             store.path().to_path_buf(),
-            swapkey::crypto::storage::platform_secure_key(),
+            switchbitcoin::crypto::storage::platform_secure_key(),
         )),
         taproot_root_comp_sh: None,
         taproot_root_comp_sl: None,
@@ -1133,7 +1133,7 @@ fn full_swap_under_cofunding_skew() {
             lease_dir: Some(lease_sl.path().to_path_buf()),
             possession_store: Some((
                 store.path().to_path_buf(),
-                swapkey::crypto::storage::platform_secure_key(),
+                switchbitcoin::crypto::storage::platform_secure_key(),
             )),
             taproot_root_comp_sh: Some(root_sh),
             taproot_root_comp_sl: Some(root_sl),
@@ -1288,7 +1288,7 @@ fn full_swap_from_real_setup_funding() {
             lease_dir: Some(lease_sl.path().to_path_buf()),
             possession_store: Some((
                 store.path().to_path_buf(),
-                swapkey::crypto::storage::platform_secure_key(),
+                switchbitcoin::crypto::storage::platform_secure_key(),
             )),
             taproot_root_comp_sh: Some(root_sh),
             taproot_root_comp_sl: Some(root_sl),

@@ -1,4 +1,13 @@
-# Swap Key Protocol — Settlement-Core Scaffold (v3.16)
+# SwitchBitcoin Protocol — Settlement-Core Scaffold (v3.16)
+
+> **Rebrand note (Task 31, 2026-07-18):** the project's public identity is
+> **SwitchBitcoin** (formerly "Swap Key", the internal codename; protocol
+> lineage v3.16 unchanged). Crate `switchbitcoin`, binaries
+> `switchbitcoin-cli` / `switchbitcoin-manifest`, config
+> `switchbitcoin.toml` (legacy `swapkey.toml` still accepted), env namespace
+> `SWITCHBITCOIN_*` (legacy `SWAPKEY_*` still accepted). The `newkey-*`
+> domain tags, the `newkey-scaffold` folder name, `NEWKEY_GIT_HASH`, and the
+> `skt1` ticket HRP are deliberate spec literals and did NOT change.
 
 This is the **step-1/step-2 reference scaffold** from the v3.16 build sequence:
 pinned crypto + validation gate + nonce invariants + settlement core, with

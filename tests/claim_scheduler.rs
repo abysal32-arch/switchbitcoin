@@ -5,19 +5,19 @@
 //! late refund matures.
 
 use bitcoin::OutPoint;
-use swapkey::chain::{ChainView, SimChain, SpendStatus};
-use swapkey::crypto::adaptor::AdaptorSecret;
-use swapkey::crypto::ValidatedPoint;
-use swapkey::settlement::params::Params;
-use swapkey::settlement::refund::{confirm_watchtower_handoff, PreArmedRefund};
-use swapkey::settlement::state_machine::{
+use switchbitcoin::chain::{ChainView, SimChain, SpendStatus};
+use switchbitcoin::crypto::adaptor::AdaptorSecret;
+use switchbitcoin::crypto::ValidatedPoint;
+use switchbitcoin::settlement::params::Params;
+use switchbitcoin::settlement::refund::{confirm_watchtower_handoff, PreArmedRefund};
+use switchbitcoin::settlement::state_machine::{
     ExchangeInputs, Funding, PeerSession, Role, Transport,
 };
-use swapkey::tx::escrow::Escrow;
-use swapkey::tx::txbuild::{build_completion, finalize_key_spend};
-use swapkey::wallet::claim_scheduler::{ClaimBroadcast, ClaimScheduler};
-use swapkey::wallet::manifest::{ClaimDelayPosture, SignedManifest};
-use swapkey::{Error, Result};
+use switchbitcoin::tx::escrow::Escrow;
+use switchbitcoin::tx::txbuild::{build_completion, finalize_key_spend};
+use switchbitcoin::wallet::claim_scheduler::{ClaimBroadcast, ClaimScheduler};
+use switchbitcoin::wallet::manifest::{ClaimDelayPosture, SignedManifest};
+use switchbitcoin::{Error, Result};
 use secp::{Point, Scalar};
 use std::sync::mpsc;
 
@@ -77,7 +77,7 @@ fn sl_claim_is_posture_delayed_reveal_observed_and_bound_holds() {
     let sh = keypair();
     let sl = keypair();
     let internal =
-        swapkey::settlement::state_machine::canonical_internal_key(sh.pk, sl.pk).unwrap();
+        switchbitcoin::settlement::state_machine::canonical_internal_key(sh.pk, sl.pk).unwrap();
     let escrow_comp_sh = Escrow::new(&internal, &sl.pk, params.delta_early).unwrap(); // E_sl
     let escrow_comp_sl = Escrow::new(&internal, &sh.pk, delta_late).unwrap(); // E_sh
     let op_comp_sh = OutPoint::new(txid_from(2), 0); // E_sl (SH sweeps)
@@ -152,7 +152,7 @@ fn sl_claim_is_posture_delayed_reveal_observed_and_bound_holds() {
             lease_dir: Some(lease_sl.path().to_path_buf()),
             possession_store: Some((
                 store.path().to_path_buf(),
-                swapkey::crypto::storage::platform_secure_key(),
+                switchbitcoin::crypto::storage::platform_secure_key(),
             )),
             taproot_root_comp_sh: Some(root_sh),
             taproot_root_comp_sl: Some(root_sl),

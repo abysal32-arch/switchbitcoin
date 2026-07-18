@@ -1,4 +1,4 @@
-//! `swapkey-cli` — the runnable pre-alpha wallet (Task 08).
+//! `switchbitcoin-cli` — the runnable pre-alpha wallet (Task 08).
 //!
 //! A THIN composition over the library seams: [`Wallet`] (config + keystore +
 //! engine, Task 07), [`BitcoinCoreChainView`] (real node, Task 03),
@@ -11,7 +11,7 @@
 //! the peer transport is plaintext TCP (LAN/loopback interop). No real funds
 //! before the external cryptographer review.
 //!
-//! Subcommands (run `swapkey-cli help`):
+//! Subcommands (run `switchbitcoin-cli help`):
 //!   init      create (or resume creating) the wallet: keystore + mnemonic
 //!             backup + Phase-0 acknowledgement + ledger; writes a config
 //!             template if none exists. `--restore` re-seals from a mnemonic.
@@ -28,11 +28,11 @@
 //!             atomic) and verify the wallet opens; --rescan raises the
 //!             key-index floor when the bundle may be stale.
 //!   watch     standalone watchtower (second-device dead-device refund guard).
-//!   serve     localhost JSON API for SwapKey-Wallet.html (loopback, no auth).
+//!   serve     localhost JSON API for SwitchBitcoin-Wallet.html (loopback, no auth).
 //!   manifest  show/ingest the signed-params manifest. Verification is
 //!             against the BUILD-TIME pinned operator key
 //!             (`PINNED_OPERATOR_XONLY`); authoring/signing lives in the
-//!             separate `swapkey-manifest` ops tool — this binary has no
+//!             separate `switchbitcoin-manifest` ops tool — this binary has no
 //!             operator-key input path.
 //!
 //! Logging: plain lines to stderr, no secrets — the mnemonic is printed ONCE
@@ -47,26 +47,26 @@ use std::time::Duration;
 
 use unicode_normalization::UnicodeNormalization;
 
-use swapkey::chain::{AuthoritativeChainView, ChainView};
-use swapkey::settlement::state_machine::PeerSession;
-use swapkey::wallet::config::{Network, WalletConfig, CONFIG_FILE};
-use swapkey::wallet::keys::KeyPurpose;
-use swapkey::wallet::manifest::{
+use switchbitcoin::chain::{AuthoritativeChainView, ChainView};
+use switchbitcoin::settlement::state_machine::PeerSession;
+use switchbitcoin::wallet::config::{Network, WalletConfig, CONFIG_FILE, LEGACY_CONFIG_FILE};
+use switchbitcoin::wallet::keys::KeyPurpose;
+use switchbitcoin::wallet::manifest::{
     ClaimDelayPosture, ManifestOpenReport, PinnedTrustRoot, ENVELOPE_LEN,
 };
-use swapkey::wallet::ledger::{acknowledge_phase0, SystemClock, PHASE0_WARNING};
-use swapkey::wallet::runner::{
+use switchbitcoin::wallet::ledger::{acknowledge_phase0, SystemClock, PHASE0_WARNING};
+use switchbitcoin::wallet::runner::{
     self, apply_recovery_tick, backstop_step, hex32, negotiate_swap, refund_babysit_step,
     swap_step, RunOptions, SwapOutcome, SwapStepOutcome,
 };
-use swapkey::wallet::runtime::{FirstRunError, OpenedWallet, Wallet};
-use swapkey::wallet::ticket::{maker_rendezvous, taker_rendezvous, Ticket};
-use swapkey::wallet::transport::{
+use switchbitcoin::wallet::runtime::{FirstRunError, OpenedWallet, Wallet};
+use switchbitcoin::wallet::ticket::{maker_rendezvous, taker_rendezvous, Ticket};
+use switchbitcoin::wallet::transport::{
     negotiation_io_timeout, TcpTransport, DEFAULT_CONNECT_RETRIES, DIAL_RETRY_BACKOFF,
     RENDEZVOUS_LEASH,
 };
-use swapkey::wallet::SoftwareKeyStore;
-use swapkey::wallet::SwapApp;
+use switchbitcoin::wallet::SoftwareKeyStore;
+use switchbitcoin::wallet::SwapApp;
 
 /// Deposit-address recognition scan bound (`onboard` maps the chain-reported
 /// funding spk back to its key index; the ledger's counter is monotonic, so
@@ -76,7 +76,7 @@ const KEY_SCAN_LIMIT: u32 = 10_000;
 /// The BUILD-TIME manifest trust root (Task 18, DECISION 3): the REAL
 /// pre-alpha operator x-only public key, hex
 /// `fedd62229b6c8a194d6d174d68ad0ce303623cbd49df4b968b9b06ea9e6ec7fe`.
-/// Generated 2026-07-16 by `swapkey-manifest keygen` — the SECOND operator
+/// Generated 2026-07-16 by `switchbitcoin-manifest keygen` — the SECOND operator
 /// key: the first (fbb01df4…, 2026-07-14) had its reseal passphrase lost and
 /// was retired via the documented key-loss rotation
 /// (docs/params-governance.md "Key management"), exercising that recovery
@@ -87,7 +87,7 @@ const KEY_SCAN_LIMIT: u32 = 10_000;
 /// restore verification, manifest — pins it via [`Wallet::open_with_root`];
 /// the prototype `ModeledTrustRoot` (whose secret is printed in the library
 /// source) remains tests/library-only. DELIBERATELY not a config key: a
-/// `swapkey.toml` pin would reduce the signed-manifest trust path to
+/// `switchbitcoin.toml` pin would reduce the signed-manifest trust path to
 /// config-file security (any local file writer could repoint the root, then
 /// feed hostile-but-`validate()`-clean params). Key loss/rotation = re-pin +
 /// rebuild + redistribute (docs/params-governance.md).
@@ -110,9 +110,9 @@ fn pinned_root() -> Box<PinnedTrustRoot> {
 /// WRITES (`confirm_split`) always use the real [`SystemClock`], and
 /// testnet keeps real delays (mainnet has no config variant at all).
 struct LeaseClock(Network);
-impl swapkey::wallet::ledger::WalletClock for LeaseClock {
+impl switchbitcoin::wallet::ledger::WalletClock for LeaseClock {
     fn now_unix(&self) -> u64 {
-        let now = swapkey::wallet::ledger::WalletClock::now_unix(&SystemClock);
+        let now = switchbitcoin::wallet::ledger::WalletClock::now_unix(&SystemClock);
         match self.0 {
             Network::Regtest => now.saturating_add(73 * 3600),
             Network::Testnet => now,
@@ -126,7 +126,7 @@ fn main() {
         Ok(()) => 0,
         Err(UsageError(msg)) => {
             eprintln!("error: {msg}");
-            eprintln!("run `swapkey-cli help` for usage");
+            eprintln!("run `switchbitcoin-cli help` for usage");
             2
         }
     };
@@ -137,13 +137,13 @@ fn main() {
 /// Display text; no values/secrets ride in them by construction).
 struct UsageError(String);
 
-impl From<swapkey::Error> for UsageError {
-    fn from(e: swapkey::Error) -> Self {
+impl From<switchbitcoin::Error> for UsageError {
+    fn from(e: switchbitcoin::Error) -> Self {
         UsageError(e.to_string())
     }
 }
-impl From<swapkey::wallet::config::ConfigError> for UsageError {
-    fn from(e: swapkey::wallet::config::ConfigError) -> Self {
+impl From<switchbitcoin::wallet::config::ConfigError> for UsageError {
+    fn from(e: switchbitcoin::wallet::config::ConfigError) -> Self {
         UsageError(e.to_string())
     }
 }
@@ -209,7 +209,7 @@ fn run(args: &[String]) -> CliResult {
 /// key, or equal to the modeled TEST root (whose SECRET is printed in the
 /// library source). One cheap curve derivation per process start.
 fn test_root_reason() -> Option<&'static str> {
-    use swapkey::wallet::manifest::{ManifestTrustRoot, ModeledTrustRoot};
+    use switchbitcoin::wallet::manifest::{ManifestTrustRoot, ModeledTrustRoot};
     if bitcoin::secp256k1::XOnlyPublicKey::from_slice(&PINNED_OPERATOR_XONLY).is_err() {
         return Some("the pinned trust root is not a valid x-only key");
     }
@@ -220,13 +220,13 @@ fn test_root_reason() -> Option<&'static str> {
 }
 
 const HELP: &str = "\
-swapkey-cli — Swap Key pre-alpha wallet (REGTEST/TESTNET ONLY, no real funds)
+switchbitcoin-cli — SwitchBitcoin pre-alpha wallet (REGTEST/TESTNET ONLY, no real funds)
 
-USAGE: swapkey-cli <COMMAND> [FLAGS]
+USAGE: switchbitcoin-cli <COMMAND> [FLAGS]
 
 COMMANDS
   init      Create the wallet (keystore + mnemonic backup + Phase-0 ack +
-            ledger). Writes a swapkey.toml template if none exists.
+            ledger). Writes a switchbitcoin.toml template if none exists.
             --data-dir <path>   data dir for a fresh config template
             --network <net>     regtest|testnet for a fresh template (default regtest)
             --restore           restore the keystore from a BIP39 mnemonic
@@ -301,7 +301,7 @@ COMMANDS
                                 when the bundle may be OLDER than the last
                                 address this wallet ever issued
   manifest <show|ingest <file>>  The signed-params trust path (operator
-            manifests are authored/signed by the SEPARATE swapkey-manifest
+            manifests are authored/signed by the SEPARATE switchbitcoin-manifest
             tool; this wallet only verifies + ingests against its BUILD-TIME
             pinned operator key — the pin is deliberately not configurable).
             show                current version, id, params, and whether this
@@ -319,7 +319,7 @@ COMMANDS
             NEVER contains the seed, mnemonic, passphrase, or RPC secrets.
   version   Print the build version (crate + git hash) and the pinned
             manifest trust root. PRE-ALPHA, TESTNET/REGTEST ONLY.
-  serve     Localhost JSON API for SwapKey-Wallet.html (LOOPBACK ONLY, no
+  serve     Localhost JSON API for SwitchBitcoin-Wallet.html (LOOPBACK ONLY, no
             auth — any local process can drive the wallet; pre-alpha).
             --port <n>          bind 127.0.0.1:<n> (default 3316)
             --poll-secs / --feerate / --assume-congested / --connect-retries
@@ -337,7 +337,8 @@ COMMANDS
             field carries the first).
 
 COMMON FLAGS
-  --config <path>        config file (default ./swapkey.toml)
+  --config <path>        config file (default ./switchbitcoin.toml; falls back
+                         to a legacy ./swapkey.toml when only that exists)
   --passphrase-stdin     read the passphrase as the first stdin line
                          (scripting; default is an interactive prompt)
   --accept-phase0        acknowledge the Phase-0 warning without a prompt
@@ -436,8 +437,24 @@ impl Flags {
             Some(v) => v.parse().map(Some).map_err(|_| format!("--{name}: not a number").into()),
         }
     }
+    /// Default config resolution: an explicit `--config` path wins verbatim;
+    /// otherwise `./switchbitcoin.toml`, falling back to the pre-rebrand
+    /// legacy name (`LEGACY_CONFIG_FILE`, with a deprecation line) when only
+    /// that exists — the live testnet fleet's configs predate the Task-31
+    /// rename.
     fn config_path(&self) -> PathBuf {
-        PathBuf::from(self.value("config").unwrap_or(CONFIG_FILE))
+        if let Some(p) = self.value("config") {
+            return PathBuf::from(p);
+        }
+        let new = PathBuf::from(CONFIG_FILE);
+        if !new.exists() && Path::new(LEGACY_CONFIG_FILE).exists() {
+            log(&format!(
+                "DEPRECATED: no ./{CONFIG_FILE} found — using legacy ./{LEGACY_CONFIG_FILE}; \
+                 rename it to {CONFIG_FILE} when convenient"
+            ));
+            return PathBuf::from(LEGACY_CONFIG_FILE);
+        }
+        new
     }
 }
 
@@ -457,14 +474,14 @@ fn parse_claim_posture(v: &str) -> Result<ClaimDelayPosture, UsageError> {
 }
 
 fn log(msg: &str) {
-    eprintln!("[swapkey] {msg}");
+    eprintln!("[switchbitcoin] {msg}");
 }
 
 /// A dial-failure message that names the likely cause and points at the guide's
 /// connectivity section (Task 24). Testers hit refused/unreachable far more
 /// often than any protocol error, and a bare transport abort sends them looking
 /// in the wrong place.
-fn dial_failed_hint(addr: &str, e: swapkey::Error) -> UsageError {
+fn dial_failed_hint(addr: &str, e: switchbitcoin::Error) -> UsageError {
     format!(
         "could not reach the peer at {addr}: {e}. Likely the maker isn't \
          listening yet, or its host:port isn't reachable from here (home \
@@ -555,7 +572,7 @@ fn open_ready(flags: &Flags) -> Result<Wallet, UsageError> {
             Ok(*w)
         }
         OpenedWallet::FirstRun(_) => {
-            Err("wallet onboarding is incomplete — run `swapkey-cli init` first".into())
+            Err("wallet onboarding is incomplete — run `switchbitcoin-cli init` first".into())
         }
     }
 }
@@ -586,11 +603,11 @@ fn log_manifest_alarm(wallet: &Wallet) {
 
 fn chain_view(
     config: &WalletConfig,
-) -> Result<swapkey::chain::BitcoinCoreChainView<swapkey::chain::HttpTransport>, UsageError> {
+) -> Result<switchbitcoin::chain::BitcoinCoreChainView<switchbitcoin::chain::HttpTransport>, UsageError> {
     let node = config
         .node
         .as_ref()
-        .ok_or("this command needs a node: add a [node] section to swapkey.toml")?;
+        .ok_or("this command needs a node: add a [node] section to switchbitcoin.toml")?;
     Ok(node.chain_view()?)
 }
 
@@ -667,7 +684,7 @@ fn cmd_init(flags: &Flags) -> CliResult {
         SoftwareKeyStore::restore(&config.data_dir, &words, &passphrase)?;
         log("keystore restored from mnemonic");
         log("NOTE: the mnemonic recovers the SEED only. If you have a `backup` bundle,");
-        log("      use `swapkey-cli restore --from <bundle>` instead — it brings back the");
+        log("      use `switchbitcoin-cli restore --from <bundle>` instead — it brings back the");
         log("      coin ledger, swap records, and key index too.");
     }
 
@@ -728,9 +745,9 @@ fn cmd_init(flags: &Flags) -> CliResult {
                     }
                 }
                 print_status(&wallet);
-                log("next: edit swapkey.toml's [node] section if you haven't, then");
-                log("      `swapkey-cli address` to get a deposit address");
-                log("      (full walkthrough: `swapkey-cli quickstart`)");
+                log("next: edit switchbitcoin.toml's [node] section if you haven't, then");
+                log("      `switchbitcoin-cli address` to get a deposit address");
+                log("      (full walkthrough: `switchbitcoin-cli quickstart`)");
                 return Ok(());
             }
             Err(FirstRunError::Refused { first_run: fr, error }) => {
@@ -757,7 +774,7 @@ fn write_config_template(flags: &Flags, path: &Path) -> CliResult {
     };
     let data_dir = match flags.value("data-dir") {
         Some(d) => PathBuf::from(d),
-        None => std::env::current_dir()?.join("swapkey-data"),
+        None => std::env::current_dir()?.join("switchbitcoin-data"),
     };
     let data_dir_str = data_dir.display().to_string();
     if data_dir_str.contains('\'') {
@@ -771,14 +788,14 @@ fn write_config_template(flags: &Flags, path: &Path) -> CliResult {
         }
     }
     let template = format!(
-        "# swapkey.toml — Swap Key pre-alpha wallet (REGTEST/TESTNET only).\n\
+        "# switchbitcoin.toml — SwitchBitcoin pre-alpha wallet (REGTEST/TESTNET only).\n\
          # Strings are quoted; single quotes are literal (Windows paths need no escaping).\n\
-         # Unknown keys are load errors. Env overrides: SWAPKEY_* (see wallet::config).\n\
+         # Unknown keys are load errors. Env overrides: SWITCHBITCOIN_* (see wallet::config).\n\
          network = \"{network}\"\n\
          data_dir = '{data_dir_str}'\n\
          \n\
          # Uncomment and fill to connect a local bitcoind (required by\n\
-         # onboard/swap/recover). Prefer SWAPKEY_RPC_PASSWORD or cookie auth over\n\
+         # onboard/swap/recover). Prefer SWITCHBITCOIN_RPC_PASSWORD or cookie auth over\n\
          # writing a password here.\n\
          #[node]\n\
          #rpc_url = \"http://127.0.0.1:{port}\"\n\
@@ -807,7 +824,7 @@ fn cmd_address(flags: &Flags) -> CliResult {
     let address = bitcoin::Address::from_script(spk.as_script(), network)
         .map_err(|_| "derived spk is not addressable")?;
     println!("deposit address (key index {index}): {address}");
-    println!("after it CONFIRMS: swapkey-cli onboard <txid:vout> --key-index {index}");
+    println!("after it CONFIRMS: switchbitcoin-cli onboard <txid:vout> --key-index {index}");
     Ok(())
 }
 
@@ -826,8 +843,8 @@ fn cmd_status(flags: &Flags) -> CliResult {
 /// lease time regardless — this line is advisory, not the gate.
 /// `diag` deliberately does NOT carry this: a maturity timestamp pasted into
 /// a public bug report leaks the coin's decorrelation draw.
-fn maturity_suffix(c: &swapkey::wallet::ledger::CoinRecord, now_unix: u64) -> Option<String> {
-    use swapkey::wallet::ledger::{CoinClass, CoinState};
+fn maturity_suffix(c: &switchbitcoin::wallet::ledger::CoinRecord, now_unix: u64) -> Option<String> {
+    use switchbitcoin::wallet::ledger::{CoinClass, CoinState};
     if c.class != CoinClass::PreEncumbrance || c.state != CoinState::Unspent {
         return None;
     }
@@ -895,7 +912,7 @@ fn print_status(wallet: &Wallet) {
     if coins.is_empty() {
         println!("coins:    none — get an address (`address`) and onboard a deposit");
     } else {
-        let now = swapkey::wallet::ledger::WalletClock::now_unix(&SystemClock);
+        let now = switchbitcoin::wallet::ledger::WalletClock::now_unix(&SystemClock);
         println!("coins ({}):", coins.len());
         for c in coins {
             println!(
@@ -972,7 +989,7 @@ fn cmd_onboard(flags: &Flags) -> CliResult {
     // failure, e.g. a bad --split-fee) resumes at the SPLIT step instead of
     // wedging on "already tracked" (Fable review).
     {
-        use swapkey::wallet::ledger::{CoinClass, CoinState};
+        use switchbitcoin::wallet::ledger::{CoinClass, CoinState};
         if let Some(coin) = wallet.engine().ledger().find(&deposit) {
             match (coin.class, coin.state, coin.split_attempts.last().cloned()) {
                 (_, CoinState::SplitPending, Some(attempt)) => {
@@ -1117,7 +1134,7 @@ fn cmd_swap(flags: &Flags) -> CliResult {
     // a heads-up before funding into bad weather, so a stranded Setup does not
     // read to a tester as a mystery hang.
     {
-        use swapkey::wallet::fee_weather::FeeWeather;
+        use switchbitcoin::wallet::fee_weather::FeeWeather;
         let fw = FeeWeather::assess(wallet.params(), chain.estimated_feerate_sat_vb());
         log(&fw.log_line());
     }
@@ -1279,7 +1296,7 @@ fn cmd_swap(flags: &Flags) -> CliResult {
     }
 
     let artifacts = negotiated.artifacts;
-    let mut state = swapkey::wallet::SwapRunState::new();
+    let mut state = switchbitcoin::wallet::SwapRunState::new();
     let mut sink = |line: String| log(&line);
     let mut iter: u64 = 0;
 
@@ -1321,7 +1338,7 @@ fn cmd_swap(flags: &Flags) -> CliResult {
         // above owns every decision.
         if iter.is_multiple_of(6) {
             if let Ok(Some(rec)) = wallet.engine().store().get(&sid) {
-                if let Some(sig) = swapkey::wallet::observe_reorg(&rec, &chain) {
+                if let Some(sig) = switchbitcoin::wallet::observe_reorg(&rec, &chain) {
                     log(&sig.describe(&sid));
                 }
             }
@@ -1348,7 +1365,7 @@ fn cmd_swap(flags: &Flags) -> CliResult {
                 if let Err(e) = backstop_step(&app, wallet.engine_mut(), &chain, &opts, &mut sink) {
                     log(&format!("backstop pass failed (retrying next poll): {e}"));
                 }
-                match swapkey::wallet::runner::completion_babysit_step(
+                match switchbitcoin::wallet::runner::completion_babysit_step(
                     wallet.engine_mut(),
                     &chain,
                     &data_dir,
@@ -1417,7 +1434,7 @@ fn guard_funded_escrow(
             log(&format!("[{sid_hint}] backstop pass failed (retrying): {e}"));
         }
         recovery_pass(wallet, chain, data_dir, opts, &[]);
-        if matches!(chain.spend_status(escrow), swapkey::chain::SpendStatus::Confirmed(_)) {
+        if matches!(chain.spend_status(escrow), switchbitcoin::chain::SpendStatus::Confirmed(_)) {
             log("escrow exit confirmed; run `recover` to reconcile the records");
             return Err("swap errored after funding; the escrow was resolved via its exit".into());
         }
@@ -1523,12 +1540,12 @@ fn cmd_watch(flags: &Flags) -> CliResult {
         }
     };
 
-    let opts = swapkey::wallet::watch::WatchOptions {
+    let opts = switchbitcoin::wallet::watch::WatchOptions {
         target_feerate_sat_vb: flags.num_opt("feerate")?,
         refund_congested: flags.switch("assume-congested"),
         allow_bump,
     };
-    let set = swapkey::wallet::watch::arm_guards(wallet.engine())?;
+    let set = switchbitcoin::wallet::watch::arm_guards(wallet.engine())?;
     for p in &set.unreadable {
         log(&format!("ALARM: unreadable swap record {}", p.display()));
     }
@@ -1556,7 +1573,7 @@ fn cmd_watch(flags: &Flags) -> CliResult {
     }
     let mut sink = |line: String| log(&line);
     loop {
-        let remaining = swapkey::wallet::watch::watch_pass(
+        let remaining = switchbitcoin::wallet::watch::watch_pass(
             &mut guards,
             wallet.engine_mut(),
             &chain,
@@ -1589,7 +1606,7 @@ fn cmd_backup(flags: &Flags) -> CliResult {
     // Deliberately NO passphrase: the bundle is a byte-faithful snapshot of
     // files that are already sealed at rest — backup must stay runnable from
     // a script/cron without unlocking the wallet.
-    let summary = swapkey::wallet::backup_data_dir(&config.data_dir, &dest)?;
+    let summary = switchbitcoin::wallet::backup_data_dir(&config.data_dir, &dest)?;
     for (name, len) in &summary.files {
         log(&format!("  bundled {name} ({len} bytes)"));
     }
@@ -1616,7 +1633,7 @@ fn cmd_restore(flags: &Flags) -> CliResult {
     let config = load_config(flags)?;
     let data_dir = config.data_dir.clone();
 
-    let summary = swapkey::wallet::restore_data_dir(Path::new(bundle), &data_dir)?;
+    let summary = switchbitcoin::wallet::restore_data_dir(Path::new(bundle), &data_dir)?;
     log(&format!(
         "restored {} files ({} bytes) into {}",
         summary.files.len(),
@@ -1660,13 +1677,13 @@ fn cmd_restore(flags: &Flags) -> CliResult {
         }
     }
     print_status(&wallet);
-    log("restore complete — run `swapkey-cli recover` to re-enter any in-flight swap");
+    log("restore complete — run `switchbitcoin-cli recover` to re-enter any in-flight swap");
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // manifest — the wallet-side (secret-free) half of the Task-18 trust path.
-// Authoring/signing lives in the SEPARATE swapkey-manifest tool; this wallet
+// Authoring/signing lives in the SEPARATE switchbitcoin-manifest tool; this wallet
 // binary has no operator-key input path by construction (DECISION 1) and
 // verifies only against its build-time pinned root (DECISION 3). Ingest is
 // CLI-only — deliberately no `serve` endpoint (DECISION 6).
@@ -1767,7 +1784,7 @@ fn print_manifest_state(wallet: &Wallet) {
         println!(
             "WARNING: running the version-0 COMPILED BASELINE — v0 wallets form their own \
              small, fingerprintable anonymity partition. Ingest the operator's current \
-             signed manifest before swapping: swapkey-cli manifest ingest <file>"
+             signed manifest before swapping: switchbitcoin-cli manifest ingest <file>"
         );
     }
 }
@@ -1781,8 +1798,8 @@ fn cmd_version(flags: &Flags) -> CliResult {
     if !flags.positional.is_empty() {
         return Err("version takes no arguments".into());
     }
-    println!("swapkey-cli {}", api::BUILD_VERSION);
-    println!("Swap Key PRE-ALPHA — REGTEST/TESTNET ONLY, NO REAL FUNDS");
+    println!("switchbitcoin-cli {}", api::BUILD_VERSION);
+    println!("SwitchBitcoin PRE-ALPHA — REGTEST/TESTNET ONLY, NO REAL FUNDS");
     println!("(mainnet has no config variant by construction; external cryptographer review pending)");
     println!("pinned manifest trust root: {}", hex32(&PINNED_OPERATOR_XONLY));
     Ok(())
@@ -1801,7 +1818,7 @@ fn cmd_quickstart(flags: &Flags) -> CliResult {
 }
 
 const QUICKSTART: &str = "\
-Swap Key quickstart — zero to your first swap (PRE-ALPHA)
+SwitchBitcoin quickstart — zero to your first swap (PRE-ALPHA)
 ==========================================================
 
 READ THIS FIRST — the two realities every tester must know up front:
@@ -1819,16 +1836,16 @@ STEP 0 — a Bitcoin node (once)
    Wait for sync. Details + config: docs/TESTER-GUIDE.md section 2.
 
 STEP 1 — create your wallet
-   swapkey-cli init --network testnet --data-dir <where wallet data lives>
-   This writes swapkey.toml next to you, prompts for a NEW passphrase,
+   switchbitcoin-cli init --network testnet --data-dir <where wallet data lives>
+   This writes switchbitcoin.toml next to you, prompts for a NEW passphrase,
    shows your 24-word recovery mnemonic ONCE (write it down, retype it),
    and shows the Phase-0 warning (type ACCEPT).
-   Then EDIT swapkey.toml: uncomment [node] and point it at your bitcoind
+   Then EDIT switchbitcoin.toml: uncomment [node] and point it at your bitcoind
    (rpc_url + rpc_user/rpc_password, or rpc_cookie_file).
-   next: swapkey-cli address
+   next: switchbitcoin-cli address
 
 STEP 2 — get a deposit address
-   swapkey-cli address
+   switchbitcoin-cli address
    next: send testnet coins to it (STEP 3)
 
 STEP 3 — get testnet coins (faucet)
@@ -1837,33 +1854,33 @@ STEP 3 — get testnet coins (faucet)
    testnet4 faucet works (search: \"bitcoin testnet4 faucet\"; e.g. the
    mempool.space or coinfaucet.eu testnet4 faucets at the time of writing).
    Wait for 1 confirmation, note the funding txid and output index.
-   next: swapkey-cli onboard <txid:vout>
+   next: switchbitcoin-cli onboard <txid:vout>
 
 STEP 4 — onboard the deposit
-   swapkey-cli onboard <txid:vout>
+   switchbitcoin-cli onboard <txid:vout>
    This splits your deposit into swap-ready units + the fee reserve, then
    anchors the privacy delay: coins become swappable after a randomized
    24-72h decorrelation delay (testnet keeps real delays; regtest
    fast-forwards the wall clock). Check readiness anytime with:
-   swapkey-cli status
+   switchbitcoin-cli status
 
 STEP 5 — swap with a partner (the ticket flow)
    One of you MAKES the offer (binds a port, prints a one-line ticket):
-     swapkey-cli swap --make <your-reachable-host:port>
+     switchbitcoin-cli swap --make <your-reachable-host:port>
    Send the printed skt1... ticket line to your partner, who TAKES it:
-     swapkey-cli swap --take <ticket>
+     switchbitcoin-cli swap --take <ticket>
    Both wallets negotiate, fund, and settle automatically. Leave both
    running until you see SWAP COMPLETED (or a refund resolution — see the
    refund reality above; retry after a refund).
 
 STEP 6 — optional but recommended: the second-device safety net
-   swapkey-cli backup <bundle-file>          (on this device)
-   swapkey-cli restore --from <bundle-file>  (on a second device/dir)
-   swapkey-cli watch                         (on that second device)
+   switchbitcoin-cli backup <bundle-file>          (on this device)
+   switchbitcoin-cli restore --from <bundle-file>  (on a second device/dir)
+   switchbitcoin-cli watch                         (on that second device)
    The watchtower fires your pre-armed refund even if this device dies
    mid-swap. Full story: docs/TESTER-GUIDE.md section 7.
 
-If anything breaks: swapkey-cli diag   (redacted support bundle), then file
+If anything breaks: switchbitcoin-cli diag   (redacted support bundle), then file
 a report per docs/BUG-REPORT-TEMPLATE.md. Full guide: docs/TESTER-GUIDE.md.
 ";
 
@@ -1878,8 +1895,8 @@ fn cmd_diag(flags: &Flags) -> CliResult {
     // userinfo) and the auth MODE only.
     let wallet = open_ready(flags)?;
     let config = wallet.config();
-    println!("=== swapkey diag (redacted support bundle) ===");
-    println!("version:      swapkey-cli {}", api::BUILD_VERSION);
+    println!("=== switchbitcoin diag (redacted support bundle) ===");
+    println!("version:      switchbitcoin-cli {}", api::BUILD_VERSION);
     println!("trust root:   {}", hex32(&PINNED_OPERATOR_XONLY));
     println!("network:      {}", config.network);
     println!("data dir:     {}", config.data_dir.display());
@@ -1887,8 +1904,8 @@ fn cmd_diag(flags: &Flags) -> CliResult {
         None => println!("node:         none configured"),
         Some(n) => {
             let auth = match &n.auth {
-                swapkey::wallet::config::RpcAuth::UserPass { .. } => "user/pass (redacted)",
-                swapkey::wallet::config::RpcAuth::CookieFile(_) => "cookie file",
+                switchbitcoin::wallet::config::RpcAuth::UserPass { .. } => "user/pass (redacted)",
+                switchbitcoin::wallet::config::RpcAuth::CookieFile(_) => "cookie file",
             };
             println!("node:         {} (auth: {auth})", n.url);
             match chain_view(config) {
@@ -1948,18 +1965,18 @@ fn cmd_diag(flags: &Flags) -> CliResult {
 }
 
 // ---------------------------------------------------------------------------
-// serve — the localhost JSON API for SwapKey-Wallet.html (Task 09)
+// serve — the localhost JSON API for SwitchBitcoin-Wallet.html (Task 09)
 // ---------------------------------------------------------------------------
 
-use swapkey::wallet::api::{
+use switchbitcoin::wallet::api::{
     self, route, status_snapshot, ApiCmd, ApiState, SharedState, SwapView, DEFAULT_API_PORT,
 };
-use swapkey::wallet::runner::{completion_babysit_step, SwapArtifacts};
-use swapkey::wallet::SwapRunState;
+use switchbitcoin::wallet::runner::{completion_babysit_step, SwapArtifacts};
+use switchbitcoin::wallet::SwapRunState;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 
-type NodeChain = swapkey::chain::BitcoinCoreChainView<swapkey::chain::HttpTransport>;
+type NodeChain = switchbitcoin::chain::BitcoinCoreChainView<switchbitcoin::chain::HttpTransport>;
 
 /// The worker's live activity — one command at a time (`busy` gates the API).
 enum Live {
@@ -2003,7 +2020,7 @@ fn cmd_serve(flags: &Flags) -> CliResult {
     let jitter: u32 = flags.num("jitter", 0)?;
     // Concurrency cap (Task 16): loud and bounded, never silent. 0 would be a
     // serve that can never swap — refuse it as the config error it is.
-    let max_swaps: usize = flags.num("max-swaps", swapkey::wallet::api::DEFAULT_MAX_SWAPS)?;
+    let max_swaps: usize = flags.num("max-swaps", switchbitcoin::wallet::api::DEFAULT_MAX_SWAPS)?;
     if max_swaps == 0 {
         return Err("--max-swaps must be at least 1".into());
     }
@@ -2328,7 +2345,7 @@ fn dispatch_swap(
     // Fee-weather preflight (Task 26): the same warn-and-proceed heads-up as
     // the CLI `swap`, surfaced in the serve trace before any lease. NOT a gate.
     {
-        use swapkey::wallet::fee_weather::FeeWeather;
+        use switchbitcoin::wallet::fee_weather::FeeWeather;
         sink(FeeWeather::assess(wallet.params(), chain.estimated_feerate_sat_vb()).log_line());
     }
     // Sibling live sids: a failed dispatch heals orphaned leases, and the
@@ -2795,7 +2812,7 @@ fn step_live(
             recovery_pass(wallet, chain, data_dir, opts, exclude);
             if matches!(
                 chain.spend_status(app.our_escrow()),
-                swapkey::chain::SpendStatus::Confirmed(_)
+                switchbitcoin::chain::SpendStatus::Confirmed(_)
             ) {
                 sink("escrow exit confirmed; run recover to reconcile records".into());
                 if let Some(sid_hex) = active.clone() {
@@ -2822,7 +2839,7 @@ fn serve_onboard(
     let deposit = parse_outpoint(deposit)?;
     let params = wallet.params().clone();
     {
-        use swapkey::wallet::ledger::{CoinClass, CoinState};
+        use switchbitcoin::wallet::ledger::{CoinClass, CoinState};
         if let Some(coin) = wallet.engine().ledger().find(&deposit) {
             match (coin.class, coin.state, coin.split_attempts.last().cloned()) {
                 (_, CoinState::SplitPending, Some(attempt)) => {
@@ -2896,7 +2913,7 @@ mod tests {
             amount_sats: 1_005_000,
             class,
             state,
-            key_purpose: swapkey::wallet::keys::KeyPurpose::PreEncumbrance,
+            key_purpose: switchbitcoin::wallet::keys::KeyPurpose::PreEncumbrance,
             key_index: 0,
             created_height: 0,
             delay_or_eligible_unix: at,
@@ -2909,7 +2926,7 @@ mod tests {
         }
     }
 
-    use swapkey::wallet::ledger;
+    use switchbitcoin::wallet::ledger;
 
     #[test]
     fn maturity_suffix_immature_names_both_anchors() {

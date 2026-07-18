@@ -1,4 +1,4 @@
-//! `swapkey-manifest` binary integration test (Task 18): the FULL issuance
+//! `switchbitcoin-manifest` binary integration test (Task 18): the FULL issuance
 //! path at the process level — keygen → compose-check → sign → inspect →
 //! reseal — plus every refusal the operator can hit. Runs in the DEFAULT
 //! suite (the tool has no required-features; that is DECISION 1's point).
@@ -11,7 +11,7 @@ use std::io::Write as _;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
-use swapkey::wallet::manifest::{
+use switchbitcoin::wallet::manifest::{
     modeled_operator_seckey, sign_manifest, verify_manifest, ModeledTrustRoot, PinnedTrustRoot,
     SignedManifest,
 };
@@ -19,13 +19,13 @@ use swapkey::wallet::manifest::{
 const PASSPHRASE: &str = "operator pass 18\n";
 
 fn run_tool(args: &[&str], stdin: &str) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_swapkey-manifest"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_switchbitcoin-manifest"))
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn swapkey-manifest");
+        .expect("spawn switchbitcoin-manifest");
     child
         .stdin
         .as_mut()
@@ -202,7 +202,7 @@ fn issuance_path_end_to_end_with_every_refusal_gate() {
     let store_dir = tempfile::tempdir().unwrap();
     let root = PinnedTrustRoot(xonly);
     let (mut store, _) =
-        swapkey::wallet::manifest::ManifestStore::open(store_dir.path(), &root).unwrap();
+        switchbitcoin::wallet::manifest::ManifestStore::open(store_dir.path(), &root).unwrap();
     store.ingest(&envelope, &root).expect("the tool's envelope must ingest");
     assert_eq!(store.current().version(), 1);
 
@@ -210,8 +210,8 @@ fn issuance_path_end_to_end_with_every_refusal_gate() {
     // "anyone who read the source" key has no authority under a real pin.
     let m2 = SignedManifest::compose(
         2,
-        swapkey::settlement::params::Params::testnet_provisional(),
-        swapkey::wallet::manifest::ClaimDelayPosture::Moderate,
+        switchbitcoin::settlement::params::Params::testnet_provisional(),
+        switchbitcoin::wallet::manifest::ClaimDelayPosture::Moderate,
         [(0, 6), (6, 36), (12, 72)],
         6,
         3,

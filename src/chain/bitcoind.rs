@@ -160,7 +160,7 @@ fn read_body(resp: ureq::Response) -> core::result::Result<String, RpcClientErro
 impl RpcTransport for HttpTransport {
     fn call(&self, method: &str, params: &[Value]) -> core::result::Result<Value, RpcClientError> {
         let body =
-            json!({ "jsonrpc": "1.0", "id": "swapkey", "method": method, "params": params })
+            json!({ "jsonrpc": "1.0", "id": "switchbitcoin", "method": method, "params": params })
                 .to_string();
         let resp = self
             .agent
@@ -1778,11 +1778,11 @@ mod tests {
 
     /// Live smoke test against a LOCAL regtest node — run manually:
     /// ```text
-    /// bitcoind -regtest -txindex=1 -rpcuser=swapkey -rpcpassword=swapkey
-    /// bitcoin-cli -regtest -rpcuser=swapkey -rpcpassword=swapkey createwallet w1
-    /// bitcoin-cli -regtest -rpcuser=swapkey -rpcpassword=swapkey -generate 101
+    /// bitcoind -regtest -txindex=1 -rpcuser=switchbitcoin -rpcpassword=switchbitcoin
+    /// bitcoin-cli -regtest -rpcuser=switchbitcoin -rpcpassword=switchbitcoin createwallet w1
+    /// bitcoin-cli -regtest -rpcuser=switchbitcoin -rpcpassword=switchbitcoin -generate 101
     /// BITCOIND_RPC_URL=http://127.0.0.1:18443 \
-    /// BITCOIND_RPC_USER=swapkey BITCOIND_RPC_PASS=swapkey \
+    /// BITCOIND_RPC_USER=switchbitcoin BITCOIND_RPC_PASS=switchbitcoin \
     ///   cargo test --features bitcoind -- --ignored live_regtest_smoke
     /// ```
     /// (Cookie auth: set `BITCOIND_RPC_COOKIE=<datadir>/regtest/.cookie`

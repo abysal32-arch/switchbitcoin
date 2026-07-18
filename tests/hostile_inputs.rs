@@ -16,8 +16,8 @@
 //!
 //! Behavioral (happy-path + specific-refusal) tests live in the owning files
 //! (`tests/ticket.rs`, `tests/backup.rs`, `tests/api.rs`, and the manifest
-//! module / `swapkey-manifest` in-bin tests); this file is the property layer.
-//! The two BINARY parsers (`swapkey-cli` Flags/parse_*, `swapkey-manifest`
+//! module / `switchbitcoin-manifest` in-bin tests); this file is the property layer.
+//! The two BINARY parsers (`switchbitcoin-cli` Flags/parse_*, `switchbitcoin-manifest`
 //! params-TOML) are unreachable from an integration test — their sweeps live
 //! in-bin next to the code.
 //!
@@ -26,9 +26,9 @@
 use proptest::prelude::*;
 
 use bitcoin::bech32::{self, Bech32m, Hrp};
-use swapkey::settlement::params::Params;
-use swapkey::wallet::config::{Network, WalletConfig};
-use swapkey::wallet::ticket::Ticket;
+use switchbitcoin::settlement::params::Params;
+use switchbitcoin::wallet::config::{Network, WalletConfig};
+use switchbitcoin::wallet::ticket::Ticket;
 
 // ============================================================================
 // Surface 1 — wallet::ticket::Ticket::decode (a CHAT PASTE: the most
@@ -81,7 +81,7 @@ proptest! {
     ) {
         let s = format!("skt1{}", "q".repeat(n));
         match Ticket::decode(&s) {
-            Err(swapkey::Error::Validation(m)) => {
+            Err(switchbitcoin::Error::Validation(m)) => {
                 prop_assert!(m.contains("length cap"), "expected the cap, got: {}", m)
             }
             other => prop_assert!(false, "over-cap string not cap-refused: {:?}", other),
@@ -110,7 +110,7 @@ proptest! {
 // Surface 2 — wallet::backup restore (a bundle restored from disk).
 // ============================================================================
 
-use swapkey::wallet::backup::{restore_data_dir, BACKUP_MAGIC};
+use switchbitcoin::wallet::backup::{restore_data_dir, BACKUP_MAGIC};
 
 /// Serialize a bundle with a VALID trailing SHA-256 (an attacker can always
 /// produce a well-hashed bundle — the hash gates corruption, the name
@@ -179,7 +179,7 @@ proptest! {
 // Surface 3 — wallet::manifest verify/inspect + ManifestStore::open.
 // ============================================================================
 
-use swapkey::wallet::manifest::{
+use switchbitcoin::wallet::manifest::{
     inspect_envelope, modeled_operator_seckey, sign_manifest, verify_manifest, ClaimDelayPosture,
     ManifestStore, ModeledTrustRoot, SignedManifest,
 };
@@ -260,7 +260,7 @@ proptest! {
 
 use std::io::Cursor;
 use std::sync::mpsc;
-use swapkey::wallet::api::{
+use switchbitcoin::wallet::api::{
     json_bool_field, json_str_field, json_u64_field, read_request, route, ApiCmd, ApiState,
     SharedState,
 };
@@ -366,8 +366,8 @@ fn json_str_field_resists_key_name_smuggling_and_type_confusion() {
 // Surface 5 — wallet::config::load (the wallet's outermost input surface).
 // ============================================================================
 
-fn load_cfg(dir: &std::path::Path, text: &str) -> Result<WalletConfig, swapkey::wallet::config::ConfigError> {
-    let path = dir.join("swapkey.toml");
+fn load_cfg(dir: &std::path::Path, text: &str) -> Result<WalletConfig, switchbitcoin::wallet::config::ConfigError> {
+    let path = dir.join("switchbitcoin.toml");
     std::fs::write(&path, text).unwrap();
     WalletConfig::load_with_env(&path, &|_| None)
 }

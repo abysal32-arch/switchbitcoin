@@ -38,7 +38,7 @@
 //!                       so that swap can only abort-refund — conservative)
 //! ```
 //!
-//! `swapkey.toml` is NOT required to live here — the config file is wherever
+//! `switchbitcoin.toml` is NOT required to live here — the config file is wherever
 //! the runner is pointed, and it *contains* `data_dir`.
 //!
 //! [`crate::wallet::backup`] snapshots this whole durable set (locks and

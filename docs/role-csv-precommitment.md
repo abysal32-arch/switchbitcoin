@@ -463,9 +463,9 @@ STRONG property that the outcome equals the seed-bit prediction (refunds are
 worse), plus forward-or-refund closure on both sides.
 
 * **SimChain, large-N** (fast, no node): `tests/runner.rs::
-  measure_role_csv_refund_rate` — `SWAPKEY_RATE_ATTEMPTS` (default 32):
+  measure_role_csv_refund_rate` — `SWITCHBITCOIN_RATE_ATTEMPTS` (default 32):
   `cargo test --test runner measure_role_csv_refund_rate -- --ignored --nocapture`
-* **Live regtest** (real bitcoind + two swapkey-cli processes):
+* **Live regtest** (real bitcoind + two switchbitcoin-cli processes):
   `tests/regtest_e2e.rs::e2e_measure_refund_rate` — default 4 attempts:
   `cargo test --features bitcoind --test regtest_e2e e2e_measure_refund_rate -- --ignored --nocapture`
 

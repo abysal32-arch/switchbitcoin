@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Swap Key PRE-ALPHA release build (Task 20). TESTNET/REGTEST ONLY.
+# SwitchBitcoin PRE-ALPHA release build (Task 20). TESTNET/REGTEST ONLY.
 #
-# Produces dist/swapkey-prealpha-<version>-<git>-<platform>/ containing the
-# two binaries (swapkey-cli, swapkey-manifest), the tester docs, the current
+# Produces dist/switchbitcoin-prealpha-<version>-<git>-<platform>/ containing the
+# two binaries (switchbitcoin-cli, switchbitcoin-manifest), the tester docs, the current
 # signed manifest, and SHA256SUMS — after refusing to package anything that
 # fails the full gates or carries a test trust root.
 #
@@ -13,9 +13,9 @@
 # Env knobs:
 #   MINGW64_BIN          path to the MinGW gcc bin dir (Windows only;
 #                        default: /c/Users/Joe/AppData/Local/mingw64/bin)
-#   SWAPKEY_ALLOW_DIRTY=1  permit an uncommitted tree (version is stamped
+#   SWITCHBITCOIN_ALLOW_DIRTY=1  permit an uncommitted tree (version is stamped
 #                        "-dirty"; NEVER hand such a build to a tester)
-#   SWAPKEY_SKIP_GATES=1   skip the test/clippy gates (ONLY for repackaging
+#   SWITCHBITCOIN_SKIP_GATES=1   skip the test/clippy gates (ONLY for repackaging
 #                        a tree the gates already passed unchanged)
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -31,13 +31,13 @@ case "$(uname -s)" in
   *)      EXE=""; PLATFORM="unknown";;
 esac
 
-if [ -n "$(git status --porcelain)" ] && [ "${SWAPKEY_ALLOW_DIRTY:-0}" != "1" ]; then
-  echo "ERROR: uncommitted changes — commit first (or SWAPKEY_ALLOW_DIRTY=1 for a"
+if [ -n "$(git status --porcelain)" ] && [ "${SWITCHBITCOIN_ALLOW_DIRTY:-0}" != "1" ]; then
+  echo "ERROR: uncommitted changes — commit first (or SWITCHBITCOIN_ALLOW_DIRTY=1 for a"
   echo "       local-only build; a -dirty build must never reach a tester)." >&2
   exit 1
 fi
 
-if [ "${SWAPKEY_SKIP_GATES:-0}" != "1" ]; then
+if [ "${SWITCHBITCOIN_SKIP_GATES:-0}" != "1" ]; then
   echo "== gate 1/3: full default suite =="
   cargo test
   echo "== gate 2/3: full --features bitcoind suite =="
@@ -46,15 +46,15 @@ if [ "${SWAPKEY_SKIP_GATES:-0}" != "1" ]; then
   cargo clippy --all-targets -- -D warnings
   cargo clippy --all-targets --features bitcoind -- -D warnings
 else
-  echo "!! gates SKIPPED (SWAPKEY_SKIP_GATES=1) — only valid for repackaging an"
+  echo "!! gates SKIPPED (SWITCHBITCOIN_SKIP_GATES=1) — only valid for repackaging an"
   echo "!! unchanged tree the gates already passed."
 fi
 
 echo "== release build (overflow-checks stay ON per [profile.release]) =="
 cargo build --release --features bitcoind
 
-CLI="target/release/swapkey-cli${EXE}"
-MANIFEST_TOOL="target/release/swapkey-manifest${EXE}"
+CLI="target/release/switchbitcoin-cli${EXE}"
+MANIFEST_TOOL="target/release/switchbitcoin-manifest${EXE}"
 
 echo "== shippability: the trust-root pin must be real =="
 VERSION_OUT="$("$CLI" version 2>&1)"
@@ -68,10 +68,10 @@ if ! echo "$VERSION_OUT" | grep -qE "pinned manifest trust root: [0-9a-f]{64}"; 
   echo "ERROR: no pinned trust root line in 'version' output. Refusing to package." >&2
   exit 1
 fi
-VERSION_LINE="$(echo "$VERSION_OUT" | head -1)"                    # swapkey-cli X (git H)
-STAMP="$(echo "$VERSION_LINE" | sed -E 's/^swapkey-cli ([^ ]+) \(git ([^)]+)\)$/\1-\2/')"
+VERSION_LINE="$(echo "$VERSION_OUT" | head -1)"                    # switchbitcoin-cli X (git H)
+STAMP="$(echo "$VERSION_LINE" | sed -E 's/^switchbitcoin-cli ([^ ]+) \(git ([^)]+)\)$/\1-\2/')"
 
-OUT="dist/swapkey-prealpha-${STAMP}-${PLATFORM}"
+OUT="dist/switchbitcoin-prealpha-${STAMP}-${PLATFORM}"
 echo "== packaging ${OUT} =="
 rm -rf "$OUT"
 mkdir -p "$OUT/docs"
@@ -83,20 +83,20 @@ mkdir -p "$OUT/docs/manifests"
 cp docs/manifests/v2.manifest docs/manifests/v2-params.toml "$OUT/docs/manifests/"
 # The local HTML UI lives one level above the crate in this workspace; ship
 # it when present (serve works without it — the UI is optional).
-if [ -f "../SwapKey-Wallet.html" ]; then
-  cp "../SwapKey-Wallet.html" "$OUT/"
+if [ -f "../SwitchBitcoin-Wallet.html" ]; then
+  cp "../SwitchBitcoin-Wallet.html" "$OUT/"
 else
-  echo "note: SwapKey-Wallet.html not found next to the crate — shipped without the UI file"
+  echo "note: SwitchBitcoin-Wallet.html not found next to the crate — shipped without the UI file"
 fi
 cat > "$OUT/README-FIRST.txt" <<'EOF'
-Swap Key PRE-ALPHA tester package — TESTNET/REGTEST ONLY, NO REAL FUNDS.
+SwitchBitcoin PRE-ALPHA tester package — TESTNET/REGTEST ONLY, NO REAL FUNDS.
 This software has NOT had its external cryptographer review. Expect ~half
 of swap attempts to close through refunds by design (funds come back).
 
 Start here:
   1. read docs/TESTER-GUIDE.md (the limitations banner is not optional)
-  2. run: swapkey-cli quickstart
-Report problems with the output of: swapkey-cli diag
+  2. run: switchbitcoin-cli quickstart
+Report problems with the output of: switchbitcoin-cli diag
 (template: docs/BUG-REPORT-TEMPLATE.md)
 EOF
 

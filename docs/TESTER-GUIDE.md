@@ -1,4 +1,7 @@
-# Swap Key — Tester Guide (PRE-ALPHA)
+# SwitchBitcoin — Tester Guide (PRE-ALPHA)
+
+*(Formerly "Swap Key", the internal codename; protocol lineage v3.16
+unchanged. Task 31, 2026-07-18.)*
 
 Welcome, and thank you for testing. This guide takes you from nothing to a
 completed swap, covers the local UI and the second-device watchtower, and
@@ -39,9 +42,9 @@ tells you exactly how to report what breaks.
 
 ## 2. Install
 
-**Option A — the release package** (`swapkey-prealpha-<version>-<git>-<platform>/`):
+**Option A — the release package** (`switchbitcoin-prealpha-<version>-<git>-<platform>/`):
 verify `SHA256SUMS`, put the folder somewhere convenient, and use the two
-binaries directly: `swapkey-cli` (the wallet) and `swapkey-manifest`
+binaries directly: `switchbitcoin-cli` (the wallet) and `switchbitcoin-manifest`
 (operator tooling — testers normally never need it). `README-FIRST.txt`
 points back here.
 
@@ -54,7 +57,7 @@ best-effort (untested hosts).
 Check what you have — every bug report starts with this line:
 
 ```
-swapkey-cli version
+switchbitcoin-cli version
 ```
 
 It prints the build (crate version + git hash), the pre-alpha banner, and
@@ -81,7 +84,7 @@ terminal. Cookie auth (the default) is the easiest hookup: point
 
 ## 4. Quickstart (zero → first swap)
 
-Run `swapkey-cli quickstart` — it prints the numbered walkthrough (init →
+Run `switchbitcoin-cli quickstart` — it prints the numbered walkthrough (init →
 address → faucet → onboard → swap ticket) and every wallet command tells you
 the next one. Highlights and traps:
 
@@ -89,9 +92,9 @@ the next one. Highlights and traps:
   it, then demands the Phase-0 acknowledgement (type `ACCEPT`). Write the
   words down; the file `keystore.bin` + your passphrase is the only other
   copy of your keys.
-* Edit the generated `swapkey.toml` and fill the `[node]` section, or
+* Edit the generated `switchbitcoin.toml` and fill the `[node]` section, or
   commands will refuse with `this command needs a node: add a [node]
-  section to swapkey.toml`.
+  section to switchbitcoin.toml`.
 * Faucet amount: at least **0.011 tBTC** (one 0.01 swap unit + fees + the
   CPFP reserve the split carves). Wait for a confirmation before `onboard`.
 * After `onboard` confirms, each coin matures after its own randomized
@@ -142,10 +145,10 @@ or one LAN this just works. Across the internet — two homes, two offices — t
 ## 6. The local UI (optional)
 
 ```
-swapkey-cli serve
+switchbitcoin-cli serve
 ```
 
-then open `SwapKey-Wallet.html` (shipped in the package) in a browser. It
+then open `SwitchBitcoin-Wallet.html` (shipped in the package) in a browser. It
 talks to `http://127.0.0.1:3316` — loopback only, **no auth** (limitation
 banner applies). Onboarding, tickets, and live swap state all work from the
 page; everything the UI does is also in the CLI.
@@ -170,17 +173,17 @@ state from a real problem before filing a bug:
 * the phase-0 provenance warning before your first onboard.
 
 The page renders `/status` verbatim — it never invents state. If a surface
-looks wrong, `swapkey-cli status` / `manifest show` say the same thing.
+looks wrong, `switchbitcoin-cli status` / `manifest show` say the same thing.
 
 ## 7. Signed parameter manifests
 
 Settlement parameters arrive on a signed, versioned manifest — never from
 your config file. Two commands matter to a tester:
 
-* `swapkey-cli manifest show` — what you're running. A fresh wallet says
+* `switchbitcoin-cli manifest show` — what you're running. A fresh wallet says
   version 0 with a WARNING: v0 wallets are a small, fingerprintable
   anonymity partition. Fix it by ingesting the current round's manifest:
-* `swapkey-cli manifest ingest <file>` — e.g. the `docs/manifests/v2.manifest`
+* `switchbitcoin-cli manifest ingest <file>` — e.g. the `docs/manifests/v2.manifest`
   shipped in the package (v1 was signed by the retired first operator key —
   since the 2026-07-16 key rotation it refuses with `signature does not
   verify`, by design). Two wallets on different manifests refuse each
@@ -192,11 +195,11 @@ your config file. Two commands matter to a tester:
 
 This is the best fund-safety demo you can run:
 
-1. `swapkey-cli backup wallet.skbak` (on your main device; refuses while the
+1. `switchbitcoin-cli backup wallet.skbak` (on your main device; refuses while the
    wallet is running).
 2. Move the bundle to a second device (or second directory + own config),
-   `swapkey-cli restore --from wallet.skbak`.
-3. `swapkey-cli watch` on the second device.
+   `switchbitcoin-cli restore --from wallet.skbak`.
+3. `switchbitcoin-cli watch` on the second device.
 4. Start a swap on the primary and kill the process mid-swap.
 5. Watch the tower fire your pre-armed refund at CSV maturity — funds come
    back with the primary dead.
@@ -236,10 +239,10 @@ Traps the guide must warn you about:
 | `reorg detected: … funding for … un-confirmed; HOLDING …` | A testnet4 reorg orphaned a confirmation your live swap depends on. The wallet holds until it re-confirms — the safety system working (a reorg can only delay an exit, never fire one early). Keep the wallet running; report only if it never clears. |
 | `reorg detected: swept-escrow funding … re-confirmed at height N (was M)` | A reorg re-confirmed a funding at a new height. Chain-derived deadlines (the refund CSV) re-derive from the current chain automatically. Informational — keep running; include the line if you file a bug. |
 | `another process holds this swap store (single-instance)` | Two processes on one data dir (often `serve` + `swap`, or `watch` on the primary dir). One wallet process per dir. |
-| `wallet onboarding is incomplete — run swapkey-cli init first` | `init` never finished (mnemonic retype/Phase-0). Re-run `init`. |
+| `wallet onboarding is incomplete — run switchbitcoin-cli init first` | `init` never finished (mnemonic retype/Phase-0). Re-run `init`. |
 | `keystore: wrong passphrase or corrupted file` | Wrong passphrase (retype; NFC quirks are normalized) — or real file damage: restore `keystore.bin` from backup / `init --restore` from the mnemonic. |
 | `keystore.bin is damaged but wallet data exists — do NOT delete it…` | Follow the message exactly. Never delete a keystore that guarded funds. |
-| `this command needs a node: add a [node] section to swapkey.toml` | Fill `[node]` in the config (section 3). |
+| `this command needs a node: add a [node] section to switchbitcoin.toml` | Fill `[node]` in the config (section 3). |
 | `deposit not found or not confirmed — wait for a confirmation` | The faucet tx hasn't confirmed, or the `<txid:vout>` is wrong (vout is the output INDEX paying your address). |
 | `deposit does not pay any address of this wallet` | Wrong txid/vout, or coins sent to some other wallet's address. |
 | `coins become leasable after their decorrelation delay (24-72h wall clock)` | The onboarding privacy delay (banner). Each unit's maturity is a separate random draw; `status` shows each unit's `matures ~…` annotation. Retry the `swap` once it reads `delay elapsed` — an early attempt refuses cleanly. |
@@ -259,11 +262,11 @@ Traps the guide must warn you about:
 | `standing down (completion-supersedes)` | The counterparty's completion confirmed, so the refund is moot. Correct behavior. |
 | `watch step failed (retrying next pass)` / `backstop pass failed (retrying next poll)` | Transient (usually RPC). It retries on the next poll; only report if it repeats forever. |
 | `ALARM: … quarantine` / `unreadable swap record` | A sealed record failed authentication. ALWAYS report this one with `diag` output. |
-| `error: unknown flag …` / `use --flag value, not --flag=value` | Typo protection — flags are strict on purpose. `swapkey-cli help`. |
+| `error: unknown flag …` / `use --flag value, not --flag=value` | Typo protection — flags are strict on purpose. `switchbitcoin-cli help`. |
 
 ## 10. Reporting bugs
 
-1. Run `swapkey-cli diag` and copy the WHOLE block. It is redacted by
+1. Run `switchbitcoin-cli diag` and copy the WHOLE block. It is redacted by
    construction — no seed, mnemonic, passphrase, or RPC secrets — and names
    the exact build.
 2. Fill in `docs/BUG-REPORT-TEMPLATE.md` (what you did, what you expected,

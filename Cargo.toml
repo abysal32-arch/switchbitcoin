@@ -1,11 +1,11 @@
 [package]
-name = "swapkey"
+name = "switchbitcoin"
 # 0.1.0 = the pre-alpha tester release line (Task 20). The full provenance
 # string a tester reports is version + git short hash — see build.rs and
-# `swapkey-cli --version`.
+# `switchbitcoin-cli --version`.
 version = "0.1.0"
 edition = "2021"
-description = "Swap Key Protocol — settlement-core reference scaffold (v3.16). NOT production. Fill against real libsecp256k1-zkp."
+description = "SwitchBitcoin Protocol (formerly Swap Key) — settlement-core reference scaffold (v3.16 lineage). NOT production. Fill against real libsecp256k1-zkp."
 license = "MIT OR Apache-2.0"
 publish = false
 
@@ -56,7 +56,7 @@ base64 = { version = "0.22", optional = true }                       # HTTP basi
 # (Task 07 contract: `Wallet::open` receives the normalized form so the same
 # visual passphrase always unseals the keystore across OSes/IMEs). Pure Rust
 # tables, no crypto — Req 1 untouched. Binary-only, but NON-optional since
-# Task 18: `swapkey-manifest` (no required-features, so it builds in the
+# Task 18: `switchbitcoin-manifest` (no required-features, so it builds in the
 # default suite) applies the same normalization to the operator passphrase.
 unicode-normalization = "0.1"
 
@@ -69,8 +69,8 @@ bitcoind = ["dep:serde_json", "dep:ureq", "dep:base64"]
 # windows-gnu suite HTTP-client-free: `cargo test` never builds the binary;
 # build/run it with `--features bitcoind`.
 [[bin]]
-name = "swapkey-cli"
-path = "src/bin/swapkey-cli.rs"
+name = "switchbitcoin-cli"
+path = "src/bin/switchbitcoin-cli.rs"
 required-features = ["bitcoind"]
 
 # Manifest issuance ops tooling (Task 18, DECISION 1): the ONLY binary that
@@ -79,8 +79,8 @@ required-features = ["bitcoind"]
 # only core deps, so the default suite builds it and runs its tests. The
 # wallet binary above has NO operator-key input path by construction.
 [[bin]]
-name = "swapkey-manifest"
-path = "src/bin/swapkey-manifest.rs"
+name = "switchbitcoin-manifest"
+path = "src/bin/switchbitcoin-manifest.rs"
 
 [dev-dependencies]
 proptest = "1"

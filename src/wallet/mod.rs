@@ -82,7 +82,7 @@
 
 //!   * `config` + `runtime` — the runnable-wallet shell (pre-alpha): ONE
 //!     validated `WalletConfig` (data dir, network, node RPC, peer addrs;
-//!     loaded from `swapkey.toml` + env) and `Wallet::open`, which routes
+//!     loaded from `switchbitcoin.toml` + env) and `Wallet::open`, which routes
 //!     first-run/torn/existing keystore states and composes keystore →
 //!     engine → `SwapApp::startup` under a single data dir with the
 //!     single-instance locks. The Task-08 runner drives the handle.

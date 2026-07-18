@@ -1,5 +1,5 @@
 [package]
-name = "swapkey-fuzz"
+name = "switchbitcoin-fuzz"
 version = "0.0.0"
 edition = "2021"
 publish = false
@@ -14,7 +14,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 
-[dependencies.swapkey]
+[dependencies.switchbitcoin]
 path = ".."
 
 [[bin]]

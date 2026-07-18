@@ -7,22 +7,22 @@
 //! funding-phase swap whose transport is gone.
 
 use bitcoin::{OutPoint, Txid};
-use swapkey::chain::{ChainView, DualSourceChainView, SimChain, Source, SpendStatus};
-use swapkey::crypto::adaptor::AdaptorSecret;
-use swapkey::crypto::ValidatedPoint;
-use swapkey::settlement::params::Params;
-use swapkey::settlement::refund::{confirm_watchtower_handoff, PreArmedRefund};
-use swapkey::settlement::state_machine::{
+use switchbitcoin::chain::{ChainView, DualSourceChainView, SimChain, Source, SpendStatus};
+use switchbitcoin::crypto::adaptor::AdaptorSecret;
+use switchbitcoin::crypto::ValidatedPoint;
+use switchbitcoin::settlement::params::Params;
+use switchbitcoin::settlement::refund::{confirm_watchtower_handoff, PreArmedRefund};
+use switchbitcoin::settlement::state_machine::{
     swap_session_id, ExchangeInputs, Funding, PeerSession, Role, Transport,
 };
-use swapkey::tx::escrow::Escrow;
-use swapkey::tx::setup::build_setup;
-use swapkey::tx::txbuild::{build_completion, finalize_key_spend, SpendTx};
-use swapkey::wallet::orchestrator::AbortAction;
-use swapkey::wallet::{
+use switchbitcoin::tx::escrow::Escrow;
+use switchbitcoin::tx::setup::build_setup;
+use switchbitcoin::tx::txbuild::{build_completion, finalize_key_spend, SpendTx};
+use switchbitcoin::wallet::orchestrator::AbortAction;
+use switchbitcoin::wallet::{
     ModeledEnclave, RecoveryAction, RecoveryDriver, RecoveryTick, SwapPhase, SwapRecord, SwapStore,
 };
-use swapkey::{Error, Result};
+use switchbitcoin::{Error, Result};
 use secp::{Point, Scalar};
 use std::sync::mpsc;
 
@@ -101,7 +101,7 @@ fn released_swap() -> ReleasedSwap {
     let delta_late = u32::try_from(params.delta_late()).unwrap();
 
     let internal =
-        swapkey::settlement::state_machine::canonical_internal_key(sh.pk, sl.pk).unwrap();
+        switchbitcoin::settlement::state_machine::canonical_internal_key(sh.pk, sl.pk).unwrap();
     let escrow_comp_sh = Escrow::new(&internal, &sl.pk, params.delta_early).expect("E_sl");
     let escrow_comp_sl = Escrow::new(&internal, &sh.pk, delta_late).expect("E_sh");
     let op_comp_sh = OutPoint::new(txid_from(2), 0); // SL-funded (E_sl)
@@ -204,7 +204,7 @@ fn released_swap() -> ReleasedSwap {
             lease_dir: Some(lease_sl.path().to_path_buf()),
             possession_store: Some((
                 possession_store.path().to_path_buf(),
-                swapkey::crypto::storage::platform_secure_key(),
+                switchbitcoin::crypto::storage::platform_secure_key(),
             )),
             taproot_root_comp_sh: Some(root_sh),
             taproot_root_comp_sl: Some(root_sl),
@@ -378,7 +378,7 @@ fn abort_and_funding_records_route_correctly() {
     // AbortDriver's ours-vs-theirs check has a real txid.
     let a = keypair();
     let b = keypair();
-    let internal = swapkey::settlement::state_machine::canonical_internal_key(a.pk, b.pk).unwrap();
+    let internal = switchbitcoin::settlement::state_machine::canonical_internal_key(a.pk, b.pk).unwrap();
     let escrow = Escrow::new(&internal, &a.pk, params.delta_early).unwrap();
     let dest = escrow.funding_script_pubkey().clone();
     let our_escrow = OutPoint::new(txid_from(0x30), 0);
@@ -468,7 +468,7 @@ fn never_confirming_setup_is_rebroadcast_until_the_escrow_confirms() {
 
     let a = keypair();
     let b = keypair();
-    let internal = swapkey::settlement::state_machine::canonical_internal_key(a.pk, b.pk).unwrap();
+    let internal = switchbitcoin::settlement::state_machine::canonical_internal_key(a.pk, b.pk).unwrap();
     let escrow = Escrow::new(&internal, &a.pk, params.delta_early).unwrap();
 
     // A funded pre-encumbrance coin + the REAL signed Setup that spends it into
@@ -562,7 +562,7 @@ fn funding_phase_never_confirming_setup_is_rebroadcast() {
 
     let a = keypair();
     let b = keypair();
-    let internal = swapkey::settlement::state_machine::canonical_internal_key(a.pk, b.pk).unwrap();
+    let internal = switchbitcoin::settlement::state_machine::canonical_internal_key(a.pk, b.pk).unwrap();
     let escrow = Escrow::new(&internal, &a.pk, params.delta_early).unwrap();
     let chain = SimChain::new(s_height);
     let pre_op = OutPoint::new(txid_from(0x52), 0);
@@ -628,7 +628,7 @@ fn recovery_setup_arm_uses_the_authoritative_confirmation_read() {
 
     let a = keypair();
     let b = keypair();
-    let internal = swapkey::settlement::state_machine::canonical_internal_key(a.pk, b.pk).unwrap();
+    let internal = switchbitcoin::settlement::state_machine::canonical_internal_key(a.pk, b.pk).unwrap();
     let escrow = Escrow::new(&internal, &a.pk, params.delta_early).unwrap();
     let dest = escrow.funding_script_pubkey().clone();
 
@@ -770,7 +770,7 @@ fn terminal_records_are_revalidated_against_reorg() {
 
     let a = keypair();
     let b = keypair();
-    let internal = swapkey::settlement::state_machine::canonical_internal_key(a.pk, b.pk).unwrap();
+    let internal = switchbitcoin::settlement::state_machine::canonical_internal_key(a.pk, b.pk).unwrap();
     let escrow = Escrow::new(&internal, &a.pk, params.delta_early).unwrap();
     let dest = escrow.funding_script_pubkey().clone();
     let our_escrow = OutPoint::new(txid_from(0x50), 0);
@@ -855,7 +855,7 @@ fn completed_record_survives_an_actual_reorg_round_trip() {
 
     let a = keypair();
     let b = keypair();
-    let internal = swapkey::settlement::state_machine::canonical_internal_key(a.pk, b.pk).unwrap();
+    let internal = switchbitcoin::settlement::state_machine::canonical_internal_key(a.pk, b.pk).unwrap();
     let escrow = Escrow::new(&internal, &a.pk, params.delta_early).unwrap();
     let dest = escrow.funding_script_pubkey().clone();
     let our_escrow = OutPoint::new(txid_from(0x54), 0);
@@ -925,7 +925,7 @@ fn completing_foreign_spend_routes_to_abort_not_completed() {
 
     let a = keypair();
     let b = keypair();
-    let internal = swapkey::settlement::state_machine::canonical_internal_key(a.pk, b.pk).unwrap();
+    let internal = switchbitcoin::settlement::state_machine::canonical_internal_key(a.pk, b.pk).unwrap();
     let escrow = Escrow::new(&internal, &a.pk, params.delta_early).unwrap();
     let dest = escrow.funding_script_pubkey().clone();
     let our_escrow = OutPoint::new(txid_from(0x70), 0);
@@ -1002,7 +1002,7 @@ fn unattributable_swept_spend_stays_nonterminal() {
 
     let a = keypair();
     let b = keypair();
-    let internal = swapkey::settlement::state_machine::canonical_internal_key(a.pk, b.pk).unwrap();
+    let internal = switchbitcoin::settlement::state_machine::canonical_internal_key(a.pk, b.pk).unwrap();
     let escrow = Escrow::new(&internal, &a.pk, params.delta_early).unwrap();
     let dest = escrow.funding_script_pubkey().clone();
     let our_escrow = OutPoint::new(txid_from(0x72), 0);
@@ -1075,7 +1075,7 @@ fn completed_foreign_spend_reenters_abort() {
 
     let a = keypair();
     let b = keypair();
-    let internal = swapkey::settlement::state_machine::canonical_internal_key(a.pk, b.pk).unwrap();
+    let internal = switchbitcoin::settlement::state_machine::canonical_internal_key(a.pk, b.pk).unwrap();
     let escrow = Escrow::new(&internal, &a.pk, params.delta_early).unwrap();
     let dest = escrow.funding_script_pubkey().clone();
     let our_escrow = OutPoint::new(txid_from(0x74), 0);
@@ -1159,7 +1159,7 @@ fn completed_sh_with_both_escrows_foreign_spent_rests_stably() {
 
     let a = keypair();
     let b = keypair();
-    let internal = swapkey::settlement::state_machine::canonical_internal_key(a.pk, b.pk).unwrap();
+    let internal = switchbitcoin::settlement::state_machine::canonical_internal_key(a.pk, b.pk).unwrap();
     let escrow = Escrow::new(&internal, &a.pk, params.delta_early).unwrap();
     let dest = escrow.funding_script_pubkey().clone();
     let our_escrow = OutPoint::new(txid_from(0x7A), 0);
@@ -1344,7 +1344,7 @@ fn abort_never_refunds_when_our_completion_already_swept() {
 
     let a = keypair();
     let b = keypair();
-    let internal = swapkey::settlement::state_machine::canonical_internal_key(a.pk, b.pk).unwrap();
+    let internal = switchbitcoin::settlement::state_machine::canonical_internal_key(a.pk, b.pk).unwrap();
     let escrow = Escrow::new(&internal, &a.pk, params.delta_early).unwrap();
     let dest = escrow.funding_script_pubkey().clone();
     let our_escrow = OutPoint::new(txid_from(0xA0), 0);
@@ -1451,7 +1451,7 @@ fn refunded_sl_own_mempool_refund_is_not_a_reveal() {
 
     let a = keypair();
     let b = keypair();
-    let internal = swapkey::settlement::state_machine::canonical_internal_key(a.pk, b.pk).unwrap();
+    let internal = switchbitcoin::settlement::state_machine::canonical_internal_key(a.pk, b.pk).unwrap();
     let escrow = Escrow::new(&internal, &a.pk, params.delta_early).unwrap();
     let dest = escrow.funding_script_pubkey().clone();
     let our_escrow = OutPoint::new(txid_from(0xB0), 0);
@@ -1573,7 +1573,7 @@ fn abort_refund_over_confirmed_own_refund_terminalizes() {
     let unit = params.escrow_amount_sats();
     let a = keypair();
     let b = keypair();
-    let internal = swapkey::settlement::state_machine::canonical_internal_key(a.pk, b.pk).unwrap();
+    let internal = switchbitcoin::settlement::state_machine::canonical_internal_key(a.pk, b.pk).unwrap();
     let escrow = Escrow::new(&internal, &a.pk, params.delta_early).unwrap();
     let dest = escrow.funding_script_pubkey().clone();
     let our_escrow = OutPoint::new(txid_from(0xC0), 0);

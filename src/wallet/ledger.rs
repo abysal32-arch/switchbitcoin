@@ -73,7 +73,7 @@ use std::path::{Path, PathBuf};
 /// v3.13 Phase 0 warning, verbatim. Full-screen, non-dismissable, shown once
 /// at onboarding and again at first deposit; the UI's Confirm button passes
 /// the displayed text to `acknowledge_phase0`.
-pub const PHASE0_WARNING: &str = "Warning: Before you send Bitcoin to Swap Key, move it to a fresh address first. If it came from a KYC'd exchange or any service that knows your identity, send it to a brand-new self-custodied address you control before depositing here. Swap Key protects your history from the moment your Bitcoin arrives; it cannot erase provenance that already exists on-chain before you arrive. One clean transaction to a wallet you control, wait for confirmation, then deposit.";
+pub const PHASE0_WARNING: &str = "Warning: Before you send Bitcoin to SwitchBitcoin, move it to a fresh address first. If it came from a KYC'd exchange or any service that knows your identity, send it to a brand-new self-custodied address you control before depositing here. SwitchBitcoin protects your history from the moment your Bitcoin arrives; it cannot erase provenance that already exists on-chain before you arrive. One clean transaction to a wallet you control, wait for confirmation, then deposit.";
 
 /// The congestion-bump linkage warning (v3.13: "bumping via a reserve UTXO
 /// reintroduces the link... explicit, user-visible consent"). Shown before a

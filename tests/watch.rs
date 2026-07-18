@@ -26,21 +26,21 @@ use bitcoin::{
     TxOut, Txid, Witness,
 };
 use secp::{Point, Scalar};
-use swapkey::chain::{ChainView, SimChain, SpendStatus};
-use swapkey::settlement::params::Params;
-use swapkey::settlement::refund::PreArmedRefund;
-use swapkey::settlement::state_machine::{canonical_internal_key, Role};
-use swapkey::tx::escrow::Escrow;
-use swapkey::tx::txbuild::build_completion;
-use swapkey::wallet::engine::SwapEngine;
-use swapkey::wallet::keys::ModeledKeySource;
-use swapkey::wallet::ledger::{
+use switchbitcoin::chain::{ChainView, SimChain, SpendStatus};
+use switchbitcoin::settlement::params::Params;
+use switchbitcoin::settlement::refund::PreArmedRefund;
+use switchbitcoin::settlement::state_machine::{canonical_internal_key, Role};
+use switchbitcoin::tx::escrow::Escrow;
+use switchbitcoin::tx::txbuild::build_completion;
+use switchbitcoin::wallet::engine::SwapEngine;
+use switchbitcoin::wallet::keys::ModeledKeySource;
+use switchbitcoin::wallet::ledger::{
     acknowledge_phase0, CoinClass, CoinState, Ledger, WalletClock, PHASE0_WARNING,
 };
-use swapkey::wallet::manifest::ModeledTrustRoot;
-use swapkey::wallet::runner::{persist_artifacts, SwapArtifacts};
-use swapkey::wallet::store::{ModeledEnclave, SwapPhase, SwapRecord};
-use swapkey::wallet::watch::{arm_guards, watch_pass, watch_step, WatchOptions, WatchStatus};
+use switchbitcoin::wallet::manifest::ModeledTrustRoot;
+use switchbitcoin::wallet::runner::{persist_artifacts, SwapArtifacts};
+use switchbitcoin::wallet::store::{ModeledEnclave, SwapPhase, SwapRecord};
+use switchbitcoin::wallet::watch::{arm_guards, watch_pass, watch_step, WatchOptions, WatchStatus};
 
 // ---------- fixture helpers (mirrors tests/runner.rs / tests/backstop_bump.rs) ----------
 

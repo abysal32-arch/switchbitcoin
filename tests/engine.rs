@@ -7,23 +7,23 @@
 //! isolation.
 
 use bitcoin::OutPoint;
-use swapkey::chain::{ChainView, SimChain, SpendStatus};
-use swapkey::crypto::adaptor::AdaptorSecret;
-use swapkey::crypto::ValidatedPoint;
-use swapkey::settlement::params::Params;
-use swapkey::settlement::refund::{confirm_watchtower_handoff, PreArmedRefund};
-use swapkey::settlement::state_machine::{
+use switchbitcoin::chain::{ChainView, SimChain, SpendStatus};
+use switchbitcoin::crypto::adaptor::AdaptorSecret;
+use switchbitcoin::crypto::ValidatedPoint;
+use switchbitcoin::settlement::params::Params;
+use switchbitcoin::settlement::refund::{confirm_watchtower_handoff, PreArmedRefund};
+use switchbitcoin::settlement::state_machine::{
     swap_session_id, ExchangeInputs, Funding, PeerSession, Role, Transport,
 };
-use swapkey::tx::escrow::Escrow;
-use swapkey::tx::txbuild::{build_completion, finalize_key_spend, sign_schnorr_single};
-use swapkey::wallet::driver::{DriveStatus, SwapDriver};
-use swapkey::wallet::engine::{ChainReconcile, SwapContext, SwapEngine, SwapOutcome};
-use swapkey::wallet::keys::ModeledKeySource;
-use swapkey::wallet::ledger::{acknowledge_phase0, CoinState, Ledger, WalletClock, PHASE0_WARNING};
-use swapkey::wallet::manifest::{ClaimDelayPosture, ModeledTrustRoot};
-use swapkey::wallet::store::{ModeledEnclave, SwapPhase};
-use swapkey::{Error, Result};
+use switchbitcoin::tx::escrow::Escrow;
+use switchbitcoin::tx::txbuild::{build_completion, finalize_key_spend, sign_schnorr_single};
+use switchbitcoin::wallet::driver::{DriveStatus, SwapDriver};
+use switchbitcoin::wallet::engine::{ChainReconcile, SwapContext, SwapEngine, SwapOutcome};
+use switchbitcoin::wallet::keys::ModeledKeySource;
+use switchbitcoin::wallet::ledger::{acknowledge_phase0, CoinState, Ledger, WalletClock, PHASE0_WARNING};
+use switchbitcoin::wallet::manifest::{ClaimDelayPosture, ModeledTrustRoot};
+use switchbitcoin::wallet::store::{ModeledEnclave, SwapPhase};
+use switchbitcoin::{Error, Result};
 use secp::{Point, Scalar};
 use std::sync::mpsc;
 
@@ -111,7 +111,7 @@ fn full_swap_driven_through_the_engine() {
     let sh = keypair();
     let sl = keypair();
     let internal =
-        swapkey::settlement::state_machine::canonical_internal_key(sh.pk, sl.pk).unwrap();
+        switchbitcoin::settlement::state_machine::canonical_internal_key(sh.pk, sl.pk).unwrap();
     let escrow_comp_sh = Escrow::new(&internal, &sl.pk, params.delta_early).unwrap(); // E_sl
     let escrow_comp_sl = Escrow::new(&internal, &sh.pk, delta_late).unwrap(); // E_sh
     let op_comp_sh = OutPoint::new(txid_from(2), 0); // E_sl — SL funded, SH sweeps
@@ -250,7 +250,7 @@ fn full_swap_driven_through_the_engine() {
         .expect("funding coin tracked");
     assert_eq!(
         coin.state,
-        swapkey::wallet::ledger::CoinState::Spent,
+        switchbitcoin::wallet::ledger::CoinState::Spent,
         "the engine marked the funding coin spent"
     );
 }
@@ -271,7 +271,7 @@ fn settle_sl_with_late_reveal(reveal_offset: u32) -> (u32, u32, u64, u32) {
     let sh = keypair();
     let sl = keypair();
     let internal =
-        swapkey::settlement::state_machine::canonical_internal_key(sh.pk, sl.pk).unwrap();
+        switchbitcoin::settlement::state_machine::canonical_internal_key(sh.pk, sl.pk).unwrap();
     let escrow_comp_sh = Escrow::new(&internal, &sl.pk, params.delta_early).unwrap(); // E_sl
     let escrow_comp_sl = Escrow::new(&internal, &sh.pk, delta_late).unwrap(); // E_sh
     let op_comp_sh = OutPoint::new(txid_from(2), 0); // E_sl — SL funded, SH sweeps
@@ -450,7 +450,7 @@ fn engine_open_recovers_a_crashed_signing_swap() {
     // The engine derives the id from the keys — the test must key on the same.
     let sid = swap_session_id(sl.pk, sh.pk).unwrap();
     let internal =
-        swapkey::settlement::state_machine::canonical_internal_key(sh.pk, sl.pk).unwrap();
+        switchbitcoin::settlement::state_machine::canonical_internal_key(sh.pk, sl.pk).unwrap();
     let escrow = Escrow::new(&internal, &sl.pk, params.delta_early).unwrap();
     let op = OutPoint::new(txid_from(7), 0);
     let dest = escrow.funding_script_pubkey().clone();
@@ -501,7 +501,7 @@ fn engine_open_recovers_a_crashed_signing_swap() {
     assert!(
         actions.iter().any(|a| matches!(
             a,
-            swapkey::wallet::store::RecoveryAction::AbortedLiveSigning { .. }
+            switchbitcoin::wallet::store::RecoveryAction::AbortedLiveSigning { .. }
         )),
         "a crashed Signing swap must be routed to AbortRefund on open: {actions:?}"
     );
@@ -514,7 +514,7 @@ fn engine_open_recovers_a_crashed_signing_swap() {
     assert!(
         matches!(
             coin.state,
-            swapkey::wallet::ledger::CoinState::Leased | swapkey::wallet::ledger::CoinState::Unspent
+            switchbitcoin::wallet::ledger::CoinState::Leased | switchbitcoin::wallet::ledger::CoinState::Unspent
         ),
         "coin state after recovery: {:?}",
         coin.state
@@ -539,7 +539,7 @@ fn full_swap_driven_through_the_swap_driver() {
     let sh = keypair();
     let sl = keypair();
     let internal =
-        swapkey::settlement::state_machine::canonical_internal_key(sh.pk, sl.pk).unwrap();
+        switchbitcoin::settlement::state_machine::canonical_internal_key(sh.pk, sl.pk).unwrap();
     let escrow_comp_sh = Escrow::new(&internal, &sl.pk, params.delta_early).unwrap(); // E_sl
     let escrow_comp_sl = Escrow::new(&internal, &sh.pk, delta_late).unwrap(); // E_sh
     let op_comp_sh = OutPoint::new(txid_from(2), 0); // E_sl — SL funded, SH sweeps
@@ -687,7 +687,7 @@ fn full_swap_driven_through_the_swap_driver() {
         .expect("funding coin tracked");
     assert_eq!(
         coin.state,
-        swapkey::wallet::ledger::CoinState::Spent,
+        switchbitcoin::wallet::ledger::CoinState::Spent,
         "the driver's run_exchange marked the funding coin spent"
     );
 }
@@ -710,7 +710,7 @@ fn sl_settle_reroutes_a_mangled_reveal_to_awaiting_reveal() {
     let sh = keypair();
     let sl = keypair();
     let internal =
-        swapkey::settlement::state_machine::canonical_internal_key(sh.pk, sl.pk).unwrap();
+        switchbitcoin::settlement::state_machine::canonical_internal_key(sh.pk, sl.pk).unwrap();
     let escrow_comp_sh = Escrow::new(&internal, &sl.pk, params.delta_early).unwrap(); // E_sl
     let escrow_comp_sl = Escrow::new(&internal, &sh.pk, delta_late).unwrap(); // E_sh
     let op_comp_sh = OutPoint::new(txid_from(2), 0); // E_sl — SL funded, SH sweeps
@@ -872,7 +872,7 @@ fn swap_driver_reports_refunding_when_phase_a_fails() {
     let sh = keypair();
     let sl = keypair();
     let internal =
-        swapkey::settlement::state_machine::canonical_internal_key(sh.pk, sl.pk).unwrap();
+        switchbitcoin::settlement::state_machine::canonical_internal_key(sh.pk, sl.pk).unwrap();
     let escrow_comp_sh = Escrow::new(&internal, &sl.pk, params.delta_early).unwrap();
     let escrow_comp_sl =
         Escrow::new(&internal, &sh.pk, u32::try_from(params.delta_late()).unwrap()).unwrap();
@@ -1041,7 +1041,7 @@ fn spend_std(outpoint: OutPoint, out: u64) -> Vec<u8> {
 /// re-selected for a lease and rejected at submit forever.
 #[test]
 fn engine_reconcile_leases_with_chain_heals_a_funding_coin_phantom() {
-    use swapkey::wallet::ledger::CoinState;
+    use switchbitcoin::wallet::ledger::CoinState;
     let params = Params::testnet_provisional();
     let base = 500_000u32;
     let wallet_dir = tempfile::tempdir().unwrap();
@@ -1105,7 +1105,7 @@ fn make_ctx(
     ok_sl: [u8; 32],
     lease_dir: std::path::PathBuf,
     possession_store: std::path::PathBuf,
-    watchtower_receipt: swapkey::settlement::refund::WatchtowerReceipt,
+    watchtower_receipt: switchbitcoin::settlement::refund::WatchtowerReceipt,
     funding_coin: OutPoint,
 ) -> SwapContext {
     SwapContext {
@@ -1158,7 +1158,7 @@ fn wrong_csv_swept_escrow_refuses_to_release_and_refunds() {
     let sl = keypair();
     let sid = swap_session_id(sl.pk, sh.pk).unwrap();
     let internal =
-        swapkey::settlement::state_machine::canonical_internal_key(sh.pk, sl.pk).unwrap();
+        switchbitcoin::settlement::state_machine::canonical_internal_key(sh.pk, sl.pk).unwrap();
 
     // E_sl (SL funds, SH sweeps) — honest early leaf; its spk is irrelevant to
     // the SL-side guard (SH sweeps it), so a bare fund is fine.
@@ -1211,7 +1211,7 @@ fn wrong_csv_swept_escrow_refuses_to_release_and_refunds() {
 
     // The guard fires: run_exchange refuses and routes to the refund.
     match engine.run_exchange(funded, &mut ctx, &chain) {
-        Err(swapkey::Error::Abort(reason)) => {
+        Err(switchbitcoin::Error::Abort(reason)) => {
             assert!(reason.contains("wrong refund CSV"), "got {reason:?}")
         }
         Err(other) => panic!("expected the CSV-mismatch Abort, got {other:?}"),

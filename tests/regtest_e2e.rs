@@ -1,4 +1,4 @@
-//! Regtest two-wallet END-TO-END harness (Task 10): two real `swapkey-cli`
+//! Regtest two-wallet END-TO-END harness (Task 10): two real `switchbitcoin-cli`
 //! processes against a real `bitcoind -regtest` — no SimChain anywhere.
 //!
 //! Every test is `#[ignore]` (needs a node binary + minutes of wall clock);
@@ -25,7 +25,7 @@
 //!
 //! Timing note: the onboarding delay's HEIGHT anchor (144–432 blocks) is
 //! mined out; its WALL anchor is fast-forwarded by the binary's
-//! regtest-only lease clock (see `LeaseClock` in swapkey-cli).
+//! regtest-only lease clock (see `LeaseClock` in switchbitcoin-cli).
 #![cfg(feature = "bitcoind")]
 
 use std::io::{Read, Write};
@@ -187,7 +187,7 @@ impl Node {
 }
 
 // ---------------------------------------------------------------------------
-// swapkey-cli wallets
+// switchbitcoin-cli wallets
 // ---------------------------------------------------------------------------
 
 struct Wallet {
@@ -197,9 +197,9 @@ struct Wallet {
 }
 
 fn cli_cmd(config: &Path, args: &[&str]) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_swapkey-cli"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_switchbitcoin-cli"));
     for (name, _) in std::env::vars() {
-        if name.starts_with("SWAPKEY_") {
+        if name.starts_with("SWITCHBITCOIN_") || name.starts_with("SWAPKEY_") {
             cmd.env_remove(&name);
         }
     }
@@ -213,7 +213,7 @@ fn run_cli(config: &Path, args: &[&str], stdin: &str) -> Output {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn swapkey-cli");
+        .expect("spawn switchbitcoin-cli");
     child.stdin.as_mut().unwrap().write_all(stdin.as_bytes()).unwrap();
     child.wait_with_output().expect("cli exit")
 }
@@ -225,7 +225,7 @@ fn text(out: &Output) -> String {
 impl Wallet {
     fn create(name: &'static str, rpc_port: u16) -> Wallet {
         let dir = tempfile::tempdir().expect("wallet dir");
-        let config = dir.path().join("swapkey.toml");
+        let config = dir.path().join("switchbitcoin.toml");
         let data_dir = dir.path().join("data");
         std::fs::write(
             &config,
@@ -579,7 +579,7 @@ fn e2e_crash_recovery_reenters_from_the_store() {
 // ---------------------------------------------------------------------------
 
 /// Live analogue of `runner::measure_role_csv_refund_rate`: run EXACTLY N
-/// attempts of the A-listen/B-connect flow (env `SWAPKEY_RATE_ATTEMPTS`,
+/// attempts of the A-listen/B-connect flow (env `SWITCHBITCOIN_RATE_ATTEMPTS`,
 /// default 4 — live attempts are minutes each) WITHOUT stopping at the first
 /// completion, record each terminal, and print a machine-greppable summary.
 ///
@@ -587,9 +587,9 @@ fn e2e_crash_recovery_reenters_from_the_store() {
 /// forward-or-refund — the same per-attempt assertion the happy-path proof
 /// makes for its non-completing attempts.
 #[test]
-#[ignore = "needs bitcoind; N-attempt role↔CSV refund-rate measurement (SWAPKEY_RATE_ATTEMPTS, default 4)"]
+#[ignore = "needs bitcoind; N-attempt role↔CSV refund-rate measurement (SWITCHBITCOIN_RATE_ATTEMPTS, default 4)"]
 fn e2e_measure_refund_rate() {
-    let n: u16 = std::env::var("SWAPKEY_RATE_ATTEMPTS")
+    let n: u16 = std::env::var("SWITCHBITCOIN_RATE_ATTEMPTS")
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|&v| v > 0)

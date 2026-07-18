@@ -8,18 +8,18 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 
 use bitcoin::OutPoint;
-use swapkey::chain::{
+use switchbitcoin::chain::{
     AuthoritativeChainView, ChainView, DualSourceChainView, FundingReading, SimChain, Source,
     SpendStatus,
 };
-use swapkey::crypto::ValidatedPoint;
-use swapkey::settlement::state_machine::{PeerSession, Role, Transport};
-use swapkey::tx::escrow::Escrow;
-use swapkey::tx::setup::build_setup;
-use swapkey::wallet::funding_driver::{FundingDriver, FundingTick, HandoffError};
-use swapkey::wallet::manifest::SignedManifest;
-use swapkey::wallet::orchestrator::FundingOrder;
-use swapkey::{Error, Result};
+use switchbitcoin::crypto::ValidatedPoint;
+use switchbitcoin::settlement::state_machine::{PeerSession, Role, Transport};
+use switchbitcoin::tx::escrow::Escrow;
+use switchbitcoin::tx::setup::build_setup;
+use switchbitcoin::wallet::funding_driver::{FundingDriver, FundingTick, HandoffError};
+use switchbitcoin::wallet::manifest::SignedManifest;
+use switchbitcoin::wallet::orchestrator::FundingOrder;
+use switchbitcoin::{Error, Result};
 
 fn dual(chain: &SimChain) -> DualSourceChainView<Source<SimChain>, Source<SimChain>> {
     DualSourceChainView::new(
@@ -76,7 +76,7 @@ fn two_parties(chain: &SimChain, manifest: &SignedManifest, base_height: u32) ->
     let vb = ValidatedPoint::from_bytes(&pk_b.serialize()).unwrap();
 
     let internal =
-        swapkey::settlement::state_machine::canonical_internal_key(pk_a, pk_b).unwrap();
+        switchbitcoin::settlement::state_machine::canonical_internal_key(pk_a, pk_b).unwrap();
     let escrow_a = Escrow::new(&internal, &pk_a, params.delta_early).unwrap();
     let escrow_b = Escrow::new(&internal, &pk_b, params.delta_early).unwrap();
 
@@ -185,7 +185,7 @@ fn jitter_clamps_to_manifest_bound_and_gates_broadcast() {
     let manifest = SignedManifest::provisional();
     let jitter_max = {
         // provisional bound is 6; clamp must bring an oversized sample down.
-        let c = swapkey::wallet::orchestrator::FundingCoordinator::from_manifest(&manifest);
+        let c = switchbitcoin::wallet::orchestrator::FundingCoordinator::from_manifest(&manifest);
         c.jitter_max()
     };
     let chain = SimChain::new(900_000);
@@ -485,7 +485,7 @@ fn substituted_counterparty_escrow_spk_is_refused() {
     let va = ValidatedPoint::from_bytes(&pk_a.serialize()).unwrap();
     let vb = ValidatedPoint::from_bytes(&pk_b.serialize()).unwrap();
     let internal =
-        swapkey::settlement::state_machine::canonical_internal_key(pk_a, pk_b).unwrap();
+        switchbitcoin::settlement::state_machine::canonical_internal_key(pk_a, pk_b).unwrap();
     let escrow_a = Escrow::new(&internal, &pk_a, params.delta_early).unwrap(); // genuine
     let escrow_b_fake = Escrow::new(&pk_b, &pk_b, params.delta_early).unwrap(); // solo-control
 
@@ -754,7 +754,7 @@ fn handoff_discovers_a_substituted_spk_without_a_prior_tick() {
     let va = ValidatedPoint::from_bytes(&pk_a.serialize()).unwrap();
     let vb = ValidatedPoint::from_bytes(&pk_b.serialize()).unwrap();
     let internal =
-        swapkey::settlement::state_machine::canonical_internal_key(pk_a, pk_b).unwrap();
+        switchbitcoin::settlement::state_machine::canonical_internal_key(pk_a, pk_b).unwrap();
     let escrow_a = Escrow::new(&internal, &pk_a, params.delta_early).unwrap();
     let escrow_b_fake = Escrow::new(&pk_b, &pk_b, params.delta_early).unwrap();
 

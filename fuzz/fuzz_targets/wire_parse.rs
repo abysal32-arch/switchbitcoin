@@ -14,7 +14,7 @@
 
 #![no_main]
 use libfuzzer_sys::fuzz_target;
-use swapkey::wire::{open_message, parse_message};
+use switchbitcoin::wire::{open_message, parse_message};
 
 fuzz_target!(|data: &[u8]| {
     // We do NOT assert on Ok vs Err — any well-defined return is fine.

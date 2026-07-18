@@ -26,27 +26,27 @@ use std::time::Duration;
 
 use bitcoin::OutPoint;
 use secp::{Point, Scalar};
-use swapkey::chain::{ChainView, SimChain, SpendStatus};
-use swapkey::crypto::ValidatedPoint;
-use swapkey::settlement::params::Params;
-use swapkey::settlement::refund::{confirm_watchtower_handoff, PreArmedRefund};
-use swapkey::settlement::state_machine::{canonical_internal_key, PeerSession, Transport};
-use swapkey::tx::escrow::Escrow;
-use swapkey::tx::setup::build_setup;
-use swapkey::tx::txbuild::build_completion;
-use swapkey::wallet::backup::{backup_data_dir, restore_data_dir, BACKUP_MAGIC};
-use swapkey::wallet::engine::{SwapContext, SwapEngine};
-use swapkey::wallet::ledger::{
+use switchbitcoin::chain::{ChainView, SimChain, SpendStatus};
+use switchbitcoin::crypto::ValidatedPoint;
+use switchbitcoin::settlement::params::Params;
+use switchbitcoin::settlement::refund::{confirm_watchtower_handoff, PreArmedRefund};
+use switchbitcoin::settlement::state_machine::{canonical_internal_key, PeerSession, Transport};
+use switchbitcoin::tx::escrow::Escrow;
+use switchbitcoin::tx::setup::build_setup;
+use switchbitcoin::tx::txbuild::build_completion;
+use switchbitcoin::wallet::backup::{backup_data_dir, restore_data_dir, BACKUP_MAGIC};
+use switchbitcoin::wallet::engine::{SwapContext, SwapEngine};
+use switchbitcoin::wallet::ledger::{
     acknowledge_phase0, CoinClass, CoinState, Ledger, WalletClock, PHASE0_WARNING,
 };
-use swapkey::wallet::manifest::ModeledTrustRoot;
-use swapkey::wallet::runner::{
+use switchbitcoin::wallet::manifest::ModeledTrustRoot;
+use switchbitcoin::wallet::runner::{
     apply_recovery_tick, hex32, persist_artifacts, refund_babysit_step, swap_step, RunOptions,
     SwapArtifacts, SwapOutcome, SwapRunState, SwapStepOutcome,
 };
-use swapkey::wallet::store::SwapPhase;
-use swapkey::wallet::{AppTick, SoftwareKeyStore, SwapApp};
-use swapkey::{Error, Result};
+use switchbitcoin::wallet::store::SwapPhase;
+use switchbitcoin::wallet::{AppTick, SoftwareKeyStore, SwapApp};
+use switchbitcoin::{Error, Result};
 
 /// Low KDF work factor so the suite stays fast (the keystore module's own
 /// precedent); production is DEFAULT_PBKDF2_ITERS.
@@ -455,7 +455,7 @@ fn restore_refuses_corrupt_and_hostile_bundles_cleanly() {
         "duplicate member",
     );
     attempt(&craft(&[("ledger.bin", b"l")]), "missing keystore");
-    attempt(&craft(&[("swapkey.toml", b"cfg"), ("keystore.bin", b"k"), ("ledger.bin", b"l")]), "foreign member");
+    attempt(&craft(&[("switchbitcoin.toml", b"cfg"), ("keystore.bin", b"k"), ("ledger.bin", b"l")]), "foreign member");
     // Structurally valid, but the keystore member itself is torn: the staged
     // pre-KDF probe must refuse BEFORE any dir exists at the destination.
     attempt(&craft(&[("keystore.bin", b"garbage"), ("ledger.bin", b"l")]), "torn keystore member");

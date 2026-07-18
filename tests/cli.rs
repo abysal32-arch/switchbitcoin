@@ -1,4 +1,4 @@
-//! `swapkey-cli` binary smoke test (Task 08). Feature-gated with the binary
+//! `switchbitcoin-cli` binary smoke test (Task 08). Feature-gated with the binary
 //! itself (`required-features = ["bitcoind"]`): the default suite never
 //! builds either.
 //!
@@ -12,13 +12,13 @@ use std::process::{Command, Output, Stdio};
 
 const PASSPHRASE: &str = "correct horse battery staple\n";
 
-/// Run the CLI with `args`, feeding `stdin`, with every `SWAPKEY_*` variable
-/// scrubbed (the config loader REFUSES unknown ones, and a developer's
+/// Run the CLI with `args`, feeding `stdin`, with every `SWITCHBITCOIN_*` variable
+/// scrubbed — legacy `SWAPKEY_*` too (the config loader REFUSES unknown ones in either namespace, and a developer's
 /// environment must not leak into the test).
 fn run_cli(config: &Path, args: &[&str], stdin: &str) -> Output {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_swapkey-cli"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_switchbitcoin-cli"));
     for (name, _) in std::env::vars() {
-        if name.starts_with("SWAPKEY_") {
+        if name.starts_with("SWITCHBITCOIN_") || name.starts_with("SWAPKEY_") {
             cmd.env_remove(&name);
         }
     }
@@ -30,7 +30,7 @@ fn run_cli(config: &Path, args: &[&str], stdin: &str) -> Output {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn swapkey-cli");
+        .expect("spawn switchbitcoin-cli");
     child
         .stdin
         .as_mut()
@@ -51,7 +51,7 @@ fn text(out: &Output) -> String {
 #[test]
 fn init_creates_the_wallet_and_status_reads_it_back() {
     let dir = tempfile::tempdir().unwrap();
-    let config = dir.path().join("swapkey.toml");
+    let config = dir.path().join("switchbitcoin.toml");
     let data_dir = dir.path().join("data");
 
     // 1. init on a fresh dir: writes the config template, creates the
@@ -98,7 +98,7 @@ fn init_creates_the_wallet_and_status_reads_it_back() {
 
 #[test]
 fn help_prints_usage() {
-    let out = Command::new(env!("CARGO_BIN_EXE_swapkey-cli"))
+    let out = Command::new(env!("CARGO_BIN_EXE_switchbitcoin-cli"))
         .arg("help")
         .output()
         .expect("cli exit");
@@ -106,12 +106,69 @@ fn help_prints_usage() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("USAGE"));
 }
 
+/// Task 31 (rebrand): with no `--config`, a directory holding only the
+/// pre-rebrand `swapkey.toml` still works — used loudly (deprecation line,
+/// no template written next to it) — and `switchbitcoin.toml` is preferred
+/// silently once it exists. The live testnet fleet's configs predate the
+/// rename; this is the compat contract that keeps them running.
+#[test]
+fn legacy_swapkey_toml_default_still_works_with_a_deprecation_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let cfg = format!("network = \"regtest\"\ndata_dir = '{}'\n", data_dir.display());
+    std::fs::write(dir.path().join("swapkey.toml"), &cfg).unwrap();
+
+    // run_cli always passes --config; default-path resolution needs a bare
+    // invocation with a controlled cwd instead.
+    let run_in_dir = |args: &[&str]| -> Output {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_switchbitcoin-cli"));
+        for (name, _) in std::env::vars() {
+            if name.starts_with("SWITCHBITCOIN_") || name.starts_with("SWAPKEY_") {
+                cmd.env_remove(&name);
+            }
+        }
+        let mut child = cmd
+            .current_dir(dir.path())
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn switchbitcoin-cli");
+        child.stdin.as_mut().unwrap().write_all(PASSPHRASE.as_bytes()).unwrap();
+        child.wait_with_output().expect("cli exit")
+    };
+
+    // Only the legacy file exists: used, loudly.
+    let out = run_in_dir(&[
+        "init",
+        "--passphrase-stdin",
+        "--accept-phase0",
+        "--skip-backup-verification",
+    ]);
+    let t = text(&out);
+    assert!(out.status.success(), "init via legacy config failed:\n{t}");
+    assert!(t.contains("DEPRECATED") && t.contains("swapkey.toml"), "{t}");
+    assert!(t.contains("wallet created"), "{t}");
+    assert!(
+        !dir.path().join("switchbitcoin.toml").exists(),
+        "init must not write a template next to a working legacy config"
+    );
+
+    // The new name appears: preferred, silently.
+    std::fs::write(dir.path().join("switchbitcoin.toml"), &cfg).unwrap();
+    let out = run_in_dir(&["status", "--passphrase-stdin"]);
+    let t = text(&out);
+    assert!(out.status.success(), "status via new config failed:\n{t}");
+    assert!(!t.contains("DEPRECATED"), "{t}");
+}
+
 #[test]
 fn serve_answers_status_over_a_real_socket() {
     use std::io::{Read as _, Write as _};
 
     let dir = tempfile::tempdir().unwrap();
-    let config = dir.path().join("swapkey.toml");
+    let config = dir.path().join("switchbitcoin.toml");
     let data_dir = dir.path().join("data");
     let out = run_cli(
         &config,
@@ -130,9 +187,9 @@ fn serve_answers_status_over_a_real_socket() {
     // A likely-free ephemeral-range port (collision risk is tiny; the test
     // fails loudly if bind loses the race).
     let port = 39316;
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_swapkey-cli"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_switchbitcoin-cli"));
     for (name, _) in std::env::vars() {
-        if name.starts_with("SWAPKEY_") {
+        if name.starts_with("SWITCHBITCOIN_") || name.starts_with("SWAPKEY_") {
             cmd.env_remove(&name);
         }
     }
@@ -172,7 +229,7 @@ fn serve_answers_status_over_a_real_socket() {
 #[test]
 fn commands_needing_a_node_refuse_without_a_node_section() {
     let dir = tempfile::tempdir().unwrap();
-    let config = dir.path().join("swapkey.toml");
+    let config = dir.path().join("switchbitcoin.toml");
     let data_dir = dir.path().join("data");
     let out = run_cli(
         &config,
@@ -307,19 +364,19 @@ fn backup_restore_and_mnemonic_rescan_round_trip_via_the_cli() {
 /// this build pins the SECOND real operator key (the 2026-07-16 key-loss
 /// rotation), so the committed v1 manifest — signed by the RETIRED first
 /// key — now REFUSES on signature with the floor untouched, the committed
-/// v2 manifest (signed by the current key via swapkey-manifest) ingests,
+/// v2 manifest (signed by the current key via switchbitcoin-manifest) ingests,
 /// re-ingest is an idempotent no-op, and a MODELED-root-signed manifest —
 /// the key printed in the library source — is refused. Ingest is CLI-only
 /// (DECISION 6).
 #[test]
 fn pinned_root_manifest_ingest_via_the_cli() {
-    use swapkey::settlement::params::Params;
-    use swapkey::wallet::manifest::{
+    use switchbitcoin::settlement::params::Params;
+    use switchbitcoin::wallet::manifest::{
         modeled_operator_seckey, sign_manifest, ClaimDelayPosture, SignedManifest,
     };
 
     let dir = tempfile::tempdir().unwrap();
-    let config = dir.path().join("swapkey.toml");
+    let config = dir.path().join("switchbitcoin.toml");
     let data_dir = dir.path().join("data");
     let out = run_cli(
         &config,
@@ -419,14 +476,14 @@ fn pinned_root_manifest_ingest_via_the_cli() {
 #[test]
 fn version_quickstart_and_diag_are_branded_and_secretless() {
     let dir = tempfile::tempdir().unwrap();
-    let config = dir.path().join("swapkey.toml");
+    let config = dir.path().join("switchbitcoin.toml");
     let data_dir = dir.path().join("data");
 
     // ---- version: build provenance + the pinned root, and NOT unshippable.
     let out = run_cli(&config, &["version"], "");
     let t = text(&out);
     assert!(out.status.success(), "version failed:\n{t}");
-    assert!(t.contains(&format!("swapkey-cli {}", swapkey::wallet::api::BUILD_VERSION)), "{t}");
+    assert!(t.contains(&format!("switchbitcoin-cli {}", switchbitcoin::wallet::api::BUILD_VERSION)), "{t}");
     assert!(t.contains("(git "), "the git hash stamp:\n{t}");
     assert!(t.contains("PRE-ALPHA"), "{t}");
     assert!(t.contains("NO REAL FUNDS"), "{t}");
@@ -446,8 +503,8 @@ fn version_quickstart_and_diag_are_branded_and_secretless() {
         "REFUNDS",
         "faucet",
         "Phase-0",
-        "swapkey-cli init",
-        "swapkey-cli onboard",
+        "switchbitcoin-cli init",
+        "switchbitcoin-cli onboard",
         "--make",
         "--take",
         "watch",
@@ -497,8 +554,8 @@ fn version_quickstart_and_diag_are_branded_and_secretless() {
     let t = text(&out);
     assert!(out.status.success(), "diag failed:\n{t}");
     for needle in [
-        "swapkey diag (redacted support bundle)",
-        &format!("swapkey-cli {}", swapkey::wallet::api::BUILD_VERSION),
+        "switchbitcoin diag (redacted support bundle)",
+        &format!("switchbitcoin-cli {}", switchbitcoin::wallet::api::BUILD_VERSION),
         "trust root:",
         "network:      regtest",
         "manifest:     v0",
@@ -524,7 +581,7 @@ fn version_quickstart_and_diag_are_branded_and_secretless() {
     );
 }
 
-/// Task 20 scripted check: every `swapkey-cli <verb>` the quickstart tells a
+/// Task 20 scripted check: every `switchbitcoin-cli <verb>` the quickstart tells a
 /// tester to run must be a real, dispatched verb (HELP lists it). The flow
 /// itself (init → address → onboard → swap → refund/recovery) is the exact
 /// sequence the Task-11 regtest harness validated live — this guards the
@@ -532,11 +589,11 @@ fn version_quickstart_and_diag_are_branded_and_secretless() {
 #[test]
 fn quickstart_commands_all_exist_in_help() {
     let dir = tempfile::tempdir().unwrap();
-    let config = dir.path().join("swapkey.toml");
+    let config = dir.path().join("switchbitcoin.toml");
     let q = text(&run_cli(&config, &["quickstart"], ""));
     let help = text(&run_cli(&config, &["help"], ""));
     let mut checked = 0;
-    for chunk in q.split("swapkey-cli ").skip(1) {
+    for chunk in q.split("switchbitcoin-cli ").skip(1) {
         let verb: String = chunk
             .chars()
             .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
@@ -546,7 +603,7 @@ fn quickstart_commands_all_exist_in_help() {
         }
         assert!(
             help.contains(&format!("\n  {verb}")),
-            "quickstart names `swapkey-cli {verb}` but help does not list it:\n{help}"
+            "quickstart names `switchbitcoin-cli {verb}` but help does not list it:\n{help}"
         );
         checked += 1;
     }

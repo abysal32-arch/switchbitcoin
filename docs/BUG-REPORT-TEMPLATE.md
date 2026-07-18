@@ -1,4 +1,4 @@
-# Swap Key pre-alpha — bug report
+# SwitchBitcoin pre-alpha — bug report
 
 Copy this file, fill every section, send it through your onboarding channel.
 One report per problem. SAFETY: never include your mnemonic, passphrase, or
@@ -16,9 +16,9 @@ from `init` is NOT (it showed the mnemonic once).
 - expected:
 - actual:
 
-## `swapkey-cli diag` output (paste the whole block)
+## `switchbitcoin-cli diag` output (paste the whole block)
 ```
-(run: swapkey-cli diag)
+(run: switchbitcoin-cli diag)
 ```
 
 ## The failing command + its FULL stderr
@@ -30,7 +30,7 @@ from `init` is NOT (it showed the mnemonic once).
 - Bitcoin Core version (`bitcoind --version` first line):
 - network (testnet4 / regtest):
 - OS:
-- if swapping: was your partner on the same build? (`swapkey-cli version` both sides)
+- if swapping: was your partner on the same build? (`switchbitcoin-cli version` both sides)
 
 ## Severity (your call)
 - [ ] funds appear stuck or lost (report IMMEDIATELY, keep the wallet running)

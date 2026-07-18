@@ -1,6 +1,7 @@
 # Settlement-parameter governance (signed manifests) — pre-alpha
 
-Task 18. How Swap Key's settlement parameters are authored, signed,
+Task 18. How SwitchBitcoin's (formerly "Swap Key") settlement parameters
+are authored, signed,
 distributed, ingested, and version-governed, and what the trust model
 honestly is right now. TESTNET/REGTEST pre-alpha; nothing here touches real
 funds before the external cryptographer review.
@@ -11,7 +12,7 @@ Settlement parameters shape the cross-party transactions themselves: equal
 escrows are the privacy linchpin (everyone in a tier must run identical
 amounts), and the timelock ordering is what keeps the extract-and-race region
 unreachable. A wallet whose params can drift by local edit silently breaks
-both. So `swapkey.toml` deliberately cannot carry params
+both. So `switchbitcoin.toml` deliberately cannot carry params
 (`wallet::config`'s "params are NOT config" doctrine); they arrive only on
 the SIGNED, VERSIONED manifest trust path (`wallet::manifest`):
 
@@ -60,13 +61,13 @@ never on a tester's wallet.
 
 ## Roles and tooling (who holds what)
 
-* **`swapkey-manifest`** (ops tooling, DECISION 1) — the ONLY binary that
+* **`switchbitcoin-manifest`** (ops tooling, DECISION 1) — the ONLY binary that
   touches the operator secret: `keygen`, `sign`, `reseal` (plus secret-free
   `compose-check` / `inspect`). The secret lives passphrase-SEALED
   (AES-256-GCM under a PBKDF2-600k KEK, the keystore's production work
   factor) in a file OUTSIDE every repo; it is never written as plaintext and
   never accepted as an argv value.
-* **`swapkey-cli`** (the wallet) — verifies and ingests only. It has no
+* **`switchbitcoin-cli`** (the wallet) — verifies and ingests only. It has no
   operator-key input path by construction, and its trust root is the
   BUILD-TIME constant `PINNED_OPERATOR_XONLY` (DECISION 3): deliberately NOT
   a config key, because a config-file pin would let any local file writer
@@ -81,19 +82,19 @@ never on a tester's wallet.
 
 ```
 # once: generate + pin
-swapkey-manifest keygen --out-dir <operator-key-dir>
+switchbitcoin-manifest keygen --out-dir <operator-key-dir>
 #   -> operator.key (sealed secret), operator.pub (x-only hex)
-#   -> pin the printed pubkey as PINNED_OPERATOR_XONLY in swapkey-cli, rebuild
+#   -> pin the printed pubkey as PINNED_OPERATOR_XONLY in switchbitcoin-cli, rebuild
 
 # per tuning round: author, check, sign, distribute
 #   edit vN-params.toml  (version MUST strictly increase; see below)
-swapkey-manifest compose-check vN-params.toml
-swapkey-manifest sign vN-params.toml --key operator.key --out vN.manifest
+switchbitcoin-manifest compose-check vN-params.toml
+switchbitcoin-manifest sign vN-params.toml --key operator.key --out vN.manifest
 #   -> hand the 169-byte vN.manifest file to EVERY tester
 
 # tester side (CLI-only by design, DECISION 6 — no serve endpoint):
-swapkey-cli manifest ingest vN.manifest
-swapkey-cli manifest show
+switchbitcoin-cli manifest ingest vN.manifest
+switchbitcoin-cli manifest show
 ```
 
 Refusals surface verbatim at both ends: authoring-time (`compose` runs the
@@ -188,7 +189,7 @@ cryptographer-review item regardless).
 ONE operator key at a time; no threshold signing, no HSM — those are
 post-pre-alpha. The CURRENT key (the second): generated 2026-07-16, x-only
 pubkey `fedd62229b6c8a194d6d174d68ad0ce303623cbd49df4b968b9b06ea9e6ec7fe`
-(pinned in `swapkey-cli`, published in `operator-key-v2\operator.pub` and
+(pinned in `switchbitcoin-cli`, published in `operator-key-v2\operator.pub` and
 here).
 
 **The key-loss rotation has now run FOR REAL (2026-07-16).** The first key

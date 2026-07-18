@@ -14,7 +14,7 @@
 //! the `leases/<sid>` single-signer tombstones (INV-3 burn evidence: a
 //! crash-left lease means that swap may only abort-refund, and a restored
 //! store must keep saying so). Locks and `.tmp` transients are excluded;
-//! `swapkey.toml` is excluded deliberately — it can hold a PLAINTEXT node
+//! `switchbitcoin.toml` is excluded deliberately — it can hold a PLAINTEXT node
 //! RPC password and is not wallet state (back it up separately if you care).
 //!
 //! # Encryption posture (decided, per the Task-17 charter)
@@ -298,7 +298,7 @@ fn parse_bundle(bytes: &[u8]) -> Result<Vec<(String, &[u8])>> {
     let header = BACKUP_MAGIC.len() + 4;
     if bytes.len() < header + HASH_LEN || &bytes[..BACKUP_MAGIC.len()] != BACKUP_MAGIC {
         return Err(Error::Validation(
-            "restore: not a swapkey backup bundle (bad magic/length)",
+            "restore: not a switchbitcoin backup bundle (bad magic/length)",
         ));
     }
     let body_end = bytes.len() - HASH_LEN;
@@ -494,7 +494,8 @@ mod tests {
             ".store.lock".to_string(),
             ".ledger.lock".into(),
             "ledger.bin.tmp".into(),
-            "swapkey.toml".into(),
+            "switchbitcoin.toml".into(),
+            "swapkey.toml".into(), // legacy config name — equally non-durable
             format!("{sid}.swap.tmp"),
             format!("{sid}.swap.quarantine"),   // no index
             format!("{sid}.swap.quarantine1x"), // non-digit tail

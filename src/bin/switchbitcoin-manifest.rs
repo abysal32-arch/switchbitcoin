@@ -1,14 +1,14 @@
-//! `swapkey-manifest` — Swap Key manifest ISSUANCE ops tooling (Task 18).
+//! `switchbitcoin-manifest` — SwitchBitcoin manifest ISSUANCE ops tooling (Task 18).
 //!
 //! The ONLY binary that ever touches the operator manifest-signing secret
 //! (DECISION 1): `keygen` / `sign` / `reseal` here; the wallet binary
-//! (`swapkey-cli`) has NO operator-key input path by construction — it only
+//! (`switchbitcoin-cli`) has NO operator-key input path by construction — it only
 //! ingests signed envelopes against its BUILD-TIME pinned trust root. This is
 //! `wallet::manifest`'s own doctrine ("the wallet never holds
 //! `operator_seckey`; the signing half lives only in ops tooling") made
 //! structural.
 //!
-//! Subcommands (run `swapkey-manifest help`):
+//! Subcommands (run `switchbitcoin-manifest help`):
 //!   keygen         generate the REAL operator keypair; the secret is sealed
 //!                  (AES-256-GCM under a PBKDF2 passphrase KEK at the
 //!                  keystore's production work factor) to `operator.key`,
@@ -29,7 +29,7 @@
 //! SECRET HYGIENE: the operator secret exists only (a) sealed on disk and
 //! (b) transiently in zeroized memory during `sign`/`reseal`. Passphrases are
 //! read from stdin (NFC-normalized, echoed — the pre-alpha convention shared
-//! with `swapkey-cli`), NEVER accepted as argv (process lists / shell
+//! with `switchbitcoin-cli`), NEVER accepted as argv (process lists / shell
 //! history). Nothing secret is ever printed.
 //!
 //! PRE-ALPHA / TESTNET ONLY: one operator key, no rotation or threshold
@@ -44,9 +44,9 @@ use unicode_normalization::UnicodeNormalization;
 use zeroize::Zeroizing;
 
 use bitcoin::secp256k1::{Keypair, Secp256k1};
-use swapkey::settlement::params::Params;
-use swapkey::wallet::keystore::{DEFAULT_PBKDF2_ITERS, MAX_PBKDF2_ITERS};
-use swapkey::wallet::manifest::{
+use switchbitcoin::settlement::params::Params;
+use switchbitcoin::wallet::keystore::{DEFAULT_PBKDF2_ITERS, MAX_PBKDF2_ITERS};
+use switchbitcoin::wallet::manifest::{
     inspect_envelope, sign_manifest, verify_manifest, ClaimDelayPosture, PinnedTrustRoot,
     SignedManifest, ENVELOPE_LEN,
 };
@@ -70,7 +70,7 @@ fn main() {
         Ok(()) => 0,
         Err(UsageError(msg)) => {
             eprintln!("error: {msg}");
-            eprintln!("run `swapkey-manifest help` for usage");
+            eprintln!("run `switchbitcoin-manifest help` for usage");
             2
         }
     };
@@ -82,8 +82,8 @@ fn main() {
 #[derive(Debug)]
 struct UsageError(String);
 
-impl From<swapkey::Error> for UsageError {
-    fn from(e: swapkey::Error) -> Self {
+impl From<switchbitcoin::Error> for UsageError {
+    fn from(e: switchbitcoin::Error) -> Self {
         UsageError(e.to_string())
     }
 }
@@ -125,10 +125,10 @@ fn run(args: &[String]) -> CliResult {
 }
 
 const HELP: &str = "\
-swapkey-manifest — Swap Key manifest issuance (OPERATOR ops tooling; the only
+switchbitcoin-manifest — SwitchBitcoin manifest issuance (OPERATOR ops tooling; the only
 binary that touches the manifest-signing secret. TESTNET pre-alpha.)
 
-USAGE: swapkey-manifest <COMMAND> [FLAGS]
+USAGE: switchbitcoin-manifest <COMMAND> [FLAGS]
 
 COMMANDS
   keygen    Generate the operator keypair. The secret is passphrase-SEALED to
@@ -156,7 +156,7 @@ COMMON FLAGS
 ";
 
 // ---------------------------------------------------------------------------
-// flag parsing / prompts (mirrors swapkey-cli's strict parser: an unknown or
+// flag parsing / prompts (mirrors switchbitcoin-cli's strict parser: an unknown or
 // misspelled flag is a hard usage error, never silently ignored)
 // ---------------------------------------------------------------------------
 
@@ -222,7 +222,7 @@ fn prompt_line(msg: &str) -> Result<Zeroizing<String>, UsageError> {
 }
 
 /// Read + NFC-normalize ONE operator passphrase (the `read_passphrase`
-/// contract shared with swapkey-cli: interactive echoed prompt by default,
+/// contract shared with switchbitcoin-cli: interactive echoed prompt by default,
 /// `--passphrase-stdin` first-line mode for scripting, confirm-repeat only
 /// interactively). Empty passphrases are refused — this seals the trust
 /// root's signing half.
@@ -276,7 +276,7 @@ fn seal_operator_key(
     rand::TryRngCore::try_fill_bytes(&mut rand::rngs::OsRng, &mut salt)
         .map_err(|_| "OS randomness unavailable; cannot seal the operator key")?;
     let kek = derive_kek(passphrase, &salt, iters);
-    let sealed = swapkey::crypto::storage::seal(&kek, seckey.as_ref())?;
+    let sealed = switchbitcoin::crypto::storage::seal(&kek, seckey.as_ref())?;
 
     let mut buf = Vec::with_capacity(MAGIC.len() + SALT_LEN + 4 + sealed.len());
     buf.extend_from_slice(MAGIC);
@@ -321,7 +321,7 @@ fn unseal_operator_key(path: &Path, passphrase: &str) -> Result<Zeroizing<[u8; 3
     }
     let kek = derive_kek(passphrase, &salt, iters);
     let plain = Zeroizing::new(
-        swapkey::crypto::storage::open(&kek, &raw[header..])
+        switchbitcoin::crypto::storage::open(&kek, &raw[header..])
             .map_err(|_| "operator key: wrong passphrase or corrupted file")?,
     );
     if plain.len() != 32 {
@@ -618,9 +618,9 @@ fn cmd_keygen(flags: &Flags) -> CliResult {
     std::fs::write(&pub_path, format!("{}\n", hex_encode(&xonly)))?;
     seal_operator_key(&key_path, &seckey, &passphrase, DEFAULT_PBKDF2_ITERS)?;
 
-    eprintln!("[swapkey-manifest] sealed operator key written: {}", key_path.display());
-    eprintln!("[swapkey-manifest] KEEP IT OUT OF EVERY REPO; the passphrase is unrecoverable");
-    eprintln!("[swapkey-manifest] x-only public key (pin this in the wallet binary):");
+    eprintln!("[switchbitcoin-manifest] sealed operator key written: {}", key_path.display());
+    eprintln!("[switchbitcoin-manifest] KEEP IT OUT OF EVERY REPO; the passphrase is unrecoverable");
+    eprintln!("[switchbitcoin-manifest] x-only public key (pin this in the wallet binary):");
     println!("{}", hex_encode(&xonly));
     Ok(())
 }
@@ -666,14 +666,14 @@ fn cmd_sign(flags: &Flags) -> CliResult {
     f.write_all(&envelope).and_then(|()| f.sync_all())?;
 
     eprintln!(
-        "[swapkey-manifest] signed manifest v{} written: {} ({} bytes)",
+        "[switchbitcoin-manifest] signed manifest v{} written: {} ({} bytes)",
         manifest.version(),
         out_path.display(),
         envelope.len()
     );
-    eprintln!("[swapkey-manifest] id: {}", hex_encode(&manifest.id()));
-    eprintln!("[swapkey-manifest] distribute to ALL testers promptly (one version per test round)");
-    eprintln!("[swapkey-manifest] testers ingest with: swapkey-cli manifest ingest <file>");
+    eprintln!("[switchbitcoin-manifest] id: {}", hex_encode(&manifest.id()));
+    eprintln!("[switchbitcoin-manifest] distribute to ALL testers promptly (one version per test round)");
+    eprintln!("[switchbitcoin-manifest] testers ingest with: switchbitcoin-cli manifest ingest <file>");
     Ok(())
 }
 
@@ -683,7 +683,7 @@ fn cmd_compose_check(flags: &Flags) -> CliResult {
     };
     let manifest = compose_from_file(Path::new(params_file))?;
     eprintln!(
-        "[swapkey-manifest] OK: composes as manifest v{} (id {}) — every wallet-side \
+        "[switchbitcoin-manifest] OK: composes as manifest v{} (id {}) — every wallet-side \
          invariant holds",
         manifest.version(),
         hex_encode(&manifest.id())
@@ -779,10 +779,10 @@ fn cmd_reseal(flags: &Flags) -> CliResult {
     std::fs::rename(&tmp, &key_path)
         .map_err(|e| format!("reseal rename failed: {e} (the re-sealed key is at {})", tmp.display()))?;
     eprintln!(
-        "[swapkey-manifest] operator key re-sealed under the new passphrase: {}",
+        "[switchbitcoin-manifest] operator key re-sealed under the new passphrase: {}",
         key_path.display()
     );
-    eprintln!("[swapkey-manifest] the keypair is unchanged — no re-pin, no re-issue needed");
+    eprintln!("[switchbitcoin-manifest] the keypair is unchanged — no re-pin, no re-issue needed");
     Ok(())
 }
 
@@ -794,7 +794,7 @@ fn cmd_reseal(flags: &Flags) -> CliResult {
 mod tests {
     use super::*;
     use proptest::prelude::*;
-    use swapkey::wallet::manifest::{modeled_operator_seckey, ManifestStore, ModeledTrustRoot};
+    use switchbitcoin::wallet::manifest::{modeled_operator_seckey, ManifestStore, ModeledTrustRoot};
 
     /// Low work factor for the seal-format tests; the CLI layer always uses
     /// DEFAULT_PBKDF2_ITERS (same discipline as the keystore's TEST_ITERS).
@@ -1013,7 +1013,7 @@ cofunding_jitter_max = "6"
         store.ingest(&env2, &root).expect("v2 moves forward");
         assert!(matches!(
             store.ingest(&env1, &root).unwrap_err(),
-            swapkey::Error::Ordering(_)
+            switchbitcoin::Error::Ordering(_)
         ));
 
         // Δ_fee-VERSION SWAP: changed params under a NON-bumped version must
@@ -1025,7 +1025,7 @@ cofunding_jitter_max = "6"
         let env2b = sign_manifest(&m2b, &seckey).unwrap();
         assert!(matches!(
             store.ingest(&env2b, &root).unwrap_err(),
-            swapkey::Error::Ordering(_)
+            switchbitcoin::Error::Ordering(_)
         ));
 
         // WRONG KEY: the same manifest signed by a DIFFERENT real key is
@@ -1036,7 +1036,7 @@ cofunding_jitter_max = "6"
         let env3_wrong = sign_manifest(&m3, &other).unwrap();
         assert!(matches!(
             store.ingest(&env3_wrong, &root).unwrap_err(),
-            swapkey::Error::Verification(_)
+            switchbitcoin::Error::Verification(_)
         ));
 
         // PIN SYMMETRY: a pinned-real-root store rejects modeled-signed

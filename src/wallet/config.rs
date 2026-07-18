@@ -1,7 +1,10 @@
 //! Wallet configuration (Task 07): ONE validated config for the runnable
 //! wallet — data dir, network, node RPC credentials, peer transport
-//! addresses — loaded from `swapkey.toml` plus `SWAPKEY_*` environment
-//! overrides (env wins over file).
+//! addresses — loaded from `switchbitcoin.toml` plus `SWITCHBITCOIN_*`
+//! environment overrides (env wins over file). The pre-rebrand names —
+//! `swapkey.toml` and `SWAPKEY_*` — remain accepted as LEGACY fallbacks
+//! (Task 31: the live testnet fleet predates the rename); when both
+//! namespaces set the same key, `SWITCHBITCOIN_*` wins.
 //!
 //! FORMAT: a deliberately tiny TOML subset, hand-parsed so the config path
 //! adds no dependency (the config file is the wallet's outermost input
@@ -16,17 +19,20 @@
 //!   * unknown keys/sections and duplicate keys are ERRORS (typo safety —
 //!     a silently ignored `rpc_passwrod` would strand the node offline).
 //!     [`WalletConfig::load`] applies the same strictness to the env side:
-//!     unknown `SWAPKEY_*` variables are refused. A set-but-EMPTY variable
-//!     counts as unset (shells "clear" variables that way), so an empty
-//!     override can never shadow a valid file value.
+//!     unknown `SWITCHBITCOIN_*` variables are refused — and so are unknown
+//!     `SWAPKEY_*` variables, because the legacy namespace is still consulted
+//!     (a silently ignored legacy typo would strand the node exactly the way
+//!     a file typo would). A set-but-EMPTY variable counts as unset (shells
+//!     "clear" variables that way), so an empty override can never shadow a
+//!     valid file value.
 //!
 //! SECRET HYGIENE: the RPC password lives in a [`Secret`] — redacted
 //! `Debug`, no `Display`, zeroized on drop; the raw file text and parsed
 //! values are scrubbed after loading too. Parse and validation errors name
 //! keys and line numbers, NEVER values, and `rpc_url` may not embed
 //! userinfo credentials (they would sit outside the `Secret` wrapper).
-//! Prefer `SWAPKEY_RPC_PASSWORD` (or bitcoind cookie auth) over writing the
-//! password into the file at all. Residual (documented, pre-alpha threat
+//! Prefer `SWITCHBITCOIN_RPC_PASSWORD` (or bitcoind cookie auth) over
+//! writing the password into the file at all. Residual (documented, pre-alpha threat
 //! model): the process environment block itself, and OS paging, are not
 //! scrubbable from here.
 //!
@@ -45,7 +51,13 @@ use zeroize::Zeroize;
 
 /// Conventional config file name. The file lives wherever the runner is
 /// pointed (it CONTAINS `data_dir`); it need not be inside the data dir.
-pub const CONFIG_FILE: &str = "swapkey.toml";
+pub const CONFIG_FILE: &str = "switchbitcoin.toml";
+
+/// The pre-rebrand config file name (Task 31). The binaries' default-path
+/// resolution still falls back to it (with a deprecation log line) so the
+/// live testnet fleet's existing configs keep working; loading it by
+/// explicit `--config` path was never name-sensitive.
+pub const LEGACY_CONFIG_FILE: &str = "swapkey.toml";
 
 /// Config loading/validation error. Its own type (not [`crate::Error`])
 /// because config diagnostics need dynamic context — key names and line
@@ -226,15 +238,17 @@ impl WalletConfig {
         }
     }
 
-    /// Load `path` and apply `SWAPKEY_*` environment overrides, then
+    /// Load `path` and apply `SWITCHBITCOIN_*` environment overrides (legacy
+    /// `SWAPKEY_*` still consulted; the new namespace wins per key), then
     /// validate. See the module docs for the file format and key set.
-    /// The env namespace gets the same typo strictness as the file: an
-    /// unknown `SWAPKEY_*` variable in the process environment is an error
-    /// (a silently ignored `SWAPKEY_RPC_PASSWROD` would strand the node on a
-    /// stale credential — the exact failure the file parser's strictness
-    /// exists to prevent).
+    /// Both env namespaces get the same typo strictness as the file: an
+    /// unknown `SWITCHBITCOIN_*` or `SWAPKEY_*` variable in the process
+    /// environment is an error (a silently ignored
+    /// `SWITCHBITCOIN_RPC_PASSWROD` would strand the node on a stale
+    /// credential — the exact failure the file parser's strictness exists
+    /// to prevent).
     pub fn load(path: &Path) -> Result<WalletConfig, ConfigError> {
-        reject_unknown_swapkey_vars(std::env::vars().map(|(name, _)| name))?;
+        reject_unknown_namespace_vars(std::env::vars().map(|(name, _)| name))?;
         Self::load_with_env(path, &|key| std::env::var(key).ok())
     }
 
@@ -260,25 +274,29 @@ impl WalletConfig {
         // it on the freed heap.
         text.zeroize();
         let file = ZeroizeValuesOnDrop(parsed?);
-        let get = |file_key: &str, env_key: &str| -> Option<String> {
-            env(env_key)
+        // Per key: new-namespace env, else legacy-namespace env, else file.
+        let get = |file_key: &str, env_suffix: &str| -> Option<String> {
+            env(&format!("SWITCHBITCOIN_{env_suffix}"))
                 .filter(|v| !v.is_empty())
+                .or_else(|| env(&format!("SWAPKEY_{env_suffix}")).filter(|v| !v.is_empty()))
                 .or_else(|| file.0.get(file_key).cloned())
         };
 
-        let network = Network::parse(&get("network", "SWAPKEY_NETWORK").ok_or_else(|| {
-            ConfigError::Invalid("network is required (file key `network` or SWAPKEY_NETWORK)".into())
-        })?)?;
-        let data_dir = PathBuf::from(get("data_dir", "SWAPKEY_DATA_DIR").ok_or_else(|| {
+        let network = Network::parse(&get("network", "NETWORK").ok_or_else(|| {
             ConfigError::Invalid(
-                "data_dir is required (file key `data_dir` or SWAPKEY_DATA_DIR)".into(),
+                "network is required (file key `network` or SWITCHBITCOIN_NETWORK)".into(),
+            )
+        })?)?;
+        let data_dir = PathBuf::from(get("data_dir", "DATA_DIR").ok_or_else(|| {
+            ConfigError::Invalid(
+                "data_dir is required (file key `data_dir` or SWITCHBITCOIN_DATA_DIR)".into(),
             )
         })?);
 
-        let url = get("node.rpc_url", "SWAPKEY_RPC_URL");
-        let user = get("node.rpc_user", "SWAPKEY_RPC_USER");
-        let password = get("node.rpc_password", "SWAPKEY_RPC_PASSWORD").map(Secret::new);
-        let cookie = get("node.rpc_cookie_file", "SWAPKEY_RPC_COOKIE_FILE").map(PathBuf::from);
+        let url = get("node.rpc_url", "RPC_URL");
+        let user = get("node.rpc_user", "RPC_USER");
+        let password = get("node.rpc_password", "RPC_PASSWORD").map(Secret::new);
+        let cookie = get("node.rpc_cookie_file", "RPC_COOKIE_FILE").map(PathBuf::from);
         let any_node_key =
             url.is_some() || user.is_some() || password.is_some() || cookie.is_some();
         let node = if !any_node_key {
@@ -311,8 +329,8 @@ impl WalletConfig {
         };
 
         let peer = PeerConfig {
-            listen: get("peer.listen", "SWAPKEY_PEER_LISTEN"),
-            connect: get("peer.connect", "SWAPKEY_PEER_CONNECT"),
+            listen: get("peer.listen", "PEER_LISTEN"),
+            connect: get("peer.connect", "PEER_CONNECT"),
         };
 
         let config = WalletConfig {
@@ -398,32 +416,41 @@ const KNOWN_KEYS: [&str; 8] = [
     "peer.connect",
 ];
 
-/// Every environment variable `load` consults (1:1 with `KNOWN_KEYS`).
-const ENV_KEYS: [&str; 8] = [
-    "SWAPKEY_NETWORK",
-    "SWAPKEY_DATA_DIR",
-    "SWAPKEY_RPC_URL",
-    "SWAPKEY_RPC_USER",
-    "SWAPKEY_RPC_PASSWORD",
-    "SWAPKEY_RPC_COOKIE_FILE",
-    "SWAPKEY_PEER_LISTEN",
-    "SWAPKEY_PEER_CONNECT",
+/// Every environment-variable SUFFIX `load` consults (1:1 with
+/// `KNOWN_KEYS`); the full names are `SWITCHBITCOIN_<suffix>` and, legacy,
+/// `SWAPKEY_<suffix>`.
+const ENV_SUFFIXES: [&str; 8] = [
+    "NETWORK",
+    "DATA_DIR",
+    "RPC_URL",
+    "RPC_USER",
+    "RPC_PASSWORD",
+    "RPC_COOKIE_FILE",
+    "PEER_LISTEN",
+    "PEER_CONNECT",
 ];
 
 /// The env-side twin of the file parser's unknown-key strictness: any
-/// `SWAPKEY_`-prefixed variable outside [`ENV_KEYS`] is refused (the prefix
-/// is this wallet's namespace). Takes NAMES only — values never enter error
+/// `SWITCHBITCOIN_`- or (legacy) `SWAPKEY_`-prefixed variable whose suffix
+/// is outside [`ENV_SUFFIXES`] is refused — both prefixes are this wallet's
+/// namespace, and a silently ignored typo in either would strand the node
+/// on a stale credential. Takes NAMES only — values never enter error
 /// text. Separated from `load` so tests can inject names without touching
 /// the process environment.
-fn reject_unknown_swapkey_vars(
+fn reject_unknown_namespace_vars(
     names: impl Iterator<Item = String>,
 ) -> Result<(), ConfigError> {
     for name in names {
-        if name.starts_with("SWAPKEY_") && !ENV_KEYS.contains(&name.as_str()) {
-            return Err(ConfigError::Invalid(format!(
-                "unknown environment variable `{name}` (typo? known variables: {})",
-                ENV_KEYS.join(", ")
-            )));
+        let suffix = name
+            .strip_prefix("SWITCHBITCOIN_")
+            .or_else(|| name.strip_prefix("SWAPKEY_"));
+        if let Some(suffix) = suffix {
+            if !ENV_SUFFIXES.contains(&suffix) {
+                return Err(ConfigError::Invalid(format!(
+                    "unknown environment variable `{name}` (typo? known variables: SWITCHBITCOIN_{{{}}} — legacy SWAPKEY_* accepted too)",
+                    ENV_SUFFIXES.join(", ")
+                )));
+            }
         }
     }
     Ok(())
@@ -561,13 +588,13 @@ mod tests {
     }
 
     const FULL: &str = r#"
-# swapkey.toml — full example
+# switchbitcoin.toml — full example
 network = "regtest"
 data_dir = 'C:\wallet\data'   # literal string: backslashes untouched
 
 [node]
 rpc_url = "http://127.0.0.1:18443"
-rpc_user = "swapkey"
+rpc_user = "switchbitcoin"
 rpc_password = "hunter2-secret"
 
 [peer]
@@ -587,7 +614,7 @@ connect = "10.0.0.7:9735"
         assert_eq!(node.url, "http://127.0.0.1:18443");
         match &node.auth {
             RpcAuth::UserPass { user, password } => {
-                assert_eq!(user, "swapkey");
+                assert_eq!(user, "switchbitcoin");
                 assert_eq!(password.expose(), "hunter2-secret");
             }
             other => panic!("expected user/pass auth, got {other:?}"),
@@ -608,9 +635,9 @@ connect = "10.0.0.7:9735"
         );
         let env = |key: &str| -> Option<String> {
             match key {
-                "SWAPKEY_NETWORK" => Some("testnet".into()),
-                "SWAPKEY_RPC_PASSWORD" => Some("from-env".into()),
-                "SWAPKEY_PEER_CONNECT" => Some("peer.example:9735".into()),
+                "SWITCHBITCOIN_NETWORK" => Some("testnet".into()),
+                "SWITCHBITCOIN_RPC_PASSWORD" => Some("from-env".into()),
+                "SWITCHBITCOIN_PEER_CONNECT" => Some("peer.example:9735".into()),
                 _ => None,
             }
         };
@@ -622,6 +649,42 @@ connect = "10.0.0.7:9735"
         }
         assert_eq!(cfg.peer.connect.as_deref(), Some("peer.example:9735"));
         assert_eq!(cfg.peer.listen, None);
+    }
+
+    #[test]
+    fn legacy_swapkey_env_vars_still_work_and_the_new_namespace_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_cfg(
+            dir.path(),
+            "network = \"regtest\"\ndata_dir = \"d\"\n[node]\nrpc_url = \"http://x:1\"\nrpc_user = \"u\"\n",
+        );
+        // Legacy-only: the pre-rebrand namespace still supplies values.
+        let legacy_only = |key: &str| -> Option<String> {
+            match key {
+                "SWAPKEY_NETWORK" => Some("testnet".into()),
+                "SWAPKEY_RPC_PASSWORD" => Some("from-legacy".into()),
+                _ => None,
+            }
+        };
+        let cfg = WalletConfig::load_with_env(&path, &legacy_only).unwrap();
+        assert_eq!(cfg.network, Network::Testnet);
+        match &cfg.node.as_ref().unwrap().auth {
+            RpcAuth::UserPass { password, .. } => assert_eq!(password.expose(), "from-legacy"),
+            other => panic!("expected user/pass auth, got {other:?}"),
+        }
+        // Both set: SWITCHBITCOIN_* beats SWAPKEY_* per key.
+        let both = |key: &str| -> Option<String> {
+            match key {
+                "SWITCHBITCOIN_RPC_PASSWORD" => Some("from-new".into()),
+                "SWAPKEY_RPC_PASSWORD" => Some("from-legacy".into()),
+                _ => None,
+            }
+        };
+        let cfg = WalletConfig::load_with_env(&path, &both).unwrap();
+        match &cfg.node.unwrap().auth {
+            RpcAuth::UserPass { password, .. } => assert_eq!(password.expose(), "from-new"),
+            other => panic!("expected user/pass auth, got {other:?}"),
+        }
     }
 
     #[test]
@@ -720,8 +783,14 @@ connect = "10.0.0.7:9735"
         // shadow the file's valid value, and an empty stray var must not
         // conjure a [node] requirement.
         let env = |key: &str| -> Option<String> {
-            matches!(key, "SWAPKEY_RPC_PASSWORD" | "SWAPKEY_RPC_COOKIE_FILE")
-                .then(String::new)
+            matches!(
+                key,
+                "SWITCHBITCOIN_RPC_PASSWORD"
+                    | "SWITCHBITCOIN_RPC_COOKIE_FILE"
+                    | "SWAPKEY_RPC_PASSWORD"
+                    | "SWAPKEY_RPC_COOKIE_FILE"
+            )
+            .then(String::new)
         };
         let cfg = WalletConfig::load_with_env(&path, &env).unwrap();
         match &cfg.node.unwrap().auth {
@@ -758,16 +827,23 @@ connect = "10.0.0.7:9735"
     }
 
     #[test]
-    fn unknown_swapkey_env_vars_are_refused_by_name() {
+    fn unknown_namespace_env_vars_are_refused_by_name() {
         // The recommended path for the password is the env var — it gets the
-        // same typo safety as the file.
-        let err = reject_unknown_swapkey_vars(
+        // same typo safety as the file, in BOTH namespaces.
+        let err = reject_unknown_namespace_vars(
+            ["PATH", "SWITCHBITCOIN_RPC_PASSWROD", "HOME"].map(String::from).into_iter(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("SWITCHBITCOIN_RPC_PASSWROD"), "{err}");
+        let err = reject_unknown_namespace_vars(
             ["PATH", "SWAPKEY_RPC_PASSWROD", "HOME"].map(String::from).into_iter(),
         )
         .unwrap_err();
         assert!(err.to_string().contains("SWAPKEY_RPC_PASSWROD"), "{err}");
-        assert!(reject_unknown_swapkey_vars(
-            ["PATH", "SWAPKEY_RPC_PASSWORD"].map(String::from).into_iter()
+        assert!(reject_unknown_namespace_vars(
+            ["PATH", "SWITCHBITCOIN_RPC_PASSWORD", "SWAPKEY_RPC_PASSWORD"]
+                .map(String::from)
+                .into_iter()
         )
         .is_ok());
     }

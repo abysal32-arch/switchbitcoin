@@ -217,7 +217,7 @@ impl SwapEngine {
     }
 
     /// Mutable manifest-store handle — the operator INGEST path (Task 18:
-    /// `swapkey-cli manifest ingest`). Every gate lives in
+    /// `switchbitcoin-cli manifest ingest`). Every gate lives in
     /// [`ManifestStore::ingest`] itself (signature, invariants, monotonic
     /// version vs current AND floor), so this exposes no bypass. Mid-swap
     /// params safety: the store's single-instance lock means no OTHER process

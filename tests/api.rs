@@ -7,18 +7,18 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 use bitcoin::OutPoint;
-use swapkey::settlement::params::Params;
-use swapkey::wallet::api::{
+use switchbitcoin::settlement::params::Params;
+use switchbitcoin::wallet::api::{
     json_str_field, json_string, read_request, route, status_snapshot, ApiCmd, ApiState,
     SharedState, SwapView,
 };
-use swapkey::wallet::config::Network;
-use swapkey::wallet::engine::SwapEngine;
-use swapkey::wallet::keys::ModeledKeySource;
-use swapkey::wallet::ledger::{acknowledge_phase0, Ledger, PHASE0_WARNING};
-use swapkey::wallet::manifest::ModeledTrustRoot;
-use swapkey::wallet::store::ModeledEnclave;
-use swapkey::wallet::ticket::Ticket;
+use switchbitcoin::wallet::config::Network;
+use switchbitcoin::wallet::engine::SwapEngine;
+use switchbitcoin::wallet::keys::ModeledKeySource;
+use switchbitcoin::wallet::ledger::{acknowledge_phase0, Ledger, PHASE0_WARNING};
+use switchbitcoin::wallet::manifest::ModeledTrustRoot;
+use switchbitcoin::wallet::store::ModeledEnclave;
+use switchbitcoin::wallet::ticket::Ticket;
 
 fn seeded_engine(dir: &std::path::Path) -> SwapEngine {
     let ack = acknowledge_phase0(PHASE0_WARNING).unwrap();
@@ -115,7 +115,7 @@ fn status_snapshot_reflects_the_seeded_engine() {
     }
     // Build provenance (Task 20): the snapshot names the exact build.
     assert!(
-        json.contains(swapkey::wallet::api::BUILD_VERSION),
+        json.contains(switchbitcoin::wallet::api::BUILD_VERSION),
         "snapshot must carry BUILD_VERSION: {json}"
     );
     // The one active view rides BOTH in the legacy `swap` field and in the

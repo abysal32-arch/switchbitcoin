@@ -1,6 +1,6 @@
 //! Runner-module integration (Task 08): the tick→broadcast run loop and the
 //! two-party pre-swap negotiation, driven over `SimChain` + an in-process
-//! transport — the unit-testable core the `swapkey-cli` binary composes.
+//! transport — the unit-testable core the `switchbitcoin-cli` binary composes.
 //!
 //! * `swap_step_drives_a_full_swap_to_completed` — the headline app-test
 //!   fixture, but the SL side is driven ENTIRELY through `swap_step`: the
@@ -26,31 +26,31 @@ use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 use bitcoin::OutPoint;
-use swapkey::chain::{ChainView, SimChain, SpendStatus};
-use swapkey::crypto::adaptor::AdaptorSecret;
-use swapkey::crypto::ValidatedPoint;
-use swapkey::settlement::params::Params;
-use swapkey::settlement::refund::{confirm_watchtower_handoff, PreArmedRefund, WatchtowerReceipt};
-use swapkey::settlement::state_machine::{
+use switchbitcoin::chain::{ChainView, SimChain, SpendStatus};
+use switchbitcoin::crypto::adaptor::AdaptorSecret;
+use switchbitcoin::crypto::ValidatedPoint;
+use switchbitcoin::settlement::params::Params;
+use switchbitcoin::settlement::refund::{confirm_watchtower_handoff, PreArmedRefund, WatchtowerReceipt};
+use switchbitcoin::settlement::state_machine::{
     canonical_internal_key, swap_session_id, ExchangeInputs, Funding, PeerSession, Role, Transport,
 };
-use swapkey::tx::escrow::Escrow;
-use swapkey::tx::setup::build_setup;
-use swapkey::tx::txbuild::{build_completion, finalize_key_spend};
-use swapkey::wallet::config::Network;
-use swapkey::wallet::engine::{SwapContext, SwapEngine};
-use swapkey::wallet::keys::ModeledKeySource;
-use swapkey::wallet::ledger::{acknowledge_phase0, CoinClass, CoinState, Ledger, WalletClock, PHASE0_WARNING};
-use swapkey::wallet::manifest::{ClaimDelayPosture, ModeledTrustRoot};
-use swapkey::wallet::runner::{
+use switchbitcoin::tx::escrow::Escrow;
+use switchbitcoin::tx::setup::build_setup;
+use switchbitcoin::tx::txbuild::{build_completion, finalize_key_spend};
+use switchbitcoin::wallet::config::Network;
+use switchbitcoin::wallet::engine::{SwapContext, SwapEngine};
+use switchbitcoin::wallet::keys::ModeledKeySource;
+use switchbitcoin::wallet::ledger::{acknowledge_phase0, CoinClass, CoinState, Ledger, WalletClock, PHASE0_WARNING};
+use switchbitcoin::wallet::manifest::{ClaimDelayPosture, ModeledTrustRoot};
+use switchbitcoin::wallet::runner::{
     completion_babysit_step, negotiate_swap, refund_babysit_step, swap_step, RunOptions,
     SwapArtifacts, SwapOutcome, SwapRunState, SwapStepOutcome,
 };
-use swapkey::wallet::store::{ModeledEnclave, SwapPhase};
-use swapkey::wallet::ticket::{maker_rendezvous, taker_rendezvous, Ticket};
-use swapkey::wallet::transport::TcpTransport;
-use swapkey::wallet::AppTick;
-use swapkey::{Error, Result};
+use switchbitcoin::wallet::store::{ModeledEnclave, SwapPhase};
+use switchbitcoin::wallet::ticket::{maker_rendezvous, taker_rendezvous, Ticket};
+use switchbitcoin::wallet::transport::TcpTransport;
+use switchbitcoin::wallet::AppTick;
+use switchbitcoin::{Error, Result};
 use secp::{Point, Scalar};
 
 // ---------- shared fixture helpers (mirrors tests/app.rs) ----------
@@ -340,7 +340,7 @@ fn swap_step_drives_a_full_swap_to_completed() {
         possession_store.path().to_path_buf(), sl_receipt, sl_pre,
     );
     let peer = PeerSession::new([0xE9u8; 32], Box::new(io_sl));
-    let mut app = swapkey::wallet::SwapApp::begin(&engine, ctx, peer, base + 500, 0).unwrap();
+    let mut app = switchbitcoin::wallet::SwapApp::begin(&engine, ctx, peer, base + 500, 0).unwrap();
 
     let artifacts = SwapArtifacts {
         session_id: sid,
@@ -488,7 +488,7 @@ fn swap_step_funded_abort_babysits_to_refunded() {
     let sid = SwapEngine::swap_session_id(&ctx).unwrap();
     let (dead, _keep) = duplex();
     let peer = PeerSession::new([0u8; 32], Box::new(dead));
-    let mut app = swapkey::wallet::SwapApp::begin(&engine, ctx, peer, base + 500, 0).unwrap();
+    let mut app = switchbitcoin::wallet::SwapApp::begin(&engine, ctx, peer, base + 500, 0).unwrap();
 
     let artifacts = SwapArtifacts {
         session_id: sid,
@@ -629,7 +629,7 @@ fn run_party(
     let msg_comp_sl = negotiated.ctx.msg_comp_sl;
 
     let peer = PeerSession::new(sid, Box::new(io));
-    let mut app = swapkey::wallet::SwapApp::begin(&engine, negotiated.ctx, peer, block_x, 0)?;
+    let mut app = switchbitcoin::wallet::SwapApp::begin(&engine, negotiated.ctx, peer, block_x, 0)?;
     let artifacts = negotiated.artifacts;
     let opts = RunOptions::default();
     // Printed only on test failure (libtest captures output) — diagnostics.
@@ -1040,7 +1040,7 @@ fn foreign_spend_of(outpoint: OutPoint, out_sats: u64) -> Vec<u8> {
 /// be injected against the swept escrow. Tempdirs ride along so the stores
 /// under the engine/ctx stay alive.
 struct HeldSwap {
-    app: swapkey::wallet::SwapApp,
+    app: switchbitcoin::wallet::SwapApp,
     engine: SwapEngine,
     chain: SimChain,
     artifacts: SwapArtifacts,
@@ -1165,7 +1165,7 @@ fn drive_sl_swap_to_first_hold() -> HeldSwap {
         possession_store.path().to_path_buf(), sl_receipt, sl_pre,
     );
     let peer = PeerSession::new([0xE9u8; 32], Box::new(io_sl));
-    let mut app = swapkey::wallet::SwapApp::begin(&engine, ctx, peer, base + 500, 0).unwrap();
+    let mut app = switchbitcoin::wallet::SwapApp::begin(&engine, ctx, peer, base + 500, 0).unwrap();
 
     let artifacts = SwapArtifacts {
         session_id: sid,
@@ -1357,7 +1357,7 @@ fn sl_hold_reports_a_confirmed_foreign_spend_as_lost_never_success() {
 }
 
 /// N-attempt empirical measurement of the role↔CSV refund rate: run the SAME
-/// two-wallet flow N times (env `SWAPKEY_RATE_ATTEMPTS`, default 32), tally the
+/// two-wallet flow N times (env `SWITCHBITCOIN_RATE_ATTEMPTS`, default 32), tally the
 /// completed/refunded split, and print a machine-greppable summary. Ignored by
 /// default (minutes of wall clock — each refund attempt mines 216+ SimChain
 /// blocks at the 10 ms miner tick). Run with:
@@ -1365,7 +1365,7 @@ fn sl_hold_reports_a_confirmed_foreign_spend_as_lost_never_success() {
 #[test]
 #[ignore = "N-attempt role↔CSV refund-rate measurement; run with --ignored --nocapture"]
 fn measure_role_csv_refund_rate() {
-    let n: usize = std::env::var("SWAPKEY_RATE_ATTEMPTS")
+    let n: usize = std::env::var("SWITCHBITCOIN_RATE_ATTEMPTS")
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|&v| v > 0)
@@ -1883,9 +1883,9 @@ fn two_concurrent_swaps_share_one_ledger_without_collisions() {
     let peer1 = PeerSession::new(sid1, Box::new(io1_a));
     let peer2 = PeerSession::new(sid2, Box::new(io2_a));
     let mut app1 =
-        swapkey::wallet::SwapApp::begin(&engine, n1.ctx, peer1, block_x, 0).expect("begin 1");
+        switchbitcoin::wallet::SwapApp::begin(&engine, n1.ctx, peer1, block_x, 0).expect("begin 1");
     let mut app2 =
-        swapkey::wallet::SwapApp::begin(&engine, n2.ctx, peer2, block_x, 0).expect("begin 2");
+        switchbitcoin::wallet::SwapApp::begin(&engine, n2.ctx, peer2, block_x, 0).expect("begin 2");
     let art1 = n1.artifacts;
     let art2 = n2.artifacts;
     let opts = RunOptions::default();

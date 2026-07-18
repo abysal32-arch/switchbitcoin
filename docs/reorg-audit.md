@@ -2,7 +2,7 @@
 
 **Scope of risk.** Regtest never reorged under us; testnet4 *will* — multi-block
 reorgs are routine there, and spy/spam waves make stale tips and flapping fee
-estimates normal. Every deadline in SwapKey is **height-anchored**. A reorg can
+estimates normal. Every deadline in SwitchBitcoin is **height-anchored**. A reorg can
 (a) make a "confirmed" funding vanish, (b) shift an anchor height, or (c) pull
 the tip **backwards** between polls. This document walks every height-anchored
 value, answers *"what happens if the block that produced this un-confirms?"*,

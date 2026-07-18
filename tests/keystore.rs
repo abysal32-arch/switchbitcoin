@@ -9,23 +9,23 @@
 //! different key root.
 
 use bitcoin::OutPoint;
-use swapkey::chain::{ChainView, SimChain, SpendStatus};
-use swapkey::crypto::adaptor::AdaptorSecret;
-use swapkey::crypto::ValidatedPoint;
-use swapkey::settlement::params::Params;
-use swapkey::settlement::refund::{confirm_watchtower_handoff, PreArmedRefund};
-use swapkey::settlement::state_machine::{
+use switchbitcoin::chain::{ChainView, SimChain, SpendStatus};
+use switchbitcoin::crypto::adaptor::AdaptorSecret;
+use switchbitcoin::crypto::ValidatedPoint;
+use switchbitcoin::settlement::params::Params;
+use switchbitcoin::settlement::refund::{confirm_watchtower_handoff, PreArmedRefund};
+use switchbitcoin::settlement::state_machine::{
     swap_session_id, ExchangeInputs, Funding, PeerSession, Role, Transport,
 };
-use swapkey::tx::escrow::Escrow;
-use swapkey::tx::txbuild::{build_completion, finalize_key_spend};
-use swapkey::wallet::engine::{SwapContext, SwapEngine, SwapOutcome};
-use swapkey::wallet::keys::{KeyPurpose, KeySource};
-use swapkey::wallet::keystore::SoftwareKeyStore;
-use swapkey::wallet::ledger::{acknowledge_phase0, CoinState, Ledger, WalletClock, PHASE0_WARNING};
-use swapkey::wallet::manifest::ModeledTrustRoot;
-use swapkey::wallet::store::{ModeledEnclave, SwapPhase, SwapStore};
-use swapkey::{Error, Result};
+use switchbitcoin::tx::escrow::Escrow;
+use switchbitcoin::tx::txbuild::{build_completion, finalize_key_spend};
+use switchbitcoin::wallet::engine::{SwapContext, SwapEngine, SwapOutcome};
+use switchbitcoin::wallet::keys::{KeyPurpose, KeySource};
+use switchbitcoin::wallet::keystore::SoftwareKeyStore;
+use switchbitcoin::wallet::ledger::{acknowledge_phase0, CoinState, Ledger, WalletClock, PHASE0_WARNING};
+use switchbitcoin::wallet::manifest::ModeledTrustRoot;
+use switchbitcoin::wallet::store::{ModeledEnclave, SwapPhase, SwapStore};
+use switchbitcoin::{Error, Result};
 use secp::{Point, Scalar};
 use std::sync::mpsc;
 
@@ -121,7 +121,7 @@ fn full_swap_driven_with_the_software_keystore() {
     let sh = keypair();
     let sl = keypair();
     let internal =
-        swapkey::settlement::state_machine::canonical_internal_key(sh.pk, sl.pk).unwrap();
+        switchbitcoin::settlement::state_machine::canonical_internal_key(sh.pk, sl.pk).unwrap();
     let escrow_comp_sh = Escrow::new(&internal, &sl.pk, params.delta_early).unwrap(); // E_sl
     let escrow_comp_sl = Escrow::new(&internal, &sh.pk, delta_late).unwrap(); // E_sh
     let op_comp_sh = OutPoint::new(txid_from(2), 0);
@@ -319,7 +319,7 @@ fn make_ctx(
     ok_sl: [u8; 32],
     lease_dir: std::path::PathBuf,
     possession_store: std::path::PathBuf,
-    watchtower_receipt: swapkey::settlement::refund::WatchtowerReceipt,
+    watchtower_receipt: switchbitcoin::settlement::refund::WatchtowerReceipt,
     funding_coin: OutPoint,
 ) -> SwapContext {
     SwapContext {

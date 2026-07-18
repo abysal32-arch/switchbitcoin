@@ -1,6 +1,6 @@
 //! Localhost JSON API core (Task 09): the router, state, HTTP framing, and
-//! status snapshot the `swapkey-cli serve` mode exposes to the local
-//! `SwapKey-Wallet.html` frontend.
+//! status snapshot the `switchbitcoin-cli serve` mode exposes to the local
+//! `SwitchBitcoin-Wallet.html` frontend.
 //!
 //! DESIGN: everything here is chain-agnostic and I/O-thin so it unit-tests
 //! against a seeded engine + `SimChain` in the default build (no serde, no
@@ -49,7 +49,7 @@ pub const DEFAULT_API_PORT: u16 = 3316;
 /// The build provenance string (Task 20): crate version + git short hash
 /// (stamped by build.rs; `unknown` outside a git checkout, `-dirty` on an
 /// unclean tree). This is what a tester report must name — it rides in
-/// `swapkey-cli --version`, the `/status` snapshot, and the `diag` bundle.
+/// `switchbitcoin-cli --version`, the `/status` snapshot, and the `diag` bundle.
 pub const BUILD_VERSION: &str =
     concat!(env!("CARGO_PKG_VERSION"), " (git ", env!("NEWKEY_GIT_HASH"), ")");
 

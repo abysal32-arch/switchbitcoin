@@ -1,6 +1,9 @@
-//! Swap Key Protocol — settlement-core reference scaffold.
+//! SwitchBitcoin Protocol — settlement-core reference scaffold.
+//! (Formerly "Swap Key", the internal codename — rebranded Task 31; the
+//! protocol lineage is unchanged.)
 //!
-//! Corresponds to Swap Key Protocol Specification **v3.16**, build sequence step 1–2:
+//! Corresponds to the Swap Key Protocol Specification **v3.16** (the spec
+//! predates the rebrand and keeps its title), build sequence step 1–2:
 //! pinned crypto + validation gate + nonce-lifecycle invariants + settlement core,
 //! with discovery STUBBED (peers fed to each other manually — Requirement 5).
 //!

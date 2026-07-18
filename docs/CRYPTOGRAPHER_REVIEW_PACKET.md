@@ -1,6 +1,11 @@
-# Swap Key Protocol — External Cryptographer Review Packet
+# SwitchBitcoin Protocol — External Cryptographer Review Packet
 
-**Artifact:** settlement-core reference scaffold (Rust crate `swapkey` v0.0.1; the `newkey-*` crypto domain tags and `newkey-scaffold` folder name are spec-defined literals, deliberately kept), spec baseline v3.13–v3.16
+*(Rebranded from "Swap Key" — the internal codename — in Task 31,
+2026-07-18. Protocol, spec lineage, and every domain-separation literal are
+unchanged; older references to "Swap Key" in this packet and its linked
+artifacts denote the same system.)*
+
+**Artifact:** settlement-core reference scaffold (Rust crate `switchbitcoin`, formerly `swapkey`, v0.0.1 at packet authoring; the `newkey-*` crypto domain tags and `newkey-scaffold` folder name are spec-defined literals, deliberately kept), spec baseline v3.13–v3.16
 **Path:** `C:\Users\Joe\Desktop\swap key\newkey-scaffold`
 **Prepared for:** external cryptographer review — the hard stop-gate before any testnet promotion
 **Status of packet:** synthesis of six reviewer mappings; file:line citations renumbered and all status/gap claims re-verified against source on 2026-07-09.
@@ -9,7 +14,7 @@
 
 ## 1. Purpose — why this is the hard gate
 
-The Swap Key Protocol settles a two-party coin swap through a **novel composition** of four primitives that individually are well-understood but whose *interaction* is load-bearing and unaudited:
+The SwitchBitcoin Protocol settles a two-party coin swap through a **novel composition** of four primitives that individually are well-understood but whose *interaction* is load-bearing and unaudited:
 
 1. **Adaptor-signature settlement** — a MuSig2 pre-signature adaptor-shifted by `T = t·G`; broadcasting the completion reveals `s_final`, from which the counterparty extracts `t` and claims.
 2. **Possession gating (G1)** — the Secret-Learner (SL) releases its single enabling partial *only after* it holds a verified complete pre-signature for the transaction it must later extract from, so "the other party can broadcast" and "I can already extract" become simultaneous.

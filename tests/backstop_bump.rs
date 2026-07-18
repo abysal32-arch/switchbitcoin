@@ -8,16 +8,16 @@ use bitcoin::{
     absolute, transaction::Version, Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut,
     Txid, Witness,
 };
-use swapkey::chain::{ChainView, SimChain, SpendStatus};
-use swapkey::settlement::params::Params;
-use swapkey::tx::backstop::ANCHOR_VOUT;
-use swapkey::wallet::keys::ModeledKeySource;
-use swapkey::wallet::ledger::{
+use switchbitcoin::chain::{ChainView, SimChain, SpendStatus};
+use switchbitcoin::settlement::params::Params;
+use switchbitcoin::tx::backstop::ANCHOR_VOUT;
+use switchbitcoin::wallet::keys::ModeledKeySource;
+use switchbitcoin::wallet::ledger::{
     acknowledge_linkage, acknowledge_phase0, BumpTarget, CoinState, Ledger, WalletClock,
     LINKAGE_WARNING, PHASE0_WARNING,
 };
-use swapkey::wallet::{run_cpfp_bump, BumpOutcome, CpfpBumpRequest, ModeledEnclave};
-use swapkey::Error;
+use switchbitcoin::wallet::{run_cpfp_bump, BumpOutcome, CpfpBumpRequest, ModeledEnclave};
+use switchbitcoin::Error;
 
 struct Clock(u64);
 impl WalletClock for Clock {

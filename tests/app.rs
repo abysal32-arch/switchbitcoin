@@ -22,28 +22,28 @@
 //!   re-entry delegates to `RecoveryDriver::reenter_all`.
 
 use bitcoin::OutPoint;
-use swapkey::chain::{ChainView, DualSourceChainView, FundingReading, SimChain, Source, SpendStatus};
-use swapkey::crypto::adaptor::AdaptorSecret;
-use swapkey::crypto::ValidatedPoint;
-use swapkey::settlement::params::Params;
-use swapkey::settlement::refund::{confirm_watchtower_handoff, PreArmedRefund, WatchtowerReceipt};
-use swapkey::settlement::state_machine::{
+use switchbitcoin::chain::{ChainView, DualSourceChainView, FundingReading, SimChain, Source, SpendStatus};
+use switchbitcoin::crypto::adaptor::AdaptorSecret;
+use switchbitcoin::crypto::ValidatedPoint;
+use switchbitcoin::settlement::params::Params;
+use switchbitcoin::settlement::refund::{confirm_watchtower_handoff, PreArmedRefund, WatchtowerReceipt};
+use switchbitcoin::settlement::state_machine::{
     canonical_internal_key, swap_session_id, ExchangeInputs, Funding, PeerSession, Role, Transport,
 };
-use swapkey::tx::escrow::Escrow;
-use swapkey::tx::setup::build_setup;
-use swapkey::tx::txbuild::{build_completion, finalize_key_spend, sign_schnorr_single};
-use swapkey::wallet::app::{AppTick, BackstopRun, SwapApp};
-use swapkey::wallet::backstop_driver::{BackstopTick, BumpOutcome};
-use swapkey::wallet::engine::{SwapContext, SwapEngine};
-use swapkey::wallet::keys::ModeledKeySource;
-use swapkey::wallet::ledger::{acknowledge_phase0, BumpTarget, Ledger, WalletClock, PHASE0_WARNING};
-use swapkey::wallet::ledger::CoinState;
-use swapkey::wallet::manifest::ModeledTrustRoot;
-use swapkey::wallet::orchestrator::AbortAction;
-use swapkey::wallet::recovery_driver::{RecoveryDriver, RecoveryTick};
-use swapkey::wallet::store::{ModeledEnclave, SwapPhase, SwapRecord};
-use swapkey::{Error, Result};
+use switchbitcoin::tx::escrow::Escrow;
+use switchbitcoin::tx::setup::build_setup;
+use switchbitcoin::tx::txbuild::{build_completion, finalize_key_spend, sign_schnorr_single};
+use switchbitcoin::wallet::app::{AppTick, BackstopRun, SwapApp};
+use switchbitcoin::wallet::backstop_driver::{BackstopTick, BumpOutcome};
+use switchbitcoin::wallet::engine::{SwapContext, SwapEngine};
+use switchbitcoin::wallet::keys::ModeledKeySource;
+use switchbitcoin::wallet::ledger::{acknowledge_phase0, BumpTarget, Ledger, WalletClock, PHASE0_WARNING};
+use switchbitcoin::wallet::ledger::CoinState;
+use switchbitcoin::wallet::manifest::ModeledTrustRoot;
+use switchbitcoin::wallet::orchestrator::AbortAction;
+use switchbitcoin::wallet::recovery_driver::{RecoveryDriver, RecoveryTick};
+use switchbitcoin::wallet::store::{ModeledEnclave, SwapPhase, SwapRecord};
+use switchbitcoin::{Error, Result};
 use secp::{Point, Scalar};
 use std::sync::mpsc;
 
@@ -594,7 +594,7 @@ fn swap_app_funded_abort_routes_to_refunding() {
     let sid = SwapEngine::swap_session_id(&ctx).unwrap();
     let peer = PeerSession::new([0u8; 32], Box::new(DeadEnd));
     let mut app = SwapApp::begin(&engine, ctx, peer, base + 500, 0).unwrap();
-    assert_eq!(app.funding_order(), Some(swapkey::wallet::orchestrator::FundingOrder::First));
+    assert_eq!(app.funding_order(), Some(switchbitcoin::wallet::orchestrator::FundingOrder::First));
 
     // Broadcast ours (fund E_ours), then the counterparty funds its escrow at the
     // WRONG amount → a funded abort → Refunding.
@@ -1546,7 +1546,7 @@ fn backstop_execute_refund_bump_not_starved_by_a_huge_completion_parent() {
 
     // A caller-supplied completion "parent" so large its required child fee
     // dwarfs any reserve (fee 1 sat, vsize 10_000_000 vB → child fee ≫ reserve).
-    let huge = swapkey::wallet::app::StalledParent {
+    let huge = switchbitcoin::wallet::app::StalledParent {
         tx_bytes: &[0u8; 0],
         fee_sats: 1,
         vsize_vb: 10_000_000,
@@ -1629,7 +1629,7 @@ impl ChainView for EstimatingChain<'_> {
         Some(self.1)
     }
 }
-impl swapkey::chain::AuthoritativeChainView for EstimatingChain<'_> {}
+impl switchbitcoin::chain::AuthoritativeChainView for EstimatingChain<'_> {}
 
 /// Task 14 (auto-congestion): a pre-armed refund already relayed into the
 /// mempool, plus a live feerate estimate that demands MORE for the refund's own
@@ -2222,7 +2222,7 @@ impl ChainView for DegradedRevealView {
         self.inner.submit_package(p, c)
     }
 }
-impl swapkey::chain::AuthoritativeChainView for DegradedRevealView {}
+impl switchbitcoin::chain::AuthoritativeChainView for DegradedRevealView {}
 
 /// TASK 3 -- a reveal that stays mangled FOREVER never strands SL. 77018f5
 /// made a bad-witness reveal a bounded re-drive (`AwaitingReveal`, asserted
@@ -2572,7 +2572,7 @@ fn unreadable_record_keeps_its_funding_lease_across_open() {
     // held by a real live swap rather than an orphan.
     {
         let (store, _) =
-            swapkey::wallet::store::SwapStore::open(dir.path(), &ModeledEnclave).unwrap();
+            switchbitcoin::wallet::store::SwapStore::open(dir.path(), &ModeledEnclave).unwrap();
         store
             .put(&SwapRecord {
                 swap_session_id: sid_a,

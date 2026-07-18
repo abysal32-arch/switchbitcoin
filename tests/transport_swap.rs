@@ -8,17 +8,17 @@
 //! verified spendable on the bitcoin side.
 
 use bitcoin::OutPoint;
-use swapkey::crypto::adaptor::AdaptorSecret;
-use swapkey::crypto::{ValidatedFinalSig, ValidatedPoint};
-use swapkey::settlement::params::Params;
-use swapkey::settlement::refund::{confirm_watchtower_handoff, PreArmedRefund};
-use swapkey::settlement::state_machine::{
+use switchbitcoin::crypto::adaptor::AdaptorSecret;
+use switchbitcoin::crypto::{ValidatedFinalSig, ValidatedPoint};
+use switchbitcoin::settlement::params::Params;
+use switchbitcoin::settlement::refund::{confirm_watchtower_handoff, PreArmedRefund};
+use switchbitcoin::settlement::state_machine::{
     ExchangeInputs, Funding, PeerSession, Possessing, Role, Transport,
 };
-use swapkey::tx::escrow::Escrow;
-use swapkey::tx::txbuild::{build_completion, verify_taproot_key_spend};
-use swapkey::wallet::transport::TcpTransport;
-use swapkey::Result;
+use switchbitcoin::tx::escrow::Escrow;
+use switchbitcoin::tx::txbuild::{build_completion, verify_taproot_key_spend};
+use switchbitcoin::wallet::transport::TcpTransport;
+use switchbitcoin::Result;
 use secp::{Point, Scalar};
 use std::net::TcpListener;
 
@@ -39,7 +39,7 @@ fn keypair() -> (Scalar, Point) {
 }
 
 fn aggregate_internal(sh_pub: Point, sl_pub: Point) -> Point {
-    swapkey::settlement::state_machine::canonical_internal_key(sh_pub, sl_pub).expect("keys")
+    switchbitcoin::settlement::state_machine::canonical_internal_key(sh_pub, sl_pub).expect("keys")
 }
 
 #[test]
@@ -127,7 +127,7 @@ fn adaptor_exchange_over_tcp_both_legs_spendable() {
             lease_dir: Some(lease_sl.path().to_path_buf()),
             possession_store: Some((
                 store.path().to_path_buf(),
-                swapkey::crypto::storage::platform_secure_key(),
+                switchbitcoin::crypto::storage::platform_secure_key(),
             )),
             taproot_root_comp_sh: Some(root_sh),
             taproot_root_comp_sl: Some(root_sl),
@@ -165,7 +165,7 @@ fn adaptor_exchange_over_tcp_both_legs_spendable() {
 /// TCP framing byte-identically.
 #[test]
 fn cross_session_and_wrong_version_envelopes_rejected_over_tcp() {
-    use swapkey::wire::{open_message, seal_message, Message, WIRE_VERSION};
+    use switchbitcoin::wire::{open_message, seal_message, Message, WIRE_VERSION};
 
     let (mut a, mut b) = tcp_pair();
     let sid = [0xAAu8; 32];

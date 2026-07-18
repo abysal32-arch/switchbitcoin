@@ -4,10 +4,12 @@
 //! the EXACT build a tester is running. Never fails the build: outside a git
 //! checkout (e.g. a source tarball) the stamp is `unknown`.
 //!
-//! NAMESPACE NOTE: deliberately NOT `SWAPKEY_*` — that prefix is the wallet
-//! config's strictly-validated env namespace (`wallet::config` refuses any
-//! unknown `SWAPKEY_*` variable, and cargo exposes this stamp to test
-//! processes at runtime). `newkey-*` is the crate's domain-tag convention.
+//! NAMESPACE NOTE: deliberately NOT `SWITCHBITCOIN_*` (nor the legacy
+//! `SWAPKEY_*`) — those prefixes are the wallet config's strictly-validated
+//! env namespace (`wallet::config` refuses any unknown variable in either,
+//! and cargo exposes this stamp to test processes at runtime). `newkey-*` is
+//! the crate's domain-tag convention and stays through the Task-31 rebrand
+//! (spec literal).
 
 use std::process::Command;
 

@@ -19,18 +19,18 @@
 //! put(Completing) before broadcast.
 
 use bitcoin::{OutPoint, Txid};
-use swapkey::chain::{ChainView, SimChain, SpendStatus};
-use swapkey::crypto::adaptor::AdaptorSecret;
-use swapkey::crypto::{ValidatedFinalSig, ValidatedPoint};
-use swapkey::settlement::params::Params;
-use swapkey::settlement::refund::{confirm_watchtower_handoff, PreArmedRefund};
-use swapkey::settlement::state_machine::{
+use switchbitcoin::chain::{ChainView, SimChain, SpendStatus};
+use switchbitcoin::crypto::adaptor::AdaptorSecret;
+use switchbitcoin::crypto::{ValidatedFinalSig, ValidatedPoint};
+use switchbitcoin::settlement::params::Params;
+use switchbitcoin::settlement::refund::{confirm_watchtower_handoff, PreArmedRefund};
+use switchbitcoin::settlement::state_machine::{
     swap_session_id, ExchangeInputs, Funding, PeerSession, Possessing, Role, Transport,
 };
-use swapkey::tx::escrow::Escrow;
-use swapkey::tx::txbuild::{build_completion, finalize_key_spend};
-use swapkey::wallet::{ModeledEnclave, RecoveryAction, SwapPhase, SwapRecord, SwapStore};
-use swapkey::{Error, Result};
+use switchbitcoin::tx::escrow::Escrow;
+use switchbitcoin::tx::txbuild::{build_completion, finalize_key_spend};
+use switchbitcoin::wallet::{ModeledEnclave, RecoveryAction, SwapPhase, SwapRecord, SwapStore};
+use switchbitcoin::{Error, Result};
 use secp::{Point, Scalar};
 use std::sync::mpsc;
 
@@ -95,7 +95,7 @@ fn sl_crash_in_g1_window_recovers_from_store_and_claims() {
     let delta_late = u32::try_from(params.delta_late()).unwrap();
 
     let internal =
-        swapkey::settlement::state_machine::canonical_internal_key(sh.pk, sl.pk).unwrap();
+        switchbitcoin::settlement::state_machine::canonical_internal_key(sh.pk, sl.pk).unwrap();
     let escrow_comp_sh = Escrow::new(&internal, &sl.pk, params.delta_early).expect("E_sl");
     let escrow_comp_sl = Escrow::new(&internal, &sh.pk, delta_late).expect("E_sh");
     let op_comp_sh = OutPoint::new(txid_from(2), 0); // SL-funded
@@ -208,7 +208,7 @@ fn sl_crash_in_g1_window_recovers_from_store_and_claims() {
             lease_dir: Some(lease_sl.path().to_path_buf()),
             possession_store: Some((
                 possession_store.path().to_path_buf(),
-                swapkey::crypto::storage::platform_secure_key(),
+                switchbitcoin::crypto::storage::platform_secure_key(),
             )),
             taproot_root_comp_sh: Some(root_sh),
             taproot_root_comp_sl: Some(root_sl),
@@ -245,7 +245,7 @@ fn sl_crash_in_g1_window_recovers_from_store_and_claims() {
     let restored = Possessing::restore_secret_learner(
         rec.possession_record.as_ref().expect("path"),
         &rec.swap_session_id,
-        &swapkey::crypto::storage::platform_secure_key(),
+        &switchbitcoin::crypto::storage::platform_secure_key(),
     )
     .expect("restore from possession record");
 
@@ -288,7 +288,7 @@ fn crash_mid_signing_reclaims_via_persisted_refund() {
     let d = params.tier_d_sats;
 
     let internal =
-        swapkey::settlement::state_machine::canonical_internal_key(sh.pk, sl.pk).unwrap();
+        switchbitcoin::settlement::state_machine::canonical_internal_key(sh.pk, sl.pk).unwrap();
     // SL's escrow (E_sl): early refund leaf keyed to SL.
     let escrow = Escrow::new(&internal, &sl.pk, params.delta_early).expect("E_sl");
     let op = OutPoint::new(txid_from(9), 0);

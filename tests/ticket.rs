@@ -7,11 +7,11 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use bitcoin::bech32::{self, Bech32m, Hrp};
-use swapkey::settlement::params::Params;
-use swapkey::settlement::state_machine::Transport;
-use swapkey::wallet::config::Network;
-use swapkey::wallet::ticket::{maker_rendezvous, taker_rendezvous, Ticket};
-use swapkey::{Error, Result};
+use switchbitcoin::settlement::params::Params;
+use switchbitcoin::settlement::state_machine::Transport;
+use switchbitcoin::wallet::config::Network;
+use switchbitcoin::wallet::ticket::{maker_rendezvous, taker_rendezvous, Ticket};
+use switchbitcoin::{Error, Result};
 
 // ---------- helpers ----------
 

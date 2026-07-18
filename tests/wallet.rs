@@ -16,16 +16,16 @@
 
 use bitcoin::OutPoint;
 use secp::{Point, Scalar};
-use swapkey::chain::{ChainView, SimChain};
-use swapkey::settlement::refund::PreArmedRefund;
-use swapkey::settlement::state_machine::{canonical_internal_key, Role};
-use swapkey::tx::escrow::Escrow;
-use swapkey::tx::setup::build_setup;
-use swapkey::wallet::config::{Network, WalletConfig};
-use swapkey::wallet::ledger::PHASE0_WARNING;
-use swapkey::wallet::recovery_driver::RecoveryTick;
-use swapkey::wallet::runtime::{FirstRunError, OpenedWallet, Wallet};
-use swapkey::wallet::store::{SwapPhase, SwapRecord};
+use switchbitcoin::chain::{ChainView, SimChain};
+use switchbitcoin::settlement::refund::PreArmedRefund;
+use switchbitcoin::settlement::state_machine::{canonical_internal_key, Role};
+use switchbitcoin::tx::escrow::Escrow;
+use switchbitcoin::tx::setup::build_setup;
+use switchbitcoin::wallet::config::{Network, WalletConfig};
+use switchbitcoin::wallet::ledger::PHASE0_WARNING;
+use switchbitcoin::wallet::recovery_driver::RecoveryTick;
+use switchbitcoin::wallet::runtime::{FirstRunError, OpenedWallet, Wallet};
+use switchbitcoin::wallet::store::{SwapPhase, SwapRecord};
 
 const PASS: &str = "task-07 test passphrase";
 
@@ -85,7 +85,7 @@ fn first_run_creates_the_stores_and_reopen_is_ready() {
 /// other outcome.
 fn expect_refused(
     result: Result<Wallet, FirstRunError>,
-) -> Box<swapkey::wallet::runtime::FirstRun> {
+) -> Box<switchbitcoin::wallet::runtime::FirstRun> {
     match result {
         Err(FirstRunError::Refused { first_run, .. }) => first_run,
         Err(FirstRunError::Fatal(e)) => panic!("expected Refused, got Fatal({e:?})"),
@@ -215,7 +215,7 @@ fn a_second_concurrent_open_is_refused_by_the_dir_lock() {
 fn a_loaded_config_file_opens_the_wallet_it_points_at() {
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().join("wallet-data");
-    let config_path = dir.path().join("swapkey.toml");
+    let config_path = dir.path().join("switchbitcoin.toml");
     // Single-quoted literal string: Windows backslashes pass through.
     std::fs::write(
         &config_path,
