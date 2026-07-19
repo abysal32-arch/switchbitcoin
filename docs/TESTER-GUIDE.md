@@ -261,6 +261,7 @@ Traps the guide must warn you about:
 | `cannot guard <sid>: …` | That record can't be watched (e.g. pre-funding phase). The OTHER swaps still are; report if it names a funded swap. |
 | `standing down (completion-supersedes)` | The counterparty's completion confirmed, so the refund is moot. Correct behavior. |
 | `watch step failed (retrying next pass)` / `backstop pass failed (retrying next poll)` | Transient (usually RPC). It retries on the next poll; only report if it repeats forever. |
+| `ALARM: node RPC unreachable (…)` | bitcoind stopped/crashed/restarting. `serve`/`watch` keep running and announce recovery (`node RPC recovered`) by themselves — restarting bitcoind is SAFE, the wallet re-reads the fresh RPC cookie automatically. During the outage `/status` shows `node_online:false` and the tip freezes at the last seen height (frozen time never fires a deadline early); nothing can broadcast until the node returns. Report only if `node RPC recovered` never appears after the node is back. |
 | `ALARM: … quarantine` / `unreadable swap record` | A sealed record failed authentication. ALWAYS report this one with `diag` output. |
 | `error: unknown flag …` / `use --flag value, not --flag=value` | Typo protection — flags are strict on purpose. `switchbitcoin-cli help`. |
 

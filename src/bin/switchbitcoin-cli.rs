@@ -1572,6 +1572,10 @@ fn cmd_watch(flags: &Flags) -> CliResult {
         ));
     }
     let mut sink = |line: String| log(&line);
+    // Same edge detector as serve (task-29 soak): the tower's log is
+    // event-only, so a node outage — during which it CANNOT see spends or
+    // fire refunds — must announce itself and its recovery.
+    let mut node_was_online = true;
     loop {
         let remaining = switchbitcoin::wallet::watch::watch_pass(
             &mut guards,
@@ -1581,6 +1585,19 @@ fn cmd_watch(flags: &Flags) -> CliResult {
             &opts,
             &mut sink,
         );
+        let online = chain.node_online();
+        if online != node_was_online {
+            if online {
+                log(&format!("node RPC recovered — tracking tip {}", chain.tip_height()));
+            } else {
+                log(&format!(
+                    "ALARM: node RPC unreachable ({}); the tower is BLIND until the node \
+                     returns — it cannot observe spends or fire refunds",
+                    chain.last_rpc_error().unwrap_or_else(|| "no detail".into())
+                ));
+            }
+            node_was_online = online;
+        }
         if remaining == 0 {
             log("every guarded escrow's exit is confirmed — watchtower standing down");
             return Ok(());
@@ -2142,6 +2159,10 @@ fn serve_worker(
     // accepting offers must never collide on one "pending" view entry.
     let mut pending_seq: u64 = 0;
     let mut iter: u64 = 0;
+    // Node-reachability edge detector: the /status flag flaps with the chain
+    // view's per-call verdict, and each TRANSITION logs loudly (task-29 soak:
+    // a silent outage previously froze the tip with node_online stuck true).
+    let mut node_was_online = true;
 
     loop {
         let sink_state = state.clone();
@@ -2256,6 +2277,30 @@ fn serve_worker(
         }
 
         // 5. Snapshot refresh: every slot's view + the shared worker facts.
+        // The chain reads run OUTSIDE the state lock (sink locks it too), and
+        // node_online is read AFTER them so it reflects THIS tick's verdict.
+        let tip_now = chain.map(|c| c.tip_height());
+        let fee_now = chain.and_then(|c| c.estimated_feerate_sat_vb());
+        let node_online = chain.is_some_and(|c| c.node_online());
+        if let Some(c) = chain {
+            if node_online != node_was_online {
+                if node_online {
+                    sink(format!(
+                        "node RPC recovered — tracking tip {}",
+                        tip_now.unwrap_or(0)
+                    ));
+                } else {
+                    sink(format!(
+                        "ALARM: node RPC unreachable ({}); serving last-seen tip {} — frozen \
+                         time is conservative (no deadline fires early), but nothing can \
+                         broadcast until the node returns",
+                        c.last_rpc_error().unwrap_or_else(|| "no detail".into()),
+                        tip_now.unwrap_or(0)
+                    ));
+                }
+                node_was_online = node_online;
+            }
+        }
         {
             let params = wallet.params().clone();
             let mut st = state.lock().unwrap();
@@ -2269,14 +2314,14 @@ fn serve_worker(
                 wallet.engine(),
                 &params,
                 network,
-                chain.map(|c| c.tip_height()),
-                chain.is_some(),
+                tip_now,
+                node_online,
                 &views,
                 st.busy,
                 &alarms,
                 offer_ticket.as_deref(),
                 max_swaps,
-                chain.and_then(|c| c.estimated_feerate_sat_vb()),
+                fee_now,
             );
         }
 

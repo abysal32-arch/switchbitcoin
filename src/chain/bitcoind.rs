@@ -102,38 +102,85 @@ pub trait RpcTransport {
 pub struct HttpTransport {
     agent: ureq::Agent,
     url: String,
-    auth: String,
+    /// Interior-mutable: a cookie-authed transport rewrites this on 401 (see
+    /// `cookie_path`). `RpcTransport::call` takes `&self`.
+    auth: std::sync::Mutex<String>,
+    /// `Some` iff auth came from a cookie file. bitcoind mints a NEW random
+    /// cookie on every start, so after a node restart the baked token 401s
+    /// forever — a long-lived `serve`/`watch` would wedge silently until its
+    /// own process restart (task-29 soak finding, 2026-07-19). On a 401 the
+    /// call re-reads this path and retries once with the fresh token.
+    cookie_path: Option<std::path::PathBuf>,
+}
+
+/// Basic-auth header value from a bitcoind cookie file (`user:pass` line).
+fn cookie_auth(path: &std::path::Path) -> core::result::Result<String, RpcClientError> {
+    let cookie = std::fs::read_to_string(path)
+        .map_err(|e| RpcClientError::Transport(format!("cookie file: {e}")))?;
+    let (user, pass) = cookie
+        .trim()
+        .split_once(':')
+        .ok_or_else(|| RpcClientError::Transport("cookie file: expected user:pass".into()))?;
+    Ok(basic_auth(user, pass))
+}
+
+fn basic_auth(user: &str, pass: &str) -> String {
+    use base64::Engine as _;
+    let token = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
+    format!("Basic {token}")
 }
 
 impl HttpTransport {
     /// `url` like `http://127.0.0.1:18443` (regtest default port 18443,
     /// testnet3 18332) with `rpcuser`/`rpcpassword` credentials.
     pub fn new(url: impl Into<String>, rpc_user: &str, rpc_password: &str) -> Self {
-        use base64::Engine as _;
-        let token =
-            base64::engine::general_purpose::STANDARD.encode(format!("{rpc_user}:{rpc_password}"));
         HttpTransport {
             agent: ureq::AgentBuilder::new()
                 .timeout(std::time::Duration::from_secs(15))
                 .build(),
             url: url.into(),
-            auth: format!("Basic {token}"),
+            auth: std::sync::Mutex::new(basic_auth(rpc_user, rpc_password)),
+            cookie_path: None,
         }
     }
 
     /// Cookie auth: bitcoind writes `<datadir>/<network>/.cookie` containing
-    /// `__cookie__:<random>` — exactly the basic-auth pair.
+    /// `__cookie__:<random>` — exactly the basic-auth pair. The path is kept
+    /// so a post-restart 401 can re-read the fresh cookie (see `cookie_path`).
     pub fn from_cookie_file(
         url: impl Into<String>,
         cookie_path: &std::path::Path,
     ) -> core::result::Result<Self, RpcClientError> {
-        let cookie = std::fs::read_to_string(cookie_path)
-            .map_err(|e| RpcClientError::Transport(format!("cookie file: {e}")))?;
-        let (user, pass) = cookie
-            .trim()
-            .split_once(':')
-            .ok_or_else(|| RpcClientError::Transport("cookie file: expected user:pass".into()))?;
-        Ok(Self::new(url, user, pass))
+        let auth = cookie_auth(cookie_path)?;
+        Ok(HttpTransport {
+            agent: ureq::AgentBuilder::new()
+                .timeout(std::time::Duration::from_secs(15))
+                .build(),
+            url: url.into(),
+            auth: std::sync::Mutex::new(auth),
+            cookie_path: Some(cookie_path.to_path_buf()),
+        })
+    }
+
+    /// One HTTP round-trip with the given auth header: (http status, body).
+    fn send(
+        &self,
+        auth: &str,
+        body: &str,
+    ) -> core::result::Result<(u16, String), RpcClientError> {
+        let resp = self
+            .agent
+            .post(&self.url)
+            .set("Authorization", auth)
+            .set("Content-Type", "application/json")
+            .send_string(body);
+        match resp {
+            Ok(r) => Ok((200u16, read_body(r)?)),
+            // bitcoind reports RPC-level errors as HTTP 500/404/400 WITH a
+            // JSON body — that body is the verdict, so read it, don't bail.
+            Err(ureq::Error::Status(code, r)) => Ok((code, read_body(r)?)),
+            Err(e) => Err(RpcClientError::Transport(e.to_string())),
+        }
     }
 }
 
@@ -162,21 +209,32 @@ impl RpcTransport for HttpTransport {
         let body =
             json!({ "jsonrpc": "1.0", "id": "switchbitcoin", "method": method, "params": params })
                 .to_string();
-        let resp = self
-            .agent
-            .post(&self.url)
-            .set("Authorization", &self.auth)
-            .set("Content-Type", "application/json")
-            .send_string(&body);
-        let (http_status, text) = match resp {
-            Ok(r) => (200u16, read_body(r)?),
-            // bitcoind reports RPC-level errors as HTTP 500/404/400 WITH a
-            // JSON body — that body is the verdict, so read it, don't bail.
-            Err(ureq::Error::Status(code, r)) => (code, read_body(r)?),
-            Err(e) => return Err(RpcClientError::Transport(e.to_string())),
-        };
+        let auth = self.auth.lock().unwrap().clone();
+        let (mut http_status, mut text) = self.send(&auth, &body)?;
+        // 401 on a cookie-authed transport: the node likely restarted and
+        // minted a fresh cookie. Re-read the file; retry ONCE iff the token
+        // actually changed (an unchanged file means the credentials we just
+        // used ARE current — a real auth problem, don't hammer).
+        if http_status == 401 {
+            if let Some(path) = &self.cookie_path {
+                if let Ok(fresh) = cookie_auth(path) {
+                    if fresh != auth {
+                        *self.auth.lock().unwrap() = fresh.clone();
+                        let (code, t) = self.send(&fresh, &body)?;
+                        http_status = code;
+                        text = t;
+                    }
+                }
+            }
+        }
         // Auth (401) / whitelist (403) failures carry NO JSON body — surface
-        // the HTTP status instead of a bare parse error.
+        // the HTTP status explicitly instead of a bare parse error.
+        if http_status == 401 || http_status == 403 {
+            return Err(RpcClientError::Transport(format!(
+                "http {http_status} unauthorized — check RPC credentials (stale cookie? \
+                 wrong rpcuser/rpcpassword?)"
+            )));
+        }
         let v: Value = serde_json::from_str(&text).map_err(|e| {
             RpcClientError::Transport(format!(
                 "undecodable JSON-RPC response (http {http_status}): {e}"
@@ -212,8 +270,15 @@ struct IndexState {
     /// Last tip the node reported — the degraded-mode answer (frozen time is
     /// the conservative direction: no deadline fires early on an outage).
     last_tip: u32,
-    /// Last RPC failure, for the operator (`last_rpc_error`).
+    /// Last RPC failure, for the operator (`last_rpc_error`). Sticky by
+    /// design — recovery does not erase the diagnostic.
     last_error: Option<String>,
+    /// Did the most recent round-trip REACH the node? Node-level errors
+    /// (e.g. -5 no-such-tx) are answers from a live node and keep this true;
+    /// transport failures (refused, timeout, auth) flip it false. Refreshed
+    /// by every call, so a `serve` tick's `tip_height()` keeps it current
+    /// within one poll interval (task-29 soak: `node_online` must FLAP).
+    online: bool,
 }
 
 /// [`ChainView`]/[`AuthoritativeChainView`] over a trusted local Bitcoin Core
@@ -294,6 +359,7 @@ impl<T: RpcTransport> BitcoinCoreChainView<T> {
                 funding_txs: HashMap::new(),
                 last_tip: 0,
                 last_error: None,
+                online: true,
             }),
         }
     }
@@ -304,6 +370,12 @@ impl<T: RpcTransport> BitcoinCoreChainView<T> {
         self.state.lock().unwrap().last_error.clone()
     }
 
+    /// Whether the most recent RPC round-trip reached the node (see
+    /// `IndexState::online`). Starts `true` ("no failure observed yet").
+    pub fn node_online(&self) -> bool {
+        self.state.lock().unwrap().online
+    }
+
     fn call(
         &self,
         st: &mut IndexState,
@@ -311,8 +383,13 @@ impl<T: RpcTransport> BitcoinCoreChainView<T> {
         params: &[Value],
     ) -> core::result::Result<Value, RpcClientError> {
         let r = self.rpc.call(method, params);
-        if let Err(e) = &r {
-            st.last_error = Some(format!("{method}: {e}"));
+        match &r {
+            Ok(_) => st.online = true,
+            Err(e) => {
+                // A node-level error IS an answer — the node is reachable.
+                st.online = matches!(e, RpcClientError::Node { .. });
+                st.last_error = Some(format!("{method}: {e}"));
+            }
         }
         r
     }
@@ -1114,6 +1191,41 @@ mod tests {
     }
 
     #[test]
+    fn node_online_flaps_with_transport_failures_and_recovers() {
+        // Task-29 soak regression: /status previously hardcoded node_online =
+        // "a [node] is configured", so a dead node never showed. The view now
+        // tracks the most recent round-trip: Ok → online, transport failure →
+        // offline (+ stale tip), next Ok → online again — and the sticky
+        // last_rpc_error diagnostic survives the recovery.
+        let mock = MockTransport::new();
+        mock.on("getblockcount", json!([]), json!(100));
+        mock.on_transport_err("getblockcount", json!([]));
+        mock.on("getblockcount", json!([]), json!(101));
+        let view = BitcoinCoreChainView::new(mock);
+        assert!(view.node_online(), "starts optimistic: no failure observed yet");
+        assert_eq!(view.tip_height(), 100);
+        assert!(view.node_online());
+        assert_eq!(view.tip_height(), 100, "outage serves the stale tip");
+        assert!(!view.node_online(), "a transport failure flips the flag OFF");
+        assert_eq!(view.tip_height(), 101, "node returns");
+        assert!(view.node_online(), "recovery flips the flag back ON");
+        assert!(view.last_rpc_error().is_some(), "the diagnostic stays sticky through recovery");
+    }
+
+    #[test]
+    fn node_level_errors_keep_node_online_true() {
+        // A JSON-RPC error IS an answer from a live node (e.g. -5 no-such-tx,
+        // -28 warming up) — reachability must not read as an outage.
+        let mock = MockTransport::new();
+        mock.on_method_err("estimatesmartfee", -32601, "method not found");
+        mock.on_method_err("getmempoolinfo", -32601, "method not found");
+        let view = BitcoinCoreChainView::new(mock);
+        assert_eq!(view.estimated_feerate_sat_vb(), None);
+        assert!(view.node_online(), "node-level errors keep the node ONLINE");
+        assert!(view.last_rpc_error().is_some(), "but the operator still sees the failure");
+    }
+
+    #[test]
     fn degraded_transport_is_conservative_everywhere() {
         // No fixtures at all: every call is a transport failure.
         let view = BitcoinCoreChainView::new(MockTransport::new());
@@ -1772,6 +1884,130 @@ mod tests {
         let untrusted = super::super::Source::untrusted(super::super::SimChain::new(0));
         let dual = super::super::DualSourceChainView::new(sv, untrusted).unwrap();
         takes_authoritative(&dual);
+    }
+
+    // ---- cookie re-read (HTTP stub) -----------------------------------------
+
+    /// Read one full HTTP request (headers + Content-Length body) off a stub
+    /// connection. ureq keeps connections alive, so read-to-EOF would hang.
+    fn read_http_request(s: &mut std::net::TcpStream) -> String {
+        use std::io::Read as _;
+        let mut req = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = s.read(&mut buf).expect("stub read");
+            if n == 0 {
+                break;
+            }
+            req.extend_from_slice(&buf[..n]);
+            if let Some(pos) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&req[..pos]).to_ascii_lowercase();
+                let cl: usize = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                if req.len() >= pos + 4 + cl {
+                    break;
+                }
+            }
+        }
+        String::from_utf8_lossy(&req).to_string()
+    }
+
+    fn auth_header(req: &str) -> String {
+        req.lines()
+            .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
+            .and_then(|l| l.split_once(':').map(|(_, v)| v.trim().to_string()))
+            .unwrap_or_default()
+    }
+
+    fn stub_cookie_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("sb-cookie-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_401_rereads_the_cookie_file_and_retries_once() {
+        // Task-29 soak regression: bitcoind mints a NEW cookie on every start,
+        // so a restart left long-lived serve/watch processes 401-ing forever
+        // on the construction-time token. The transport must re-read the file
+        // and retry with the fresh token.
+        use std::io::Write as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_srv = seen.clone();
+        let srv = std::thread::spawn(move || {
+            for i in 0..2 {
+                let (mut s, _) = listener.accept().unwrap();
+                let req = read_http_request(&mut s);
+                seen_srv.lock().unwrap().push(auth_header(&req));
+                let resp = if i == 0 {
+                    "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_string()
+                } else {
+                    let body = r#"{"result":7,"error":null,"id":"switchbitcoin"}"#;
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                s.write_all(resp.as_bytes()).unwrap();
+            }
+        });
+
+        let dir = stub_cookie_dir("reread");
+        let cookie = dir.join(".cookie");
+        std::fs::write(&cookie, "__cookie__:old").unwrap();
+        let t = HttpTransport::from_cookie_file(format!("http://{addr}"), &cookie).unwrap();
+        // The node "restarts": a fresh random cookie replaces the file.
+        std::fs::write(&cookie, "__cookie__:new").unwrap();
+
+        let v = t.call("getblockcount", &[]).expect("retry with the fresh cookie succeeds");
+        assert_eq!(v, json!(7));
+        srv.join().unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "exactly one retry");
+        assert_eq!(seen[0], basic_auth("__cookie__", "old"), "first attempt: stale token");
+        assert_eq!(seen[1], basic_auth("__cookie__", "new"), "retry: re-read token");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_401_with_an_unchanged_cookie_fails_clean_without_retry() {
+        // The guard: if the file still holds the token we just used, the 401
+        // is a REAL auth problem — no retry hammering, a clear error instead.
+        use std::io::Write as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(Mutex::new(0usize));
+        let seen_srv = seen.clone();
+        let srv = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let _ = read_http_request(&mut s);
+            *seen_srv.lock().unwrap() += 1;
+            s.write_all(
+                b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+        });
+
+        let dir = stub_cookie_dir("noretry");
+        let cookie = dir.join(".cookie");
+        std::fs::write(&cookie, "__cookie__:same").unwrap();
+        let t = HttpTransport::from_cookie_file(format!("http://{addr}"), &cookie).unwrap();
+
+        let err = t.call("getblockcount", &[]).expect_err("unchanged cookie must not succeed");
+        assert!(
+            err.to_string().contains("401"),
+            "the auth failure is explicit, not a parse error: {err}"
+        );
+        srv.join().unwrap();
+        assert_eq!(*seen.lock().unwrap(), 1, "no retry was attempted");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---- live (manual) ---------------------------------------------------------
