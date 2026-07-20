@@ -8,8 +8,8 @@ The closer for round 2. Tracks the six-item DONE definition to
 | Item | Where | State |
 |---|---|---|
 | Release package | GitHub release [`v0.1.0-prealpha`](https://github.com/abysal32-arch/switchbitcoin-site/releases/tag/v0.1.0-prealpha) | ✅ live |
-| Build | `switchbitcoin-prealpha-0.1.0-f617468e8-windows-gnu.zip` | ✅ FINAL clean-HEAD build (rename + 6b02f01 soak fix + F1 quieter logs) |
-| Zip SHA256 | `e8ad43d192bc14404882cc490e40b277d0e3844e0b5edccefec584528d0b86b8` | ✅ site hash === live download, verified |
+| Build | `switchbitcoin-prealpha-0.1.0-d2955ba6a-windows-gnu.zip` | ✅ FINAL clean-HEAD build (rename + 6b02f01 soak fix + F1 quieter logs + wallet-UI brand fix) |
+| Zip SHA256 | `25a02006d15aff68f23a978c6d14f67ea701fe3acd8070ca55070b7c59efa3dd` | ✅ site hash === live download, verified end-to-end |
 | Tester guide | in-package `docs/TESTER-GUIDE.md` + web copy https://switchbitcoin.com/testers.html | ✅ |
 | Bug-report template | in-package `docs/BUG-REPORT-TEMPLATE.md` | ✅ |
 | Current manifest | in-package `docs/manifests/v2.manifest` + https://switchbitcoin.com/manifests/v2.manifest (id `cdda51a9…`, floor 2, onboarding delay 1–2 h) | ✅ |
