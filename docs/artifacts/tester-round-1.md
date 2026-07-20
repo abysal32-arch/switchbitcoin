@@ -106,6 +106,30 @@ of 4 fresh swaps (75%)**. Evidence: `docs/artifacts/swap-proof-2026-07-20.md`
 EXTERNAL testers, but the code they'll run is now proven to complete swaps,
 refund, and recover — the only variable left is people + funding.
 
+## Live testnet4 A↔B swap — ARMED, waiting on funding (2026-07-20)
+
+Goal: a live-network completion within 3 days. Only blocker = funding (both
+wallets' units spent in task-25; self-funding impossible by design; no
+autonomous faucet exists — all need captcha/login, verified). Everything after
+funding is automated and RUNNING:
+
+- **`tasks/task-30-.../live-swap-pipeline.sh`** (detached, 3-day cap): watches
+  deposit addr A `tb1pgsevr6w…` (key idx 22) + B `tb1pkdwh6qna…` (idx 11) via
+  `scantxoutset` every 5 min; on a confirmed UTXO ≥ 1,040,000 sats it
+  `onboard`s that wallet, then runs `swap --make/--take` (fast posture) every
+  30 min until one COMPLETES (pre-maturity attempts refuse free; ~50–75%
+  complete). Scanner tested (synthetic + live-empty, no false trigger).
+- **`treasury-bridge.sh`** + re-armed **`soak-miner.sh`** (72 h): the autonomous
+  path — if the host clock is fixed (`Start-Service w32time; w32tm /resync
+  /force`, admin), the miner grinds min-diff blocks to sb-treasury and the
+  bridge sends 0.0106 to each deposit addr → pipeline takes over. Clock still
+  ~1.85 h behind at arm time (UAC pending).
+- **Human action (surest sub-3-day path):** `FUND-THESE-TO-COMPLETE-THE-SWAP.md`
+  — send ≥ 0.0104 tBTC (ideally ~0.021 = 2 units) as ONE UTXO to each address.
+
+Watch `live-swap-logs/pipeline.log` for `funded deposit detected` → `ONBOARDED`
+→ `SWAP COMPLETED`. Completed-swap txids land there + get transcribed below.
+
 ## Swap attempts (external testers)
 
 _(one row per attempt as they come: who↔who, outcome, txids, notes)_
