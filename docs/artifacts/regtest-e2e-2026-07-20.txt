@@ -1,0 +1,20 @@
+regtest_e2e run on HEAD d2955ba6a — 2026-07-20 (Core v29.4.0 regtest)
+===
+   Compiling switchbitcoin v0.1.0 (C:\Users\Joe\Desktop\swap key\newkey-scaffold)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 33.97s
+     Running tests\regtest_e2e.rs (target\debug\deps\regtest_e2e-4a8af4fcc1b3885c.exe)
+
+running 4 tests
+test e2e_crash_recovery_reenters_from_the_store ... ok
+test e2e_dead_peer_routes_to_refund ... ok
+test e2e_happy_path_swap_completes ... ok
+test e2e_measure_refund_rate ... ROLE-CSV attempt 1/4 (regtest): completed
+ROLE-CSV attempt 2/4 (regtest): completed
+ROLE-CSV attempt 3/4 (regtest): completed
+ROLE-CSV attempt 4/4 (regtest): refunded
+ROLE-CSV RATE (regtest): completed 3/4 (75.0%), refunded 1/4
+ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1017.71s
+
+E2E_EXIT=0
