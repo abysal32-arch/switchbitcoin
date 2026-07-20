@@ -143,6 +143,25 @@ refund can't block a later attempt. Terminal-string greps verified against the
 real CLI output (`SWAP COMPLETED — our completion is confirmed`, `refund path
 resolved — record terminal: Refunded`).
 
+## LIVE RUN IN PROGRESS (2026-07-20, Joe funded + signed v3)
+
+Funding constraint (faucet drips too small for the 0.01 tier) solved via a
+**v3 test-tier manifest** (id `e962918a…`, tier_d 1,000,000→100,000; Joe signed
+with the operator key, both wallets ingested — the manifest lever, same as the
+v2 delay change). Deposits: A `15828f67…:0` 377,630 sats, B 369,968 sats — both
+confirmed. At the small tier each deposit splits into **3 pre-encumbrance units**
+(3× retry material → ~98% one completes across the role↔CSV flips).
+
+Live state: A onboarding (split `475a86ef…` broadcast, awaiting a block →
+`--accept-phase0`/`--wait-secs 1800` fixes both held); B queued (onboards after
+A's onboard call returns; do_onboard is serial). Then ~1–2 h maturity → swap.
+⚠ NODE CRASHED once mid-run (RPC dropped; cause unknown) — restarted + resynced
+to 144959; a **`node-watchdog.ps1`** now auto-restarts bitcoind within 60 s so a
+drop can't stall the pipeline. Pipeline/watchdog/node all verified running.
+NOTE: pipeline does 1 swap attempt then stops+babysits on a refund; with 3
+units, on a refund re-arm the swap loop for attempts 2–3 (units are unspent+
+mature). Watch `live-swap-logs/pipeline.log`.
+
 ## Swap attempts (external testers)
 
 _(one row per attempt as they come: who↔who, outcome, txids, notes)_
