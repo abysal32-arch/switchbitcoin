@@ -8,20 +8,19 @@ The closer for round 2. Tracks the six-item DONE definition to
 | Item | Where | State |
 |---|---|---|
 | Release package | GitHub release [`v0.1.0-prealpha`](https://github.com/abysal32-arch/switchbitcoin-site/releases/tag/v0.1.0-prealpha) | ✅ live |
-| Build | `switchbitcoin-prealpha-0.1.0-6b02f01cf-windows-gnu.zip` | ✅ clean HEAD (b41c808 rename + 6b02f01 soak fix) |
-| Zip SHA256 | `3b879ede8f76847f79d281f92ba5829b6aba63be55f8f7c3b93666a012fae511` | ✅ hash-verified on the live domain |
+| Build | `switchbitcoin-prealpha-0.1.0-f617468e8-windows-gnu.zip` | ✅ FINAL clean-HEAD build (rename + 6b02f01 soak fix + F1 quieter logs) |
+| Zip SHA256 | `e8ad43d192bc14404882cc490e40b277d0e3844e0b5edccefec584528d0b86b8` | ✅ site hash === live download, verified |
 | Tester guide | in-package `docs/TESTER-GUIDE.md` + web copy https://switchbitcoin.com/testers.html | ✅ |
 | Bug-report template | in-package `docs/BUG-REPORT-TEMPLATE.md` | ✅ |
 | Current manifest | in-package `docs/manifests/v2.manifest` + https://switchbitcoin.com/manifests/v2.manifest (id `cdda51a9…`, floor 2, onboarding delay 1–2 h) | ✅ |
 | Public home | https://switchbitcoin.com (HTTPS enforced) | ✅ live 2026-07-19 |
 
-> ⚠ The published package is `6b02f01cf`. The F1 log-spam fix (commit
-> `44978c4`) is NOT in it — F1 is cosmetic and re-cutting churns the just-
-> launched download. **Decision point:** cut a `-b` patch package from
-> `44978c4` (clean HEAD, gates green) for the actual tester hand-off, OR ship
-> `6b02f01cf` as-is and note the log verbosity. Recommend the `-b` cut at the
-> moment Joe is ready to distribute (one `scripts/build-release.sh` run), so
-> testers get the quieter logs from day one. Both are shippable (real pin).
+> ✅ DECIDED + DONE (2026-07-19): cut the final package `f617468e8` from clean
+> HEAD (includes F1's quieter logs), made it THE live download, and verified
+> site hash === download hash. Done before any tester held a hash — the one
+> free window to finalize the build. The superseded `6b02f01cf` asset is being
+> removed from the release (GitHub 503 incident during the swap — a detached
+> retry finishes it; the live download was consistent at every moment).
 
 ## Round brief (paste to each tester)
 
