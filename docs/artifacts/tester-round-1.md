@@ -54,6 +54,30 @@ The closer for round 2. Tracks the six-item DONE definition to
 3. **Be the counterparty** for their first swaps (scheduling humans).
 4. Nudge ≥1 tester through the §7 watch-drill (gate item 3).
 
+## Internal first-tester dry-run (2026-07-19, on the PUBLISHED artifact) — PASS
+
+Claude ran a tester's entire first-run path on the actual downloaded package
+(`f617468e8`, zip `e8ad43d1…`) in a throwaway dir, to catch any day-one
+packaging/onboarding bug before a real tester does. All green:
+
+| Step | Result |
+|---|---|
+| Download published zip + `sha256sum -c SHA256SUMS` | ✅ 9/9 files OK |
+| `version` | ✅ f617468e8, pin `fedd6222…` |
+| `quickstart` / `help` / README-FIRST | ✅ clear, all verbs present |
+| `init --network testnet` (scripted) | ✅ wallet created, phase-0 flow, config written, v0 provisional |
+| `address` | ✅ `tb1p…` deposit address, key index 0 |
+| `manifest show` (pre) | ✅ v0 baseline + LOUD provisional warning |
+| **`manifest ingest v2`** (the fleet-convergence step, gate #4) | ✅ **v0→v2, onboarding_delay 24–72h → 1–2h applied** |
+| `manifest show` (post) / `diag` | ✅ v2 (id `cdda51a9…`, floor 2), **diag redaction verified — no seed/passphrase/mnemonic** |
+| `backup` → `restore` into fresh dir | ✅ bundle written, 4 files restored clean |
+| `watch --once` (config w/o `[node]`) | ✅ clean instructive error "needs a [node] section" — correct, not a crash |
+
+**Conclusion:** the shipped package is sound end-to-end for a tester's first
+session. Gate item #4's mechanism (manifest ingest → fleet on one version) is
+proven on the real artifact. The only funded steps (onboard/swap/watch-fire)
+need tBTC + a node and are the external-tester legs.
+
 ## Swap attempts
 
 _(one row per attempt as they come: who↔who, outcome, txids, notes)_
