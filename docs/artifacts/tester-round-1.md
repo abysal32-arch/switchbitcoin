@@ -130,6 +130,19 @@ funding is automated and RUNNING:
 Watch `live-swap-logs/pipeline.log` for `funded deposit detected` → `ONBOARDED`
 → `SWAP COMPLETED`. Completed-swap txids land there + get transcribed below.
 
+**Pipeline adversarially reviewed before arming (2 unattended-hang bugs caught
++ fixed):** (1) fresh-deposit `onboard` calls `phase0_gate`, which prompts
+"Type ACCEPT" on stdin — the pipe carries only the passphrase, so it would
+HANG the moment funding landed; fixed with `--accept-phase0` (+ `--wait-secs
+1800` so the split confirms within one call across testnet's ~10-min blocks).
+(2) a role↔CSV refund babysits the CSV for ~24–36 h; the old 3 h kill would
+abandon the refund un-fired; now the refund route is detected early, the unit
+is marked consumed, and a detached `recover`-babysitter fires the pre-armed
+refund so funds return autonomously. Per-attempt ports added so a babysitting
+refund can't block a later attempt. Terminal-string greps verified against the
+real CLI output (`SWAP COMPLETED — our completion is confirmed`, `refund path
+resolved — record terminal: Refunded`).
+
 ## Swap attempts (external testers)
 
 _(one row per attempt as they come: who↔who, outcome, txids, notes)_
