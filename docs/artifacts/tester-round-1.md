@@ -78,6 +78,23 @@ session. Gate item #4's mechanism (manifest ingest → fleet on one version) is
 proven on the real artifact. The only funded steps (onboard/swap/watch-fire)
 need tBTC + a node and are the external-tester legs.
 
+### Live UI QA (2026-07-19) — 2 brand bugs caught + fixed → package re-cut
+
+Loaded the shipped `SwitchBitcoin-Wallet.html` over a local HTTP server
+against the running `serve` (walletA, real state). The UI rendered LIVE
+correctly — build `f617468e8`, manifest v2, balance 0.02955996 BTC, all 10
+coins, swap history 1 completed/1 refunded, tip, "connected to
+switchbitcoin-cli serve" — and the serve API's CORS headers
+(`Access-Control-Allow-Origin: *`, OPTIONS→204) make the cross-origin fetch
+work as designed. **But two task-31 rebrand misses surfaced, both
+tester-visible:** (1) the header wordmark still read **`SWAP·KEY`** →
+fixed to `SWITCH·BITCOIN`; (2) a settlement-trace line conflated the protocol
+spec version with the signed-params manifest (`manifest v3.16 verified`) →
+fixed to `protocol v3.16 · signed params verified`. The HTML lives outside the
+repo but ships in the package, so the package was re-cut to carry the fix
+(still before any tester held a hash — the free window). See the Distribution
+kit table for the final build.
+
 ## Swap attempts
 
 _(one row per attempt as they come: who↔who, outcome, txids, notes)_
