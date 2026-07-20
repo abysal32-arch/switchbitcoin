@@ -95,7 +95,18 @@ repo but ships in the package, so the package was re-cut to carry the fix
 (still before any tester held a hash — the free window). See the Distribution
 kit table for the final build.
 
-## Swap attempts
+## Shipped-binary swap proof (2026-07-20, regtest E2E) — PASS
+
+Before the external round, proved the swap COMPLETES on the exact final
+package `d2955ba6a`: `regtest_e2e` 4/4 green against live Core v29.4.0 regtest
+— happy-path completion (both ledgers `Swapped/Unspent` = exactly D),
+dead-peer refund, crash-recovery, and a refund-rate probe that **completed 3
+of 4 fresh swaps (75%)**. Evidence: `docs/artifacts/swap-proof-2026-07-20.md`
++ `regtest-e2e-2026-07-20.txt` (commit `03a4cfc`). Gate items #2/#3 need
+EXTERNAL testers, but the code they'll run is now proven to complete swaps,
+refund, and recover — the only variable left is people + funding.
+
+## Swap attempts (external testers)
 
 _(one row per attempt as they come: who↔who, outcome, txids, notes)_
 
