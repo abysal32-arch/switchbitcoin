@@ -1445,6 +1445,18 @@ fn guard_funded_escrow(
 /// One whole-wallet recovery pass (scan + drive each tick), best-effort —
 /// used inside long-running loops so OTHER swaps' deadlines are never
 /// starved by the live one. `exclude` skips the live swap's own record.
+/// Whether the serve loop's PERIODIC recovery pass should skip driving (and
+/// logging) this tick. Only terminal `Settled` records qualify: they have
+/// nothing to drive, and the pass re-observes them forever — re-logging each
+/// one every pass is the task-29 soak's F1 stderr-flood. Every other tick
+/// (refunds, rebroadcasts, alarms) MUST still be driven each pass. The
+/// one-shot `recover` command does NOT use this — it logs Settled as useful
+/// terminal confirmation. Named + tested so the "only Settled" scope can't
+/// silently widen to swallow a tick that needed driving.
+fn serve_pass_skips_tick(tick: &switchbitcoin::wallet::RecoveryTick) -> bool {
+    matches!(tick, switchbitcoin::wallet::RecoveryTick::Settled)
+}
+
 fn recovery_pass(
     wallet: &mut Wallet,
     chain: &impl AuthoritativeChainView,
@@ -1457,6 +1469,16 @@ fn recovery_pass(
         Ok(scan) => {
             for (sid, tick) in &scan.ticks {
                 if exclude.contains(sid) {
+                    continue;
+                }
+                // A terminal (Settled) record has nothing to drive; the serve
+                // loop runs this pass every ~10 ticks forever, so re-logging
+                // "settled — nothing to drive" for every terminal swap floods
+                // a long-lived serve's stderr (task-29 soak finding F1: ~390
+                // KB/day, all noise, burying real events). Skip it here — the
+                // one-shot `recover` path still surfaces it as useful
+                // confirmation that a record reached its exit.
+                if serve_pass_skips_tick(tick) {
                     continue;
                 }
                 if let Err(e) = apply_recovery_tick(
@@ -2972,6 +2994,24 @@ mod tests {
     }
 
     use switchbitcoin::wallet::ledger;
+
+    // Task-29 soak F1: the serve loop's periodic recovery pass must skip
+    // ONLY terminal Settled ticks (the stderr flood) and drive everything
+    // else every pass. If this scope ever widens, a refund/rebroadcast tick
+    // could be silently dropped — a fund-safety regression, not just noise.
+    #[test]
+    fn serve_pass_skips_only_settled_ticks() {
+        use switchbitcoin::wallet::RecoveryTick;
+        assert!(serve_pass_skips_tick(&RecoveryTick::Settled), "Settled is the flood — skip it");
+        assert!(
+            !serve_pass_skips_tick(&RecoveryTick::RewritePending),
+            "RewritePending is an ALARM — must NOT be skipped"
+        );
+        assert!(
+            !serve_pass_skips_tick(&RecoveryTick::Funding { refund: None }),
+            "a funding-phase record still needs driving each pass"
+        );
+    }
 
     #[test]
     fn maturity_suffix_immature_names_both_anchors() {
