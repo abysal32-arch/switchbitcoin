@@ -43,13 +43,14 @@ use switchbitcoin::wallet::keys::ModeledKeySource;
 use switchbitcoin::wallet::ledger::{acknowledge_phase0, CoinClass, CoinState, Ledger, WalletClock, PHASE0_WARNING};
 use switchbitcoin::wallet::manifest::{ClaimDelayPosture, ModeledTrustRoot};
 use switchbitcoin::wallet::runner::{
-    completion_babysit_step, negotiate_swap, refund_babysit_step, swap_step, RunOptions,
-    SwapArtifacts, SwapOutcome, SwapRunState, SwapStepOutcome,
+    apply_recovery_tick, completion_babysit_step, negotiate_swap, persist_artifacts,
+    refund_babysit_step, swap_step, RunOptions, SwapArtifacts, SwapOutcome, SwapRunState,
+    SwapStepOutcome,
 };
 use switchbitcoin::wallet::store::{ModeledEnclave, SwapPhase};
 use switchbitcoin::wallet::ticket::{maker_rendezvous, taker_rendezvous, Ticket};
 use switchbitcoin::wallet::transport::TcpTransport;
-use switchbitcoin::wallet::AppTick;
+use switchbitcoin::wallet::{AppTick, RecoveryTick, SwapApp};
 use switchbitcoin::{Error, Result};
 use secp::{Point, Scalar};
 
@@ -1354,6 +1355,226 @@ fn sl_hold_reports_a_confirmed_foreign_spend_as_lost_never_success() {
         matches!(err, Error::Abort(m) if m.contains("claim race lost")),
         "the loss must surface as Abort(claim race lost ...), got {err:?}"
     );
+}
+
+// ============================================================================
+// Live-run P1 (testnet4 swap, 2026-07-21): a taker killed during its
+// claim-delay hold whose swap was then finished by `recover` reached
+// `Completed` with the settlement coin NEVER registered — funds safe on
+// chain, wallet blind, and deep-conf re-runs did not backfill. The recover
+// path must register at the terminal transition exactly like the live
+// babysit, and a `Settled` re-scan must heal a wallet already wedged.
+// ============================================================================
+
+/// "Crash" the parked SL mid-hold: sidecar the artifacts exactly as the CLI
+/// runner persists them at negotiate time, then drop the live app/engine.
+/// What survives is what real process death leaves behind — the store (the
+/// record persisted `Completed` with the finalized signature; "completed"
+/// means on-the-wire, and here not even that: the hold gated the broadcast),
+/// the `<sid>.artifacts` sidecar, and the chain.
+fn crash_sl_mid_hold() -> (tempfile::TempDir, SimChain, [u8; 32], OutPoint) {
+    let held = drive_sl_swap_to_first_hold();
+    persist_artifacts(held._wallet_dir.path(), &held.artifacts).expect("artifacts sidecar");
+    let sid = held.artifacts.session_id;
+    let HeldSwap { app, engine, chain, swept_op, _wallet_dir: wallet_dir, .. } = held;
+    drop(app);
+    drop(engine);
+    let rec = open_engine(wallet_dir.path())
+        .store()
+        .get(&sid)
+        .unwrap()
+        .expect("the record survives the crash");
+    assert_eq!(
+        rec.phase,
+        SwapPhase::Completed,
+        "the record is persisted Completed before any broadcast confirms"
+    );
+    assert!(rec.completion_tx.is_some(), "the finalized claim signature was persisted");
+    assert!(
+        matches!(chain.spend_status(swept_op), SpendStatus::Unspent),
+        "the held claim was never broadcast — the crash orphaned it entirely"
+    );
+    (wallet_dir, chain, sid, swept_op)
+}
+
+/// The exact live-run P1 shape: kill the taker during its claim-delay hold,
+/// finish the swap through the CLI's recover flow (scan → apply on a fresh
+/// engine — no live context), and require the settlement coin in the ledger
+/// the moment the record reaches `Completed`. Pre-fix, recover advanced the
+/// record and logged "completion confirmed" with the ledger left blind.
+#[test]
+fn recover_registers_the_settlement_coin_after_a_crash_mid_claim_hold() {
+    let (wallet_dir, chain, sid, swept_op) = crash_sl_mid_hold();
+    let d = Params::testnet_provisional().tier_d_sats;
+
+    let mut engine = open_engine(wallet_dir.path());
+    assert!(
+        engine.ledger().coins().iter().all(|c| c.class != CoinClass::Swapped),
+        "fixture: no settlement coin is tracked before recovery"
+    );
+
+    // The recover command's loop: scan → apply every tick → mine. The first
+    // pass rebroadcasts the never-sent claim (`Rebroadcast { confirmed:
+    // false }`); once it confirms, the record re-validates `Settled` — the
+    // live run's exact tick sequence, which pre-fix ended in "settled —
+    // nothing to drive" with the ledger blind.
+    let opts = RunOptions::default();
+    let mut log = |line: String| eprintln!("[recover] {line}");
+    let mut settled = false;
+    for _ in 0..32 {
+        let scan = SwapApp::recover(&engine, &chain).expect("recovery scan");
+        if let Some((rsid, e)) = scan.failed.first() {
+            panic!("recovery re-entry failed for {rsid:?}: {e}");
+        }
+        for (rsid, tick) in &scan.ticks {
+            settled |= matches!(tick, RecoveryTick::Settled);
+            apply_recovery_tick(&mut engine, &chain, wallet_dir.path(), rsid, tick, &opts, &mut log)
+                .expect("apply recovery tick");
+        }
+        if settled {
+            break;
+        }
+        chain.mine();
+    }
+    assert!(settled, "recover must settle the crashed claim");
+    assert_eq!(engine.store().get(&sid).unwrap().expect("record").phase, SwapPhase::Completed);
+
+    // The P1 assertion: settling through recover registered the received coin.
+    {
+        let coins = engine.ledger().coins();
+        let swapped: Vec<_> = coins.iter().filter(|c| c.class == CoinClass::Swapped).collect();
+        assert_eq!(
+            swapped.len(),
+            1,
+            "a swap settled through recover must have its settlement coin ledger-tracked"
+        );
+        assert_eq!(swapped[0].state, CoinState::Unspent);
+        assert_eq!(swapped[0].amount_sats, d, "the settlement coin is exactly D");
+        let claim_txid = chain.spend_txid(swept_op).expect("the recovered claim confirmed");
+        assert_eq!(swapped[0].outpoint.txid, claim_txid, "the coin is the claim's dest output");
+    }
+
+    // Idempotent: deep-conf re-runs (`Settled` re-observations) never
+    // duplicate the coin — the same re-scan a startup pass performs forever.
+    for _ in 0..3 {
+        let scan = SwapApp::recover(&engine, &chain).expect("recovery scan");
+        for (rsid, tick) in &scan.ticks {
+            assert!(
+                matches!(tick, RecoveryTick::Settled),
+                "a confirmed Completed record re-validates Settled, got {tick:?}"
+            );
+            apply_recovery_tick(&mut engine, &chain, wallet_dir.path(), rsid, tick, &opts, &mut log)
+                .expect("apply recovery tick");
+        }
+        chain.mine();
+    }
+    assert_eq!(
+        engine.ledger().coins().iter().filter(|c| c.class == CoinClass::Swapped).count(),
+        1,
+        "re-running recover must not duplicate the settlement coin"
+    );
+}
+
+/// Drive the crashed SL to the exact wedge the live wallet was left in —
+/// record `Completed`, completion CONFIRMED on chain, ledger blind. The
+/// rebroadcast passes run live; the terminal `Settled` tick is applied under
+/// dry-run, which skips the ledger write exactly like the pre-fix code always
+/// did. Returns the wedged engine (plus the fixtures the tests assert with).
+fn wedge_settled_blind() -> (tempfile::TempDir, SimChain, [u8; 32], SwapEngine) {
+    let (wallet_dir, chain, sid, _swept_op) = crash_sl_mid_hold();
+    let mut engine = open_engine(wallet_dir.path());
+    let live = RunOptions::default();
+    let dry = RunOptions { dry_run: true, ..RunOptions::default() };
+    let mut log = |line: String| eprintln!("[recover] {line}");
+
+    let mut wedged = false;
+    for _ in 0..32 {
+        let scan = SwapApp::recover(&engine, &chain).expect("recovery scan");
+        for (rsid, tick) in &scan.ticks {
+            let terminal = matches!(tick, RecoveryTick::Settled);
+            let opts = if terminal { &dry } else { &live };
+            apply_recovery_tick(&mut engine, &chain, wallet_dir.path(), rsid, tick, opts, &mut log)
+                .expect("apply recovery tick");
+            wedged |= terminal;
+        }
+        if wedged {
+            break;
+        }
+        chain.mine();
+    }
+    assert!(wedged, "the fixture must reach the confirmed-completion Settled terminal");
+    assert_eq!(engine.store().get(&sid).unwrap().expect("record").phase, SwapPhase::Completed);
+    assert!(
+        engine.ledger().coins().iter().all(|c| c.class != CoinClass::Swapped),
+        "wedge reproduced: record Completed, completion confirmed, ledger blind"
+    );
+    (wallet_dir, chain, sid, engine)
+}
+
+/// The healing mechanism for a real wallet wedged before the fix: one
+/// ordinary (non-dry) recover pass re-observes the settled record and must
+/// BACKFILL the missing settlement coin from the `Settled` tick.
+#[test]
+fn recover_rescan_backfills_a_settled_swap_missing_its_coin() {
+    let (wallet_dir, chain, _sid, mut engine) = wedge_settled_blind();
+    let d = Params::testnet_provisional().tier_d_sats;
+    let mut log = |line: String| eprintln!("[recover] {line}");
+
+    let scan = SwapApp::recover(&engine, &chain).expect("recovery scan");
+    for (rsid, tick) in &scan.ticks {
+        assert!(matches!(tick, RecoveryTick::Settled), "expected Settled, got {tick:?}");
+        apply_recovery_tick(
+            &mut engine,
+            &chain,
+            wallet_dir.path(),
+            rsid,
+            tick,
+            &RunOptions::default(),
+            &mut log,
+        )
+        .expect("apply recovery tick");
+    }
+    let coins = engine.ledger().coins();
+    let swapped: Vec<_> = coins.iter().filter(|c| c.class == CoinClass::Swapped).collect();
+    assert_eq!(swapped.len(), 1, "the Settled re-scan must backfill the missing settlement coin");
+    assert_eq!(swapped[0].state, CoinState::Unspent);
+    assert_eq!(swapped[0].amount_sats, d, "the backfilled coin is exactly D");
+}
+
+/// The OTHER terminal-advance site: a record that crashed while still
+/// `Completing` (e.g. the Released-extract path) surfaces as `Rebroadcast {
+/// confirmed: true }` once its completion confirms, and that arm must
+/// register the coin at the transition — pinned here directly with the
+/// persisted signature, on the same wedged (blind-ledger) state.
+#[test]
+fn confirmed_completion_tick_registers_the_settlement_coin() {
+    let (wallet_dir, chain, sid, mut engine) = wedge_settled_blind();
+    let d = Params::testnet_provisional().tier_d_sats;
+    let mut log = |line: String| eprintln!("[recover] {line}");
+
+    let rec = engine.store().get(&sid).unwrap().expect("record");
+    let final_sig: [u8; 64] =
+        rec.completion_tx.as_deref().unwrap().try_into().expect("64-byte persisted signature");
+    apply_recovery_tick(
+        &mut engine,
+        &chain,
+        wallet_dir.path(),
+        &sid,
+        &RecoveryTick::Rebroadcast { final_sig, confirmed: true },
+        &RunOptions::default(),
+        &mut log,
+    )
+    .expect("apply recovery tick");
+
+    let coins = engine.ledger().coins();
+    let swapped: Vec<_> = coins.iter().filter(|c| c.class == CoinClass::Swapped).collect();
+    assert_eq!(
+        swapped.len(),
+        1,
+        "the confirmed-completion transition must register the settlement coin"
+    );
+    assert_eq!(swapped[0].state, CoinState::Unspent);
+    assert_eq!(swapped[0].amount_sats, d, "the registered coin is exactly D");
 }
 
 /// N-attempt empirical measurement of the role↔CSV refund rate: run the SAME

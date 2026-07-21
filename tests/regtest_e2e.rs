@@ -22,6 +22,10 @@
 //! * `e2e_crash_recovery_reenters_from_the_store` — SIGKILL wallet A after
 //!   its Setup broadcast; `recover` on a fresh process must re-enter from
 //!   the persisted store alone and drive the refund to `Refunded`.
+//! * `e2e_taker_killed_mid_claim_hold_recovers_and_tracks_the_coin` — SIGKILL
+//!   the SL during its claim-delay posture hold (the live-run P1 kill point);
+//!   `recover` must finish the claim AND register the settlement coin in the
+//!   ledger, not just mark the record settled.
 //!
 //! Timing note: the onboarding delay's HEIGHT anchor (144–432 blocks) is
 //! mined out; its WALL anchor is fast-forwarded by the binary's
@@ -569,6 +573,127 @@ fn e2e_crash_recovery_reenters_from_the_store() {
         assert!(
             Instant::now() < deadline,
             "recovery never drove the crashed swap to Refunded:\n{status}"
+        );
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+/// Live-run P1 (testnet4, 2026-07-21): a taker killed during its claim-delay
+/// hold, whose swap `recover` then finished, reached a settled record with the
+/// settlement coin NEVER ledger-tracked. This drill reproduces that exact kill
+/// point against a real chain: both sides run `--claim-posture private`
+/// (sampled hold >= 12 blocks — a wide window against the harness miner), the
+/// SL is SIGKILLed the moment it announces its hold, the SH finishes alone,
+/// and `recover` on the killed wallet must both settle the swap AND surface
+/// the received coin as `Swapped/Unspent` in `status`.
+#[test]
+#[ignore = "needs bitcoind (see tasks/PRE-ALPHA-RUNBOOK.md)"]
+fn e2e_taker_killed_mid_claim_hold_recovers_and_tracks_the_coin() {
+    const HOLD_LINE: &str = "claim-delay posture hold:";
+    let node = Node::start(28873, 28874);
+    let a = Wallet::create("A", 28873);
+    let b = Wallet::create("B", 28873);
+    provision(&node, &a, 0.115);
+    provision(&node, &b, 0.115);
+
+    // Retry attempts until one COMPLETES with an observable SL hold (the
+    // role↔CSV convention refunds ~half of attempts by design; the SH never
+    // holds, so exactly the SL side can trip the kill).
+    let mut killed: Option<(&Wallet, PathBuf)> = None;
+    for attempt in 0..8 {
+        let port = 29300 + attempt;
+        let posture: &[&str] = &["--claim-posture", "private"];
+        let mut args_a = vec!["--listen"];
+        let listen = format!("127.0.0.1:{port}");
+        args_a.push(&listen);
+        args_a.extend_from_slice(posture);
+        let (mut ca, log_a) = a.spawn_swap(&format!("a-hold-{port}"), &args_a);
+        std::thread::sleep(Duration::from_secs(2));
+        let mut args_b = vec!["--connect"];
+        args_b.push(&listen);
+        args_b.extend_from_slice(posture);
+        let (mut cb, log_b) = b.spawn_swap(&format!("b-hold-{port}"), &args_b);
+
+        let deadline = Instant::now() + Duration::from_secs(900);
+        let mut crashed_is_a: Option<bool> = None;
+        loop {
+            // Check for the hold BEFORE mining again, so the kill lands
+            // inside the (>= 12 block) hold window.
+            if read_log(&log_a).contains(HOLD_LINE) {
+                ca.kill();
+                crashed_is_a = Some(true);
+            } else if read_log(&log_b).contains(HOLD_LINE) {
+                cb.kill();
+                crashed_is_a = Some(false);
+            }
+            if crashed_is_a.is_some() || (ca.done() && cb.done()) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "attempt never resolved\nA:\n{}\nB:\n{}",
+                read_log(&log_a),
+                read_log(&log_b)
+            );
+            // Single blocks + a fast poll: a >= 12-block hold then spans many
+            // loop iterations, so the kill lands INSIDE it rather than racing
+            // the whole hold+confirm+register tail between two reads.
+            node.mine(1);
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if let Some(is_a) = crashed_is_a {
+            // The survivor (the SH — its completion produced the reveal) must
+            // still finish its own leg unaided.
+            let (survivor, survivor_log) =
+                if is_a { (&mut cb, &log_b) } else { (&mut ca, &log_a) };
+            let deadline = Instant::now() + Duration::from_secs(900);
+            while !survivor.done() {
+                assert!(
+                    Instant::now() < deadline,
+                    "the surviving SH never finished:\n{}",
+                    read_log(survivor_log)
+                );
+                node.mine(2);
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            assert!(
+                read_log(survivor_log).contains("SWAP COMPLETED"),
+                "the surviving SH must complete:\n{}",
+                read_log(survivor_log)
+            );
+            killed = Some(if is_a { (&a, log_a) } else { (&b, log_b) });
+            break;
+        }
+        eprintln!("attempt {attempt}: convention mismatch, closed via refunds; retrying");
+    }
+    let (crashed, crashed_log) =
+        killed.expect("no attempt completed with an observable hold in 8 tries");
+
+    // If the kill raced the hold's tail the coin may already be tracked (the
+    // live babysit registered it before dying) — the drill then only proves
+    // recover's idempotency; the deterministic runner tests pin the exact
+    // mid-hold state. Note it rather than fail a live-timing race.
+    if crashed.status().contains("Swapped/Unspent") {
+        eprintln!("NOTE: kill landed after registration; exercising recover idempotency only");
+    }
+
+    // The P1 under test: `recover` on a fresh process must finish the claim
+    // AND register the settlement coin — a settled record alone is the bug.
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        let out = run_cli(&crashed.config, &["recover", "--passphrase-stdin"], PASSPHRASE);
+        assert!(out.status.success(), "recover failed:\n{}", text(&out));
+        node.mine(2);
+        let status = crashed.status();
+        if status.contains("Swapped/Unspent") {
+            assert!(status.contains("Completed"), "record terminal:\n{status}");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "recover settled the swap without registering the settlement coin \
+             (live-run P1):\n{status}\ncrashed swap log:\n{}",
+            read_log(&crashed_log)
         );
         std::thread::sleep(Duration::from_secs(2));
     }

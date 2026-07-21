@@ -935,8 +935,12 @@ pub fn refund_babysit_step(
 /// [`swap_step`] means on-the-wire, not settled). Each step re-enters the
 /// persisted record: an evicted/unbroadcast completion surfaces as
 /// `Rebroadcast { confirmed: false }` and is re-driven; `confirmed: true` (or
-/// a `Settled` re-validation) ends the babysit, after which the received
-/// output is registered in the ledger. Returns `Some(())` once confirmed.
+/// a `Settled` re-validation) ends the babysit. Every tick goes through
+/// [`apply_recovery_tick`] — the ONE place that registers the received
+/// settlement output — so a live babysit and a cold `recover` track the coin
+/// identically (live-run P1: a duplicate registration path here meant the
+/// recover-driven terminal never registered). Returns `Some(())` once
+/// confirmed.
 pub fn completion_babysit_step(
     engine: &mut SwapEngine,
     chain: &impl AuthoritativeChainView,
@@ -950,26 +954,10 @@ pub fn completion_babysit_step(
         .get(sid)?
         .ok_or(Error::Ordering("completed swap has no persisted record"))?;
     let tick = RecoveryDriver::reenter_one(engine.store(), &rec, chain)?;
-    match &tick {
-        RecoveryTick::Settled | RecoveryTick::Rebroadcast { confirmed: true, .. } => {
-            if !opts.dry_run {
-                if let (Some(sig), Some(artifacts)) =
-                    (completion_sig(&rec), load_artifacts(data_dir, sid)?)
-                {
-                    let template = match rec.role {
-                        Role::SecretHolder => artifacts.comp_sh.clone(),
-                        Role::SecretLearner => artifacts.comp_sl.clone(),
-                    };
-                    let bytes = finalize_key_spend(template, sig);
-                    register_settlement_output(engine, chain, data_dir, sid, &bytes, log);
-                }
-            }
-            Ok(Some(()))
-        }
-        _ => {
-            apply_recovery_tick(engine, chain, data_dir, sid, &tick, opts, log)?;
-            Ok(None)
-        }
+    apply_recovery_tick(engine, chain, data_dir, sid, &tick, opts, log)?;
+    match tick {
+        RecoveryTick::Settled | RecoveryTick::Rebroadcast { confirmed: true, .. } => Ok(Some(())),
+        _ => Ok(None),
     }
 }
 
@@ -1052,7 +1040,13 @@ pub(crate) fn register_settlement_output(
 ///   `data_dir` (the record persists only the signature);
 /// * a `Refunded` decision advances the record to its terminal phase;
 /// * `RewritePending` and driver-reported damage are surfaced as ALARMS via
-///   `log` — never silently dropped.
+///   `log` — never silently dropped;
+/// * TERMINAL transitions register the settlement output the exit tx pays to
+///   our `SwapDestination` key (the [`RecoveryDriver`] deliberately never
+///   touches the ledger, so this caller must — for the refund terminal AND
+///   the confirmed-completion one), and a `Settled` re-observation backfills
+///   it idempotently, so no crash window leaves the wallet blind to a coin
+///   it provably owns.
 pub fn apply_recovery_tick(
     engine: &mut SwapEngine,
     chain: &impl AuthoritativeChainView,
@@ -1066,6 +1060,16 @@ pub fn apply_recovery_tick(
     match tick {
         RecoveryTick::Settled => {
             log(format!("{sid_hex}: settled — nothing to drive"));
+            // Idempotent backfill: a settled record's settlement output must
+            // be ledger-tracked even when the process died between the
+            // terminal advance and registration (live-run P1: recover
+            // advanced `Completed` without registering, leaving the wallet
+            // blind to its own coin — a re-scan must heal that, not shrug).
+            // Registration is a silent no-op when the coin is already
+            // tracked, so re-observing a settled record every pass is free.
+            if !opts.dry_run {
+                backfill_settled_output(engine, chain, data_dir, sid, log)?;
+            }
             Ok(())
         }
         RecoveryTick::RewritePending => {
@@ -1101,6 +1105,21 @@ pub fn apply_recovery_tick(
         RecoveryTick::Rebroadcast { final_sig, confirmed } => {
             if *confirmed {
                 log(format!("{sid_hex}: completion confirmed — record advanced to Completed"));
+                // The confirmed completion pays our own SwapDestination key:
+                // register the received coin HERE (the terminal-advance site),
+                // mirroring the `Refunded` arm — so a swap finished by
+                // `recover` is ledger-tracked exactly like one babysat live.
+                if !opts.dry_run {
+                    match recovered_completion_bytes(engine, data_dir, sid, *final_sig)? {
+                        Some(bytes) => {
+                            register_settlement_output(engine, chain, data_dir, sid, &bytes, log)
+                        }
+                        None => log(format!(
+                            "{sid_hex}: no artifacts sidecar — received output NOT registered \
+                             in the ledger (recover it by SwapDestination key derivation)"
+                        )),
+                    }
+                }
                 Ok(())
             } else {
                 broadcast_recovered_completion(engine, chain, data_dir, sid, *final_sig, opts, log)
@@ -1181,12 +1200,68 @@ fn apply_abort_action(
     }
 }
 
-/// Rebuild + broadcast the recovered completion: the record/tick carry only
-/// the 64-byte final SIGNATURE (rule 3 persists it `Completing`-first); the
-/// unsigned template comes from the `<sid>.artifacts` sidecar. A missing
-/// sidecar (a swap begun outside this runner) is a LOUD alarm, not an `Err` —
-/// the scan must keep driving the other swaps, and the signature stays
-/// re-derivable on every future pass.
+/// Rebuild the broadcastable completion tx from a recovered 64-byte final
+/// signature: the record/tick carry only the SIGNATURE (rule 3 persists it
+/// `Completing`-first); the unsigned template comes from the `<sid>.artifacts`
+/// sidecar, selected by the record's role. `Ok(None)` when the sidecar is
+/// absent (a swap begun outside this runner) — the caller decides how loudly
+/// that surfaces.
+fn recovered_completion_bytes(
+    engine: &SwapEngine,
+    data_dir: &Path,
+    sid: &[u8; 32],
+    final_sig: [u8; 64],
+) -> Result<Option<Vec<u8>>> {
+    let Some(artifacts) = load_artifacts(data_dir, sid)? else {
+        return Ok(None);
+    };
+    let rec = engine
+        .store()
+        .get(sid)?
+        .ok_or(Error::Ordering("completion recovery on a vanished record"))?;
+    let template = match rec.role {
+        Role::SecretHolder => artifacts.comp_sh,
+        Role::SecretLearner => artifacts.comp_sl,
+    };
+    Ok(Some(finalize_key_spend(template, final_sig)))
+}
+
+/// Register the settlement output of a SETTLED record (the `Settled` tick's
+/// idempotent backfill): rebuild the terminal's exit tx — the completion for
+/// `Completed`, the pre-armed refund for `Refunded` — and re-offer it to the
+/// ledger. Already-tracked is the common case and stays silent; a record the
+/// driver could only settle WITHOUT its exit evidence (no persisted
+/// signature / no sidecar) is skipped silently too — the transition sites
+/// already alarmed, and re-alarming every scan would be the F1 flood.
+fn backfill_settled_output(
+    engine: &mut SwapEngine,
+    chain: &impl AuthoritativeChainView,
+    data_dir: &Path,
+    sid: &[u8; 32],
+    log: &mut dyn FnMut(String),
+) -> Result<()> {
+    let Some(rec) = engine.store().get(sid)? else {
+        return Ok(());
+    };
+    let exit_tx = match rec.phase {
+        SwapPhase::Completed => match completion_sig(&rec) {
+            Some(sig) => recovered_completion_bytes(engine, data_dir, sid, sig)?,
+            None => None,
+        },
+        SwapPhase::Refunded => rec.pre_armed_refund.as_ref().map(|p| p.tx_bytes().to_vec()),
+        _ => None,
+    };
+    if let Some(bytes) = exit_tx {
+        register_settlement_output(engine, chain, data_dir, sid, &bytes, log);
+    }
+    Ok(())
+}
+
+/// Rebuild + broadcast the recovered completion (template rebuild via
+/// [`recovered_completion_bytes`]). A missing sidecar (a swap begun outside
+/// this runner) is a LOUD alarm, not an `Err` — the scan must keep driving
+/// the other swaps, and the signature stays re-derivable on every future
+/// pass.
 fn broadcast_recovered_completion(
     engine: &SwapEngine,
     chain: &impl AuthoritativeChainView,
@@ -1197,7 +1272,7 @@ fn broadcast_recovered_completion(
     log: &mut dyn FnMut(String),
 ) -> Result<()> {
     let sid_hex = hex32(sid);
-    let Some(artifacts) = load_artifacts(data_dir, sid)? else {
+    let Some(bytes) = recovered_completion_bytes(engine, data_dir, sid, final_sig)? else {
         log(format!(
             "{sid_hex}: ALARM — recovered a finalized completion signature but no \
              {sid_hex}.artifacts template sidecar exists in the data dir; the claim \
@@ -1205,15 +1280,6 @@ fn broadcast_recovered_completion(
         ));
         return Ok(());
     };
-    let rec = engine
-        .store()
-        .get(sid)?
-        .ok_or(Error::Ordering("completion rebroadcast on a vanished record"))?;
-    let template = match rec.role {
-        Role::SecretHolder => artifacts.comp_sh,
-        Role::SecretLearner => artifacts.comp_sl,
-    };
-    let bytes = finalize_key_spend(template, final_sig);
     let txid = txid_of(&bytes)?;
     if opts.dry_run {
         log(format!("{sid_hex}: dry-run — would (re)broadcast our completion {txid}"));

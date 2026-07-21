@@ -136,9 +136,12 @@ pub struct RecoveryScan {
 /// Re-enters crashed swaps from the persisted [`SwapStore`]. Takes only the
 /// store (not the whole engine): recovery needs the record + chain and nothing
 /// from the ledger/manifest (the funding coin was already reconciled at funding
-/// time). Stateless: every decision is re-derived from the record + chain on
-/// each call, so a crash mid-recovery just re-runs (idempotent, like
-/// `AbortDriver`).
+/// time). The LEDGER side of a terminal — registering the settlement output
+/// the exit tx pays us — is therefore the CALLER's duty at the transition
+/// (`apply_recovery_tick`); a terminal this driver persists is not "done"
+/// until the caller has offered that coin to the ledger. Stateless: every
+/// decision is re-derived from the record + chain on each call, so a crash
+/// mid-recovery just re-runs (idempotent, like `AbortDriver`).
 pub struct RecoveryDriver;
 
 impl RecoveryDriver {
