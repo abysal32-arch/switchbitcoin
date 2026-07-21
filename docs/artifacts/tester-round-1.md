@@ -162,6 +162,127 @@ NOTE: pipeline does 1 swap attempt then stops+babysits on a refund; with 3
 units, on a refund re-arm the swap loop for attempts 2–3 (units are unspent+
 mature). Watch `live-swap-logs/pipeline.log`.
 
+**Resume 2026-07-20 ~23:10Z (fresh session): pipeline + watchdog were BOTH dead
+— two latent script bugs, found + fixed + relaunched:**
+1. `live-swap-pipeline.sh` line 88: `local n="$1" A="…$n…"` on one line — bash
+   expands every word of a `local` before any assignment, so `$n` was unset →
+   `set -u` killed the whole script at the top of swap attempt 1 (22:07:22Z,
+   the log's abrupt stop). Split into two `local` statements; repro-proven
+   (old exits 127, new works). The 22:07 "attempt 1" never actually ran — no
+   swap state, no unit consumed.
+2. `node-watchdog.ps1`: UTF-8 em-dashes in a BOM-less file — PS 5.1 parses
+   BOM-less as ANSI, garbling a string terminator (parse error at line 33).
+   It had NEVER successfully run. Now pure ASCII; armed + logging 23:12:11Z.
+   (bitcoind itself never died again — the earlier session's manual restart,
+   ~21:47Z, was still up: synced 144972, 10 peers.)
+
+Relaunched pipeline (fixed) 23:09:38Z: its attempt 1 ran END-TO-END for the
+first time — ticket issued, B rendezvous OK, then the clean pre-maturity
+refusal (`pre-encumbrance coins … still in their onboarding delay`), zero
+state, free, exactly as designed. Attempts continue every 30 min; maturity
+window (1–2h from 22:06/22:07Z onboards) closes by ~00:07Z, so attempt 2
+(~23:40Z) or 3 (~00:10Z) proceeds for real.
+
+## ✅ LIVE TESTNET4 SWAP COMPLETED — 2026-07-21 00:54:58Z, attempt 3
+
+**The first live-network A↔B swap of the shipped protocol code COMPLETED on
+testnet4**, maker walletA ↔ taker walletB, v3 test tier (D = 100,000 sats),
+fully unattended under `live-swap-pipeline.sh`. Both ledgers terminal-correct.
+
+Timeline + evidence (all txids on testnet4; logs `live-swap-logs/swap-3-{A,B}.log`):
+- Attempt 1 (23:09Z) & 2 (23:40Z): clean pre-maturity refusals, free, zero
+  state. Attempt 2 proved the dual wall+height anchoring live: A mature
+  (unit `475a86ef…:2` elapsed 23:28Z, height gate met), B still in delay → B
+  refused, A aborted pre-commitment (no swap record on either side, verified).
+- **Attempt 3 armed 00:10:45Z** at tip 144975 — both height gates just met.
+  Session `a63bcf96550f42f11cc2ccf35344d579b451625e2ed422e7b76b04ea187f61bc`,
+  funding order B=First, A=Second, Block-X deadline 145119.
+- B setup: `9a6f68795bd0491368f876cbbb6b622c858ba60d1599d0382f1948a1af6bfe2b`
+- A setup: `03fd9154666c35c9f5d525671557f5652da97327cf133ef406de6f79e51e257c`
+- A completion: `3f20116c60ad66d717936b7d4854a7074d11b253fbd4746a7900657149e104f1`
+  → confirmed on chain 00:54:58Z; settlement output `:0` registered
+  **100,000 sats = exact D** → A ledger `Swapped/Unspent` ✓, record Completed.
+- Claim-delay privacy posture exercised LIVE on B (Minimal/flag): sampled a
+  6-block hold (reveal 144982 → broadcast 144988).
+- **Real crash-recovery exercise, completion path**: the pipeline `kill -9`s
+  both swap procs the moment either log says COMPLETED, which orphaned B's
+  still-held SL claim at tip ~144983. One `recover` run on B rebroadcast its
+  completion `96ad6d0bf656dd9997e88c22679dc1a1db4a5bcbf179a94b9f4f37ea475836ed`
+  ("Ctrl-C is safe; recover resumes" — proven live); babysitter re-runs
+  recover until B is terminal. B record already Completed; unit `6663ead3…:0`
+  consumed.
+- Units remaining for future attempts: A `475a86ef…:{1,2}`, B `6663ead3…:{2,3}`
+  (2 spare mature units each side).
+
+Pipeline note for reuse: the COMPLETED kill races the taker's delayed SL
+claim by design of the *script*, not the protocol — recover covers it, but a
+future pipeline revision should let the taker run until its own COMPLETED
+line before killing.
+
+### ⚠ P1 FINDING (ours, from the live run): recover settles a swap WITHOUT
+### registering the settlement-output coin
+
+When the taker's swap process dies during the claim-delay hold and `recover`
+finishes the claim, the swap record reaches Completed/settled but the
+settlement output is NEVER registered as a ledger coin. **Funds are safe on
+chain** (key is ours) but the wallet is blind to them — balance/coin-selection
+will never see the output.
+
+Evidence (2026-07-21 ~01:2xZ, wallet B):
+- `96ad6d0b…:0` = 100,000 sats at `tb1puh82e83pf7mecq9eatl4xt47hs0ml8ry553uzn759rytxs3hx03s8mpvsg`,
+  confirmed (5+ confs), unspent in the UTXO set (`gettxout` non-null).
+- B `status`: swap `a63bcf96…` Completed; coin list has NO `96ad6d0b` entry
+  (16 coins, unchanged count from pre-swap; unit `6663ead3…:0` correctly Spent).
+- Re-running `recover` after deep confirmations: "settled — nothing to drive",
+  still no registration → not a timing artifact.
+- Control: wallet A's LIVE driver registered its own settlement output
+  (`3f20116c…:0` Swapped/Unspent) before exiting — the live-driver path
+  registers; the recover path doesn't.
+- Repro shape: kill the taker mid-claim-hold → `recover` (re)broadcasts the
+  completion → a later recover pass finds it confirmed → marks settled,
+  skips coin registration. (The regtest crash-recovery test passed exact-D
+  on both ledgers, so its kill point evidently exercised a different phase —
+  this exact kill-during-claim-hold → recover-completes path is new coverage.)
+
+Disposition: fix task flagged for the triage loop (recover's
+confirmed-completion path must register the settlement output exactly like
+the live driver does, idempotently). Until fixed, any tester whose swap
+finishes via recover will "lose sight of" (not lose) their swapped coin.
+
+**✅ RESOLVED — fix commit `256d244` (2026-07-21).** Root cause: the live
+completion babysit carried its own registration path while
+`apply_recovery_tick` (the recover/startup/serve tick executor) registered
+only on the `Refunded` arm — the completion-side terminals registered
+nothing. Fix: one registration site — `completion_babysit_step` now routes
+every tick through `apply_recovery_tick`, which registers at the
+confirmed-completion transition AND idempotently re-offers a `Settled`
+record's exit output to the ledger on every re-scan (already-tracked is a
+silent no-op), so a wallet wedged by a pre-fix binary heals on its next
+`recover`/startup.
+
+- Regression tests (all green): 3 deterministic runner tests (crash the SL
+  mid-claim-hold by process death, recover settles AND registers; the
+  Settled re-scan backfills a wedged blind-ledger wallet; the
+  confirmed-completion tick registers at the transition) + new e2e drill
+  `e2e_taker_killed_mid_claim_hold_recovers_and_tracks_the_coin` — run LIVE
+  vs real bitcoind: PASS, kill landed inside the hold window.
+- **WalletB's real testnet4 ledger BACKFILLED 2026-07-21** by one `recover`
+  on the fixed binary: `a63bcf96…: settlement output 96ad6d0b…:0 registered
+  (100000 sats)` → status now 17 coins, `96ad6d0b…:0 Swapped/Unspent`,
+  swap record untouched (`Completed`). Idempotency verified: a second
+  recover registers nothing new. Pre-backfill data-dir snapshot kept
+  session-local (not in the repo).
+- Gates at the fix commit: 439 default / 487 `--features bitcoind`, clippy
+  clean both.
+- ⚠ The published tester build `d2955ba6a` PREDATES this fix: a tester whose
+  swap finishes via recover still goes coin-blind until a patch build ships
+  (funds safe; one `recover` on a fixed build heals retroactively — proven
+  on walletB). Fold into the optional `-b` patch-package cut at hand-off.
+
+**Params follow-up (Joe-gated):** v3 was the test-tier lever (0.001 tBTC) so
+faucet drips could fund units; production tier 0.01 restores via a future
+**v4 manifest** re-issue when live-run testing no longer needs the small tier.
+
 ## Swap attempts (external testers)
 
 _(one row per attempt as they come: who↔who, outcome, txids, notes)_
