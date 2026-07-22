@@ -8,11 +8,11 @@ The closer for round 2. Tracks the six-item DONE definition to
 | Item | Where | State |
 |---|---|---|
 | Release package | GitHub release [`v0.1.0-prealpha`](https://github.com/abysal32-arch/switchbitcoin-site/releases/tag/v0.1.0-prealpha) | ✅ live |
-| Build | `switchbitcoin-prealpha-0.1.0-d2955ba6a-windows-gnu.zip` | ✅ FINAL clean-HEAD build (rename + 6b02f01 soak fix + F1 quieter logs + wallet-UI brand fix) |
-| Zip SHA256 | `25a02006d15aff68f23a978c6d14f67ea701fe3acd8070ca55070b7c59efa3dd` | ✅ site hash === live download, verified end-to-end |
+| Build | `switchbitcoin-prealpha-0.1.0-651a6db3b-windows-gnu.zip` | ✅ **-b PATCH build** (everything in d2955ba6a + the P1 recover coin-registration fix `256d244` + kit on manifest v3) |
+| Zip SHA256 | `372cdcd7d3c196fc9192ca920b48879115b3e19f392707721ce174899c944d7e` | ✅ site hash === live download === local zip; live artifact unzips clean (exit 0), SHA256SUMS 9/9 OK, `version` = 651a6db3b + real pin |
 | Tester guide | in-package `docs/TESTER-GUIDE.md` + web copy https://switchbitcoin.com/testers.html | ✅ |
 | Bug-report template | in-package `docs/BUG-REPORT-TEMPLATE.md` | ✅ |
-| Current manifest | in-package `docs/manifests/v2.manifest` + https://switchbitcoin.com/manifests/v2.manifest (id `cdda51a9…`, floor 2, onboarding delay 1–2 h) | ✅ |
+| Current manifest | in-package `docs/manifests/v3.manifest` + https://switchbitcoin.com/manifests/v3.manifest (id `e962918a…`, floor 3, test tier 0.001 tBTC, onboarding delay 1–2 h; served envelope byte-verified `a63c9b4f…`) | ✅ |
 | Public home | https://switchbitcoin.com (HTTPS enforced) | ✅ live 2026-07-19 |
 
 > ✅ DECIDED + DONE (2026-07-19): cut the final package `f617468e8` from clean
@@ -22,14 +22,34 @@ The closer for round 2. Tracks the six-item DONE definition to
 > removed from the release (GitHub 503 incident during the swap — a detached
 > retry finishes it; the live download was consistent at every moment).
 
+> ✅ DECIDED + DONE (2026-07-22): cut the **-b patch package** `651a6db3b`
+> from clean HEAD — folds in the P1 recover coin-registration fix
+> (`256d244`) and moves the kit to manifest v3, the live test tier (commit
+> `651a6db`: v3 into `docs/manifests/` — envelope byte-verified + signature
+> re-checked against the pin, incl. the as-committed git blobs —, the
+> guide's new ingest-BEFORE-fund order, faucet minimum 0.011 → 0.0014).
+> Release asset + site hash replaced in the same pre-distribution window
+> (no tester ever held `d2955ba6a`). Packaging fix: the zip is now built
+> with bsdtar (`tar -a -cf`) — Compress-Archive writes backslash entry
+> paths that make Info-ZIP `unzip` warn + exit 1 (every earlier zip carried
+> that wart); future cuts keep using bsdtar. Verified END-TO-END on the
+> LIVE artifact: download hash === site keybox === local zip; unzip exit 0;
+> SHA256SUMS 9/9; `version` prints 651a6db3b + the real pin; a fresh
+> throwaway wallet on the packaged binary ingested the packaged v3
+> (floor 3, tier 100k, delay 1..2). Gates at the cut: 439 default /
+> 487 `--features bitcoind`, clippy clean both.
+
 ## Round brief (paste to each tester)
 
 > You're testing **SwitchBitcoin** pre-alpha — coordinator-free Bitcoin atomic
 > swaps, **testnet4 only, no real funds**. Download from
 > https://switchbitcoin.com (verify the zip SHA256 on the page, and that
 > `switchbitcoin-cli version` prints trust root `fedd6222…9e6ec7fe`).
-> Do: `quickstart` → fund a deposit from a testnet4 faucet (≥0.0104 tBTC as
-> ONE UTXO) → `onboard` (matures 1–2 h) → `manifest ingest` the v2 file →
+> Do: `quickstart` → **`manifest ingest docs/manifests/v3.manifest` FIRST**
+> (the v3 test tier makes units faucet-fundable; a pre-ingest onboard would
+> refuse the small deposit and draw the wrong delay) → fund a deposit from
+> a testnet4 faucet (≥0.0014 tBTC as ONE UTXO; ~0.004 = three units of
+> retry material) → `onboard` (matures 1–2 h) →
 > a swap with Joe → then the §7 watch-drill (dead-device refund). Expect
 > ~half of swap attempts to refuse-and-refund BY DESIGN (retry — funds always
 > come back). Send back: `switchbitcoin-cli diag` output + a filled
@@ -42,7 +62,7 @@ The closer for round 2. Tracks the six-item DONE definition to
 | 1 | Clean-HEAD package in ≥2 external testers' hands | ⬜ | **Joe: pick + invite testers, distribute** |
 | 2 | ≥3 completed testnet4 swaps, ≥2 external testers | ⬜ | testers + Joe as counterparty; ~50% refusal = budget retries |
 | 3 | ≥1 refund AND ≥1 watchtower fire by a NON-Joe tester | ⬜ | tester runs the §7 drill |
-| 4 | Whole fleet on one signed manifest (no v0 provisional) | ⬜ | testers run `manifest ingest v2` (v2 already fleet-default) |
+| 4 | Whole fleet on one signed manifest (no v0 provisional) | ⬜ | testers run `manifest ingest v3` (v3 already fleet-default) |
 | 5 | Zero open P0/P1; P2+ triaged to backlog | ⬜ | triage loop as reports arrive |
 | 6 | Evidence committed; RESUME marked DONE | ⬜ | this log + close |
 
@@ -50,7 +70,7 @@ The closer for round 2. Tracks the six-item DONE definition to
 
 1. **Pick + invite** the hand-picked testers (need ≥2 external), via the
    onboarding channel (email/DM).
-2. **Distribute** the package link + v2 manifest + the round brief above.
+2. **Distribute** the package link + v3 manifest + the round brief above.
 3. **Be the counterparty** for their first swaps (scheduling humans).
 4. Nudge ≥1 tester through the §7 watch-drill (gate item 3).
 
@@ -274,10 +294,10 @@ silent no-op), so a wallet wedged by a pre-fix binary heals on its next
   session-local (not in the repo).
 - Gates at the fix commit: 439 default / 487 `--features bitcoind`, clippy
   clean both.
-- ⚠ The published tester build `d2955ba6a` PREDATES this fix: a tester whose
-  swap finishes via recover still goes coin-blind until a patch build ships
-  (funds safe; one `recover` on a fixed build heals retroactively — proven
-  on walletB). Fold into the optional `-b` patch-package cut at hand-off.
+- ✅ CLOSED by the `-b` patch cut (2026-07-22, build `651a6db3b`): the
+  published tester package now carries this fix — the superseded
+  `d2955ba6a` asset was replaced before any tester held a hash. See the
+  Distribution kit table + the 2026-07-22 DECIDED note.
 
 **Params follow-up (Joe-gated):** v3 was the test-tier lever (0.001 tBTC) so
 faucet drips could fund units; production tier 0.01 restores via a future
