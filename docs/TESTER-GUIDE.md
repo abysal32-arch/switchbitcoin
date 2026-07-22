@@ -30,8 +30,11 @@ tells you exactly how to report what breaks.
   `holding the SL claim until height N` for many blocks. That is the privacy
   posture working — leave the wallet running.
 * **Onboarding delays are real on testnet**: each newly onboarded coin
-  becomes swappable only after its OWN randomized 24–72 h decorrelation
-  delay (drawn per coin, so two units rarely mature together). `status`
+  becomes swappable only after its OWN randomized decorrelation delay,
+  drawn per coin at onboard time from the signed manifest's bounds (so two
+  units rarely mature together) — 1–2 h under the current v3 testing
+  manifest; the production value (and the v0 compiled baseline) is
+  24–72 h. `status`
   annotates each unit with its maturity time and height gate
   (`[onboarding delay: matures ~… & height ≥ …]`); a swap attempted early
   refuses cleanly and leaves the coin untouched, so retrying is free.
@@ -95,10 +98,19 @@ the next one. Highlights and traps:
 * Edit the generated `switchbitcoin.toml` and fill the `[node]` section, or
   commands will refuse with `this command needs a node: add a [node]
   section to switchbitcoin.toml`.
-* Faucet amount: at least **0.011 tBTC** (one 0.01 swap unit + fees + the
-  CPFP reserve the split carves). Wait for a confirmation before `onboard`.
+* **Ingest the round's manifest BEFORE funding/onboard**:
+  `switchbitcoin-cli manifest ingest docs/manifests/v3.manifest`. The v3
+  testing round runs a 0.001 tBTC tier; a wallet still on the v0 compiled
+  baseline (0.01 tier) would refuse a test-tier deposit at `onboard`, and
+  the onboarding-delay draw is written at onboard time (a pre-ingest
+  onboard draws the long production delay).
+* Faucet amount: at least **0.0014 tBTC** (one 0.001-tier swap unit + fees
+  + the CPFP reserve the split carves; ~0.004 funds three units — spare
+  retry material for the by-design refusals). Wait for a confirmation
+  before `onboard`.
 * After `onboard` confirms, each coin matures after its own randomized
-  24–72 h delay. `status` shows the unit as `PreEncumbrance/Unspent` with a
+  delay — 1–2 h under the v3 testing manifest. `status` shows the unit as
+  `PreEncumbrance/Unspent` with a
   maturity annotation (`[onboarding delay: matures ~<UTC> & height ≥ N]`,
   flipping to `delay elapsed` once the wall-clock half has passed). A swap
   attempted before both halves clear refuses cleanly and costs nothing (see
@@ -183,10 +195,11 @@ your config file. Two commands matter to a tester:
 * `switchbitcoin-cli manifest show` — what you're running. A fresh wallet says
   version 0 with a WARNING: v0 wallets are a small, fingerprintable
   anonymity partition. Fix it by ingesting the current round's manifest:
-* `switchbitcoin-cli manifest ingest <file>` — e.g. the `docs/manifests/v2.manifest`
-  shipped in the package (v1 was signed by the retired first operator key —
-  since the 2026-07-16 key rotation it refuses with `signature does not
-  verify`, by design). Two wallets on different manifests refuse each
+* `switchbitcoin-cli manifest ingest <file>` — e.g. the `docs/manifests/v3.manifest`
+  shipped in the package (v2's 0.01 production tier is superseded for this
+  testing round; v1 was signed by the retired first operator key — since
+  the 2026-07-16 key rotation it refuses with `signature does not verify`,
+  by design). Two wallets on different manifests refuse each
   other with `handshake: peer runs different signed params (manifest
   mismatch)` — so when the operator publishes a new manifest, ingest it
   promptly (everyone in a test round runs the same version).

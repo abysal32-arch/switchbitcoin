@@ -78,9 +78,11 @@ mkdir -p "$OUT/docs"
 cp "$CLI" "$MANIFEST_TOOL" "$OUT/"
 cp docs/TESTER-GUIDE.md docs/BUG-REPORT-TEMPLATE.md docs/params-governance.md "$OUT/docs/"
 mkdir -p "$OUT/docs/manifests"
-# Ship the CURRENT round's manifest only — v1 (retired first operator key,
-# no longer verifies since the 2026-07-16 rotation) stays in the repo as history.
-cp docs/manifests/v2.manifest docs/manifests/v2-params.toml "$OUT/docs/manifests/"
+# Ship the CURRENT round's manifest only — v3, the signed test-tier round
+# (id e962918a…, tier_d 100,000 sats; the production 0.01 tier returns as a
+# future v4). v2 (superseded tier) and v1 (retired first operator key, no
+# longer verifies since the 2026-07-16 rotation) stay in the repo as history.
+cp docs/manifests/v3.manifest docs/manifests/v3-params.toml "$OUT/docs/manifests/"
 # The local HTML UI lives one level above the crate in this workspace; ship
 # it when present (serve works without it — the UI is optional).
 if [ -f "../SwitchBitcoin-Wallet.html" ]; then

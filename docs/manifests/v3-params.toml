@@ -1,0 +1,47 @@
+# SwitchBitcoin signed-manifest authoring input — VERSION 3
+# TEST-TIER for the funding-constrained live testnet4 run (2026-07-20).
+#
+# WHY: testnet4 faucets Joe can access drip only small amounts (~0.00378), and
+# the v2 tier (0.01 tBTC) needs a single ≥0.0104 UTXO per wallet to onboard —
+# unreachable from small drips (they don't combine; the wallet has no merge).
+# v3 drops tier_d 1,000,000 → 100,000 sats (0.001 tBTC), so the onboard minimum
+# falls from ~1,032,000 to ~132,000 sats (0.00132). Joe's existing wallet-A
+# deposit (377,630) covers it; wallet B needs just one small drip. The swap
+# MECHANISM is identical at any tier — this only changes the amount, proving the
+# live adaptor-signature settlement with the funds available. The production/
+# tester tier (0.01, v2) is unchanged and restored in the next round.
+#
+# This is the SAME lever v2 used for the onboarding delay (manifest, never a
+# code flag). All fee/timelock/reserve params are UNCHANGED from v2; only
+# tier_d moves. Bounds re-checked: tier_d 100,000 > delta_fee 5,000 and >
+# cpfp_reserve 25,000 and >= 1,000 (params.rs economic-sanity gate).
+#
+# Usage:   switchbitcoin-manifest sign v3-test-params.toml --key <operator.key> --out v3.manifest
+# Check:   switchbitcoin-manifest compose-check v3-test-params.toml   (no key needed)
+
+version = "3"
+posture = "moderate"      # unchanged
+quorum_q = "3"            # unchanged
+
+[params]
+tier_d_sats = "100000"              # v3 TEST TIER: 0.001 tBTC (was 1,000,000)
+delta_fee_sats = "5000"             # unchanged
+anchor_sats = "240"                 # unchanged
+setup_fee_sats = "1200"             # unchanged
+cpfp_reserve_sats = "25000"         # unchanged
+delta_early = "144"                 # unchanged
+margin = "72"                       # unchanged
+delta_buffer = "24"                 # unchanged
+claim_confirm_allowance = "6"       # unchanged
+cofunding_window = "12"             # unchanged
+onboarding_delay_lo_hours = "1"     # unchanged (testing period)
+onboarding_delay_hi_hours = "2"     # unchanged (testing period)
+
+[delays]
+minimal_min = "0"
+minimal_max = "6"
+moderate_min = "6"
+moderate_max = "36"
+aggressive_min = "12"
+aggressive_max = "72"
+cofunding_jitter_max = "6"

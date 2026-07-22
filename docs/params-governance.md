@@ -295,3 +295,27 @@ section is the template every future round appends to.
     the live Ordering demo.
 * Evidence: `docs/artifacts/manifest-v2-round-2026-07-18.md`; raw stdout in
   `tasks/task-27-manifest-v2-round/round-logs/` (outside the repo).
+
+### Round 2 → 3 (2026-07-20) — the test-tier round (live-run funding lever)
+
+* **v3** (id `e962918a44f7dd644985725e035675ba7f6d2db1e42c0e7066d5b3449ece0400`,
+  signed 2026-07-20 by the operator key `fedd6222…`): ONE change —
+  `tier_d_sats` 1,000,000 → **100,000 (0.001 tBTC test tier)**. Reachable
+  testnet4 faucets drip amounts too small for the 0.01 tier's ~1,032,000-sat
+  single-UTXO onboard minimum; at the v3 tier the minimum falls to
+  ~132,000 sats, so faucet drips fund real units. Same lever as the v2
+  delay change — the manifest, never a code flag. Everything else re-issued
+  verbatim; the compiled baseline stays UNCHANGED.
+* **Ingest + converge**: v3 ACCEPTED into A and B, floor 2→3 fleet-wide.
+* **Proven in anger**: the first live testnet4 swap of the shipped protocol
+  code (session `a63bcf96…`, completed 2026-07-21) ran at the v3 tier —
+  both ledgers settled at exactly D = 100,000 sats.
+* **Restore path (owner-gated)**: the production 0.01 tier returns as a
+  future **v4** re-issue when live-run testing no longer needs the small
+  tier — a Joe decision, recorded in the tester-round log.
+* Evidence: `docs/artifacts/tester-round-1.md` (LIVE RUN + completion
+  sections); authoring input committed as `docs/manifests/v3-params.toml`
+  (byte-identical to the signed input; id re-verified by `compose-check` +
+  `inspect --root <pin>` before distribution).
+* Distribution: v3 ships in the tester package from the `-b` cut onward
+  (`scripts/build-release.sh`) and at switchbitcoin.com/manifests/.
