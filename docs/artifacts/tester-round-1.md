@@ -8,8 +8,8 @@ The closer for round 2. Tracks the six-item DONE definition to
 | Item | Where | State |
 |---|---|---|
 | Release package | GitHub release [`v0.1.0-prealpha`](https://github.com/abysal32-arch/switchbitcoin-site/releases/tag/v0.1.0-prealpha) | ✅ live |
-| Build | `switchbitcoin-prealpha-0.1.0-651a6db3b-windows-gnu.zip` | ✅ **-b PATCH build** (everything in d2955ba6a + the P1 recover coin-registration fix `256d244` + kit on manifest v3) |
-| Zip SHA256 | `372cdcd7d3c196fc9192ca920b48879115b3e19f392707721ce174899c944d7e` | ✅ site hash === live download === local zip; live artifact unzips clean (exit 0), SHA256SUMS 9/9 OK, `version` = 651a6db3b + real pin |
+| Build | `switchbitcoin-prealpha-0.1.0-90c01fff7-windows-gnu.zip` | ✅ **-c PATCH build** (-b content [P1 recover fix `256d244` + kit on manifest v3] + guide §8 drill order corrected after the live rehearsal below) |
+| Zip SHA256 | `5b7144e61695167030c56edaa930dfe4dffb126de2dc26e1d8bcc473523a6c50` | ✅ site hash === live download === local zip; live artifact unzips clean (exit 0), SHA256SUMS 9/9 OK, `version` = 90c01fff7 + real pin |
 | Tester guide | in-package `docs/TESTER-GUIDE.md` + web copy https://switchbitcoin.com/testers.html | ✅ |
 | Bug-report template | in-package `docs/BUG-REPORT-TEMPLATE.md` | ✅ |
 | Current manifest | in-package `docs/manifests/v3.manifest` + https://switchbitcoin.com/manifests/v3.manifest (id `e962918a…`, floor 3, test tier 0.001 tBTC, onboarding delay 1–2 h; served envelope byte-verified `a63c9b4f…`) | ✅ |
@@ -38,6 +38,13 @@ The closer for round 2. Tracks the six-item DONE definition to
 > throwaway wallet on the packaged binary ingested the packaged v3
 > (floor 3, tier 100k, delay 1..2). Gates at the cut: 439 default /
 > 487 `--features bitcoind`, clippy clean both.
+
+> ✅ -c CUT (2026-07-23): `90c01fff7` — the -b content plus the §8
+> drill-order fix from the rehearsal section below; superseded `651a6db3b`
+> asset replaced inside the still-open pre-distribution window;
+> live-verified end-to-end (download === site keybox === local zip, unzip
+> exit 0, SHA256SUMS 9/9, version + real pin). Zip via bsdtar. Gates at the
+> cut: 439/487 + clippy clean both.
 
 ## Round brief (paste to each tester)
 
@@ -303,6 +310,44 @@ silent no-op), so a wallet wedged by a pre-fix binary heals on its next
 **Params follow-up (Joe-gated):** v3 was the test-tier lever (0.001 tBTC) so
 faucet drips could fund units; production tier 0.01 restores via a future
 **v4 manifest** re-issue when live-run testing no longer needs the small tier.
+
+## §8 watch-drill rehearsal on the PUBLISHED package (2026-07-23) — PASS, 2 doc bugs caught + fixed
+
+Before any tester attempts gate item 3, the drill was rehearsed VERBATIM
+from the packaged guide on the live-downloaded artifact (`651a6db3b`),
+regtest, two throwaway wallets built the tester way (init → `manifest
+ingest v3` → 0.004 funding → onboard). The point was to flush doc bugs
+before a human hits them. It worked — twice:
+
+1. **Stale §7 references** (fixed `406d5c9`): the drill is guide §8;
+   task-24's Connectivity insertion shifted the numbering and the round
+   brief / gate table / Joe checkpoints still sent testers to §7 (the
+   manifests section).
+2. **§8's step order could never arm the tower** (fixed `90c01ff` → the
+   -c package): the old order took the backup BEFORE any swap existed, but
+   the pre-armed refund is minted at negotiate time and `backup` refuses
+   on a running wallet — a tower restored from that bundle prints `no
+   guardable swaps` and cannot fire for the drill swap. Observed live: the
+   4-file pre-swap bundle stayed blind with funded escrows on-chain; the
+   6-file post-kill bundle armed instantly.
+
+Corrected-order proof chain, all on the shipped binary (session
+`12d50c80…`): setups `081370c6…` (M) + `c3fa0040…` (T) broadcast at h124 →
+both wallet processes killed → escrows confirmed h125 with the devices
+dead → post-kill backup → restore to a second dir → `watchtower armed:
+guarding 1 escrow(s)` → +220 blocks → **`dead-device refund FIRED`**
+(`7aa95c62…`) → confirm → `pre-armed refund CONFIRMED — escrow reclaimed`
+→ tower stood down by itself. M `recover`: record Refunded, settlement
+output registered (100,000 sats exact-D). T `recover`: its own pre-armed
+refund `cb2cf3b6…` broadcast → Refunded + registered. **The `256d244` P1
+fix was thereby observed working on the REFUND arm, both sides.**
+
+Also validated on the published artifact in the same run: v3 ingests on a
+regtest wallet (guide §3's local-rehearsal stanza holds — the manifest
+network byte is fixed by design); 0.004 → 3 units + 25k reserve exactly as
+the round brief claims; the single-instance store lock cleanly refused a
+concurrent onboard; v3 delay draws (1–2 h) + dual wall/height anchoring
+correct on a FRESH wallet's first onboard (the tester case).
 
 ## Swap attempts (external testers)
 
