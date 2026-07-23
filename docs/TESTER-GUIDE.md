@@ -206,16 +206,26 @@ your config file. Two commands matter to a tester:
 
 ## 8. Backup, restore, and the second-device watchtower
 
-This is the best fund-safety demo you can run:
+This is the best fund-safety demo you can run (order matters — rehearsed
+end-to-end on the shipped package, 2026-07-23):
 
-1. `switchbitcoin-cli backup wallet.skbak` (on your main device; refuses while the
-   wallet is running).
-2. Move the bundle to a second device (or second directory + own config),
+1. Start a swap on the primary and kill it mid-swap: once the setup txids
+   have printed (funding is on the wire), Ctrl-C / kill the process. The
+   "device" is now dead with a funded escrow.
+2. `switchbitcoin-cli backup wallet.skbak` on the dead primary. The order
+   is load-bearing twice over: backup refuses while the wallet is running,
+   and the bundle must POSTDATE the swap — the pre-armed refund is minted
+   at negotiate time, so a bundle taken before the swap has nothing to
+   guard.
+3. Move the bundle to a second device (or second directory + own config),
    `switchbitcoin-cli restore --from wallet.skbak`.
-3. `switchbitcoin-cli watch` on the second device.
-4. Start a swap on the primary and kill the process mid-swap.
+4. `switchbitcoin-cli watch` on the second device — it prints `watchtower
+   armed: guarding 1 escrow(s)`. If it says `no guardable swaps in the
+   store`, your bundle predates the swap: re-backup, re-restore.
 5. Watch the tower fire your pre-armed refund at CSV maturity — funds come
-   back with the primary dead.
+   back with the primary dead (`dead-device refund FIRED`, then on a later
+   pass `pre-armed refund CONFIRMED — escrow reclaimed`, then the tower
+   stands down by itself).
 
 What a watchtower can and cannot do (from the `wallet::watch` design): it
 can only ever broadcast **your own pre-armed refund** (single-signed at
@@ -239,6 +249,10 @@ Traps the guide must warn you about:
   Harmless for watch-only use (`watch` never negotiates), but do NOT run
   `swap`/`serve` from a stale restore without `manifest ingest`-ing the
   newest signed manifest first.
+* The tower guards only swaps present in ITS OWN restored store — a bundle
+  taken before a swap existed cannot guard it. Keep the watch device's
+  bundle fresh: re-backup + re-restore after starting any swap you want
+  tower-covered.
 * `watch --once` does one pass and exits — cron/Task-Scheduler friendly.
   `watch` exits 0 when there's nothing guardable or every exit confirmed.
 
