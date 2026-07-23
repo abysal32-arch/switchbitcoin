@@ -50,7 +50,8 @@ The closer for round 2. Tracks the six-item DONE definition to
 > refuse the small deposit and draw the wrong delay) → fund a deposit from
 > a testnet4 faucet (≥0.0014 tBTC as ONE UTXO; ~0.004 = three units of
 > retry material) → `onboard` (matures 1–2 h) →
-> a swap with Joe → then the §7 watch-drill (dead-device refund). Expect
+> a swap with Joe → then the guide's **§8** watch-drill (dead-device
+> refund; "Backup, restore, and the second-device watchtower"). Expect
 > ~half of swap attempts to refuse-and-refund BY DESIGN (retry — funds always
 > come back). Send back: `switchbitcoin-cli diag` output + a filled
 > BUG-REPORT for anything surprising.
@@ -61,7 +62,7 @@ The closer for round 2. Tracks the six-item DONE definition to
 |---|---|---|---|
 | 1 | Clean-HEAD package in ≥2 external testers' hands | ⬜ | **Joe: pick + invite testers, distribute** |
 | 2 | ≥3 completed testnet4 swaps, ≥2 external testers | ⬜ | testers + Joe as counterparty; ~50% refusal = budget retries |
-| 3 | ≥1 refund AND ≥1 watchtower fire by a NON-Joe tester | ⬜ | tester runs the §7 drill |
+| 3 | ≥1 refund AND ≥1 watchtower fire by a NON-Joe tester | ⬜ | tester runs the guide's §8 drill (was "§7" before task-24 inserted §5 Connectivity — stale refs fixed 2026-07-22) |
 | 4 | Whole fleet on one signed manifest (no v0 provisional) | ⬜ | testers run `manifest ingest v3` (v3 already fleet-default) |
 | 5 | Zero open P0/P1; P2+ triaged to backlog | ⬜ | triage loop as reports arrive |
 | 6 | Evidence committed; RESUME marked DONE | ⬜ | this log + close |
@@ -72,7 +73,7 @@ The closer for round 2. Tracks the six-item DONE definition to
    onboarding channel (email/DM).
 2. **Distribute** the package link + v3 manifest + the round brief above.
 3. **Be the counterparty** for their first swaps (scheduling humans).
-4. Nudge ≥1 tester through the §7 watch-drill (gate item 3).
+4. Nudge ≥1 tester through the guide's §8 watch-drill (gate item 3).
 
 ## Internal first-tester dry-run (2026-07-19, on the PUBLISHED artifact) — PASS
 
