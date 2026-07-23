@@ -14,6 +14,7 @@ The closer for round 2. Tracks the six-item DONE definition to
 | Bug-report template | in-package `docs/BUG-REPORT-TEMPLATE.md` | ✅ |
 | Current manifest | in-package `docs/manifests/v3.manifest` + https://switchbitcoin.com/manifests/v3.manifest (id `e962918a…`, floor 3, test tier 0.001 tBTC, onboarding delay 1–2 h; served envelope byte-verified `a63c9b4f…`) | ✅ |
 | Public home | https://switchbitcoin.com (HTTPS enforced) | ✅ live 2026-07-19 |
+| Source code | https://github.com/abysal32-arch/switchbitcoin (MIT, full history; tag `v0.1.0-prealpha-c` = shipped commit `90c01fff7`) | ✅ PUBLISHED 2026-07-23 — history secret-swept first; README rewritten (the scaffold-era one was obsolete); site + release notes link it as the independent verification leg |
 
 > ✅ DECIDED + DONE (2026-07-19): cut the final package `f617468e8` from clean
 > HEAD (includes F1's quieter logs), made it THE live download, and verified
@@ -356,6 +357,10 @@ _(one row per attempt as they come: who↔who, outcome, txids, notes)_
 ## Reports received
 
 _(one row per report: tester, severity P0/P1/P2, disposition)_
+
+| Tester | Severity | Report | Disposition |
+|---|---|---|---|
+| #1 (Andrea), 2026-07-23, pre-install | not a code bug — process/trust observations, both CORRECT | (a) zip hash in her setup message ≠ site hash — she STOPPED as instructed; (b) verification is circular (file, hash, trust root all trace to switchbitcoin.com/one GitHub account) + wallet source not visible despite the site's build-from-source claim | (a) explained: the -c re-cut landed after her instructions were sent; current hash given over the personal channel + release page (the stop-on-mismatch design worked). (b) FIXED: wallet source published (see kit table), site + release notes now document the independent chain (binary's embedded commit ↔ repo tag ↔ release). Her stop was exactly the tester behavior the round wants — noted as a positive signal for the docs' verification posture |
 
 ## P2+ backlog (seed for the next phase)
 
