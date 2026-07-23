@@ -48,6 +48,10 @@ scripts/build-release.sh         # gates -> release build -> shippability
 The release script refuses to package a dirty tree, a failing suite, or a
 binary whose trust-root pin is not the real operator key.
 
+Exact toolchain pins and **byte-for-byte release reproduction** (pinned
+rustc via `rust-toolchain.toml`, `--locked`, normalized PE timestamp):
+see `BUILDING.md`.
+
 ## Safety posture (read before running anything)
 
 - **Testnet4/regtest only.** The seed you generate guards worthless coins.

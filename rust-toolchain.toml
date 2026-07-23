@@ -1,0 +1,5 @@
+# Reproducible-build pin (see BUILDING.md). rustup auto-installs this exact
+# toolchain for anyone building the repo; release binaries must be cut with it.
+[toolchain]
+channel = "1.96.1"
+targets = ["x86_64-pc-windows-gnu"]

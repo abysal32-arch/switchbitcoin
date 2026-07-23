@@ -24,6 +24,9 @@ case "$(uname -s)" in
   MINGW*|MSYS*)
     export PATH="$USERPROFILE/.cargo/bin:${MINGW64_BIN:-/c/Users/Joe/AppData/Local/mingw64/bin}:$PATH"
     export CC="${CC:-gcc}" AR="${AR:-ar}"
+    # Reproducible PE output: normalize the link timestamp — the one verified
+    # source of build nondeterminism (BUILDING.md, 2026-07-23).
+    export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C link-args=-Wl,--no-insert-timestamp"
     EXE=".exe"; PLATFORM="windows-gnu"
     ;;
   Linux)  EXE=""; PLATFORM="linux"  ;;
@@ -50,8 +53,8 @@ else
   echo "!! unchanged tree the gates already passed."
 fi
 
-echo "== release build (overflow-checks stay ON per [profile.release]) =="
-cargo build --release --features bitcoind
+echo "== release build (overflow-checks stay ON per [profile.release]; locked deps) =="
+cargo build --release --features bitcoind --locked
 
 CLI="target/release/switchbitcoin-cli${EXE}"
 MANIFEST_TOOL="target/release/switchbitcoin-manifest${EXE}"
